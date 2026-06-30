@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Build / distribución
+dist/
+build/
+*.spec
+installer_output/
+
+# Configuración de usuario (credenciales FTP, API keys — NO subir)
+config.json
+*.json
+
+# Logs y temporales
+*.log
+error.log
+
+# Entorno virtual
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+desktop.ini

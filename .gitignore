@@ -1,0 +1,26 @@
+# Build / distribución
+aRenombrar/build/
+aRenombrar/dist/
+aRenombrar/__pycache__/
+aRenombrar/**/__pycache__/
+*.pyc
+*.pyo
+*.spec.bak
+
+# Logs de diagnóstico
+aRenombrar/diagnostico.log
+
+# Config local (contiene contraseñas FTP y API keys)
+# El archivo real vive en %APPDATA%\aRenombrar\config.json
+aRenombrar/auto_processed.json
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
