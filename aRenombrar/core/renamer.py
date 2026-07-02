@@ -54,22 +54,28 @@ def _sanitize(text: str) -> str:
     return text
 
 
-def rename_file(src_path: str, new_name: str, dry_run: bool = False):
-    """Renombra src_path con new_name. Devuelve (éxito, mensaje)."""
+def rename_file(src_path: str, new_name: str, dry_run: bool = False, force_overwrite: bool = False):
+    """Renombra src_path con new_name. Devuelve (éxito, mensaje).
+    force_overwrite: si ya existe un archivo distinto con new_name, lo
+    reemplaza en vez de fallar con "Ya existe" (decisión explícita del
+    usuario tras un diálogo de confirmación, nunca por defecto)."""
     src = Path(src_path)
     if not src.exists():
         return False, f"Archivo no encontrado: {src_path}"
 
     dst = src.parent / new_name
 
-    if dst.exists() and not dst.samefile(src):
+    if dst.exists() and not dst.samefile(src) and not force_overwrite:
         return False, f"Ya existe: {new_name}"
 
     if dry_run:
         return True, f"[Simulación] {src.name} → {new_name}"
 
     try:
-        src.rename(dst)
+        if force_overwrite:
+            src.replace(dst)   # atómico: sobrescribe el destino si ya existe
+        else:
+            src.rename(dst)
         return True, str(dst)
     except OSError as e:
         return False, f"Error al renombrar: {e}"

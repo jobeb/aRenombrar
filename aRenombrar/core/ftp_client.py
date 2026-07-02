@@ -132,15 +132,87 @@ class FTPClient:
         except ftplib.all_errors:
             return False
 
-    def get_free_space(self) -> Optional[int]:
-        """Intenta obtener espacio libre en bytes via AVBL o STAT. None si no soportado."""
+    def get_remote_size(self, remote_file: str) -> Optional[int]:
+        """Tamaño en bytes del archivo remoto, o None si no existe/no se puede consultar."""
         if not self.ftp:
             return None
         try:
-            resp = self.ftp.sendcmd("AVBL")
-            return int(resp.split()[-1])
+            return self.ftp.size(remote_file)
+        except ftplib.all_errors:
+            return None
+
+    def list_dirs(self, path: str) -> list[str]:
+        """Devuelve los nombres de las subcarpetas directas de *path* (sin archivos).
+        Usa MLSD si el servidor lo soporta; si no, cae a parsear LIST (formato Unix)."""
+        if not self.is_connected():
+            return []
+        try:
+            names = []
+            for name, facts in self.ftp.mlsd(path):
+                if name in (".", "..") or facts.get("type") != "dir":
+                    continue
+                names.append(name)
+            return names
+        except ftplib.all_errors:
+            pass   # servidor sin soporte MLSD -> probar LIST
+        try:
+            lines = []
+            self.ftp.retrlines(f"LIST {path}", lines.append)
+            return _parse_unix_list_dirs(lines)
+        except ftplib.all_errors:
+            return []
+
+    def get_free_space(self) -> Optional[int]:
+        """Intenta obtener espacio libre en bytes probando varios comandos."""
+        if not self.ftp:
+            return None
+        import re
+        _num = re.compile(r'\d{6,}')  # número de ≥6 dígitos = bytes plausibles
+
+        # vsftpd no soporta ningún comando de espacio libre — salir inmediatamente
+        try:
+            stat = self.ftp.sendcmd("STAT")
+            if "vsFTPd" in stat or "vsftpd" in stat.lower():
+                return None
         except Exception:
             pass
+
+        # 1. AVBL — Synology, QNAP, algunos NAS
+        try:
+            resp = self.ftp.sendcmd("AVBL")
+            m = _num.search(resp)
+            if m:
+                return int(m.group())
+        except Exception:
+            pass
+
+        # 2. SITE AVAIL — ProFTPD mod_site
+        try:
+            resp = self.ftp.sendcmd("SITE AVAIL")
+            m = _num.search(resp)
+            if m:
+                return int(m.group())
+        except Exception:
+            pass
+
+        # 3. XDISKFREE — FileZilla Server y algunos BSD
+        try:
+            resp = self.ftp.sendcmd("XDISKFREE")
+            m = _num.search(resp)
+            if m:
+                return int(m.group())
+        except Exception:
+            pass
+
+        # 4. SITE DISKFREE — vsftpd con módulo extra
+        try:
+            resp = self.ftp.sendcmd("SITE DISKFREE")
+            m = _num.search(resp)
+            if m:
+                return int(m.group())
+        except Exception:
+            pass
+
         return None
 
     def upload_file(
@@ -152,6 +224,7 @@ class FTPClient:
         skip_event=None,
         speed_limit_kbs: int = 0,
         try_resume: bool = False,
+        remote_filename: Optional[str] = None,
     ) -> tuple[bool, str]:
         """
         Sube un archivo al servidor FTP.
@@ -159,6 +232,9 @@ class FTPClient:
         cancel_event: threading.Event — para toda la cola.
         skip_event:   threading.Event — salta solo este archivo.
         speed_limit_kbs: límite de velocidad en KB/s (0 = sin límite).
+        remote_filename: nombre a usar en el servidor si debe ser distinto al
+          nombre del archivo local (p.ej. "renombrar en destino" sin haber
+          renombrado en origen). Por defecto, el nombre del archivo local.
         Retorna: (ok, msg) donde msg puede ser 'cancelado' o 'saltado'.
         """
         if not self.is_connected():
@@ -168,7 +244,7 @@ class FTPClient:
         if not local.exists():
             return False, f"Archivo no encontrado: {local_path}"
 
-        remote_file = f"{remote_path.rstrip('/')}/{local.name}"
+        remote_file = f"{remote_path.rstrip('/')}/{remote_filename or local.name}"
         total = local.stat().st_size
         sent = [0]
 
@@ -202,7 +278,6 @@ class FTPClient:
             except Exception:
                 return 0
 
-        upload_start = [time.monotonic()]   # para throttle acumulativo
         BLOCKSIZE = 4 * 1024 * 1024   # 4 MB — menos callbacks Python = más throughput
         REPORT_INTERVAL = 0.4
 
@@ -211,8 +286,16 @@ class FTPClient:
         class _Skipped(Exception):
             pass
 
-        # Pre-evaluar si hay límite para evitar llamar _get_speed_limit() en cada chunk
-        _has_limit = _get_speed_limit() > 0
+        # Punto de referencia para el throttle acumulativo (tiempo/bytes desde
+        # el último cambio de límite). Se reinicia cada vez que el límite
+        # configurado cambia de valor (activado, desactivado o modificado a
+        # media subida), para no arrastrar "deuda"/"crédito" de antes del
+        # cambio — si no, activar un límite tras subir un rato sin límite
+        # provocaría una pausa larguísima intentando compensar los bytes que
+        # ya se enviaron rápido, y viceversa.
+        throttle_limit  = [_get_speed_limit()]
+        throttle_time0  = [time.monotonic()]
+        throttle_sent0  = [sent[0]]
 
         def callback(data: bytes):
             if cancel_event and cancel_event.is_set():
@@ -221,15 +304,33 @@ class FTPClient:
                 raise _Skipped()
             sent[0] += len(data)
 
-            # Throttle acumulativo: solo si hay límite configurado
-            if _has_limit:
-                cur_limit = _get_speed_limit()
-                if cur_limit > 0:
-                    elapsed  = time.monotonic() - upload_start[0]
-                    expected = sent[0] / cur_limit
-                    delay    = expected - elapsed
-                    if delay > 0:
-                        time.sleep(min(delay, 1.0))
+            # Se relee el límite en cada bloque (no solo al empezar la subida)
+            # para poder activar/cambiar/desactivar el límite en caliente.
+            cur_limit = _get_speed_limit()
+            if cur_limit != throttle_limit[0]:
+                throttle_limit[0] = cur_limit
+                throttle_time0[0] = time.monotonic()
+                throttle_sent0[0] = sent[0]
+
+            # Cada bloque (BLOCKSIZE) ya se envió a la red antes de llegar aquí,
+            # así que el retraso necesario para compensarlo puede superar 1s si
+            # el límite configurado es menor que BLOCKSIZE/seg — hay que dormir
+            # en tramos de máx. 1s hasta agotar el retraso completo (no solo un
+            # tramo), si no el límite real acaba siendo ~BLOCKSIZE/seg pase lo
+            # que pase se configure por debajo de eso. Se comprueba cancel/skip
+            # entre tramos para no perder capacidad de respuesta al cancelar.
+            if cur_limit > 0:
+                elapsed  = time.monotonic() - throttle_time0[0]
+                expected = (sent[0] - throttle_sent0[0]) / cur_limit
+                delay    = expected - elapsed
+                while delay > 0:
+                    if cancel_event and cancel_event.is_set():
+                        raise _Cancelled()
+                    if skip_event and skip_event.is_set():
+                        raise _Skipped()
+                    nap = min(delay, 1.0)
+                    time.sleep(nap)
+                    delay -= nap
 
             now = time.monotonic()
             window_elapsed = now - t_window[0]
@@ -321,3 +422,18 @@ def _ftp_safe(text: str) -> str:
     import re
     text = re.sub(r'[<>:"|?*]', "", text)
     return text.strip()
+
+
+def _parse_unix_list_dirs(lines: list) -> list:
+    """Extrae los nombres de carpeta de una salida LIST estilo Unix
+    ('drwxr-xr-x ... nombre con espacios'). Ignora entradas que no sean directorio."""
+    names = []
+    for line in lines:
+        if not line or line[0] != "d":
+            continue
+        parts = line.split(None, 8)
+        if len(parts) == 9:
+            name = parts[8]
+            if name not in (".", ".."):
+                names.append(name)
+    return names

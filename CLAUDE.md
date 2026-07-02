@@ -17,7 +17,13 @@ python diagnostico.py        # launch with diagnostics written to diagnostico.lo
 python crear_acceso_directo.py  # create a Desktop shortcut (Windows)
 ```
 
-There are no tests.
+Unit tests cover the pure `core/` logic (no tkinter) in `aRenombrar/tests/`:
+
+```bash
+cd aRenombrar
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
 
 ## Building the executable
 

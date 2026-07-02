@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 
+import keyring
 
 APP_NAME = "aRenombrar"
+_KEYRING_FTP_PASSWORD = "ftp_password"
 
 DEFAULTS = {
-    "tmdb_api_key": "cb85e055849d97a40816a412e10e7a60",
+    "tmdb_api_key": "",
     "language": "es-ES",
     # Nombre: "Breaking Bad 3x07 One Minute.mkv"
     "tv_template": "{serie} {temporada}x{episodio:02d} {titulo}{ext}",
@@ -36,6 +38,9 @@ DEFAULTS = {
     "ftp_retries": 3,
     "desktop_notifications": True,
     "start_with_windows": False,
+    "min_confidence": 70,
+    "rename_local": True,
+    "rename_remote": True,
 }
 
 
@@ -64,22 +69,80 @@ class Config:
             except Exception:
                 pass
 
+        # Migrar contraseñas de versiones anteriores (guardadas en texto plano
+        # en config.json) al almacén de credenciales de Windows, y no dejar
+        # rastro de ellas en el JSON de aquí en adelante.
+        plain_pwd = self._data.get("ftp_password", "")
+        if plain_pwd:
+            self._set_keyring_password(plain_pwd)
+            self._data["ftp_password"] = ""
+            self.save()
+
+        self._data["ftp_password"] = self._get_keyring_password()
+
+        # Migrar las plantillas únicas de ruta FTP (una por tipo de contenido)
+        # al nuevo esquema de categorías (varias por tipo, con varias rutas
+        # raíz cada una). Solo se ejecuta una vez: si ftp_categories ya existe
+        # (aunque esté vacío a propósito) no se vuelve a tocar.
+        if "ftp_categories" not in self._data:
+            self._migrate_ftp_categories()
+
+    def _migrate_ftp_categories(self):
+        from core.ftp_categories import build_wildcard_category
+        tv_tpl    = self._data.get("ftp_path_template", DEFAULTS["ftp_path_template"])
+        movie_tpl = self._data.get("ftp_movie_path_template", DEFAULTS["ftp_movie_path_template"])
+        self._data["ftp_categories"] = {
+            "tv":    [build_wildcard_category("Series", tv_tpl)] if (tv_tpl or "").strip() else [],
+            "movie": [build_wildcard_category("Películas", movie_tpl)] if (movie_tpl or "").strip() else [],
+        }
+        self.save()
+
     def save(self):
         path = config_path()
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, indent=2, ensure_ascii=False)
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+
+    def to_dict(self) -> dict:
+        """Copia de la configuración actual, sin la contraseña FTP en texto
+        plano — usada tanto para guardar en disco como para exportar."""
+        data = dict(self._data)
+        data["ftp_password"] = ""
+        return data
+
+    @staticmethod
+    def _get_keyring_password() -> str:
+        """Lee la contraseña FTP del almacén de credenciales del sistema.
+        Si no hay backend de keyring disponible, se degrada a "" (el usuario
+        deberá reingresarla) en vez de crashear la app."""
+        try:
+            return keyring.get_password(APP_NAME, _KEYRING_FTP_PASSWORD) or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _set_keyring_password(value: str):
+        try:
+            if value:
+                keyring.set_password(APP_NAME, _KEYRING_FTP_PASSWORD, value)
+            else:
+                keyring.delete_password(APP_NAME, _KEYRING_FTP_PASSWORD)
+        except Exception:
+            pass
 
     def get(self, key: str, default=None):
         return self._data.get(key, DEFAULTS.get(key, default))
 
     def set(self, key: str, value):
+        if key == "ftp_password":
+            self._set_keyring_password(value)
         self._data[key] = value
 
     def set_many(self, updates: dict):
-        self._data.update(updates)
+        for key, value in updates.items():
+            self.set(key, value)
 
     def __getitem__(self, key):
         return self._data.get(key, DEFAULTS.get(key))
 
     def __setitem__(self, key, value):
-        self._data[key] = value
+        self.set(key, value)

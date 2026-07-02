@@ -28,6 +28,7 @@ class MediaInfo:
     # Extras
     overview: Optional[str] = None
     genres: list = field(default_factory=list)
+    genre_ids: list = field(default_factory=list)   # ids crudos de TMDB, para clasificar por categoría
 
 
 class TMDBClient:
@@ -93,6 +94,11 @@ class TMDBClient:
     def get_movie_details(self, movie_id: int) -> dict:
         return self._get(f"/movie/{movie_id}")
 
+    def get_genres(self, media_type: str) -> list:
+        """Lista de géneros TMDB [{"id": int, "name": str}, ...] en el idioma configurado."""
+        endpoint = "/genre/tv/list" if media_type == "tv" else "/genre/movie/list"
+        return self._get(endpoint).get("genres", [])
+
     def build_media_info(self, result: dict, season=None, episode=None):
         media_type = result.get("media_type", "tv")
         if media_type == "tv":
@@ -116,6 +122,7 @@ class TMDBClient:
             episode=episode,
             overview=result.get("overview", ""),
             genres=[],
+            genre_ids=result.get("genre_ids", []) or [],
         )
 
         if media_type == "tv" and season is not None and episode is not None:
@@ -154,13 +161,14 @@ EPISODE_PATTERNS = [
 
 JUNK_PATTERNS = [
     r"\b(1080p|720p|480p|2160p|4K|HDR|SDR|UHD)\b",
-    r"\b(BluRay|Blu-Ray|WEB-DL|WEBRip|HDTV|DVDRip|BRRip|AMZN|NF|DSNP)\b",
+    r"\b(BluRay|Blu-Ray|BDRip|BDRemux|BRRemux|WEB-DL|WEBRip|HDTV|DVDRip|DVDScr|HDRip|BRRip|CAM|TS|AMZN|NF|DSNP)\b",
     r"\b(x264|x265|HEVC|AVC|H\.264|H\.265|AV1)\b",
     r"\b(AAC|AC3|DTS|DD5\.1|TrueHD|Atmos|FLAC|MP3)\b",
     r"\b(PROPER|REPACK|EXTENDED|UNRATED|THEATRICAL|REMUX)\b",
     r"\[(.*?)\]",
     r"\((.*?)\)",
     r"[.\-_]",   # puntos, guiones y guiones bajos → espacios
+    r"\bby\s+\S+\s*$",   # crédito de subida al final ("... by nombre_uploader")
 ]
 
 
