@@ -10,6 +10,10 @@ aRenombrar/**/__pycache__/
 # Logs de diagnóstico
 aRenombrar/diagnostico.log
 
+# Marcador de lanzar.vbs -- evita reinstalar dependencias en cada
+# arranque si requirements.txt no ha cambiado
+aRenombrar/.deps_installed
+
 # Config local (contiene contraseñas FTP y API keys)
 # El archivo real vive en %APPDATA%\aRenombrar\config.json
 aRenombrar/auto_processed.json

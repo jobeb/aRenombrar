@@ -156,19 +156,199 @@ class FTPClient:
         except ftplib.all_errors:
             pass   # servidor sin soporte MLSD -> probar LIST
         try:
-            lines = []
-            self.ftp.retrlines(f"LIST {path}", lines.append)
+            lines = self._retrlines_lenient(f"LIST {path}")
             return _parse_unix_list_dirs(lines)
         except ftplib.all_errors:
             return []
 
-    def get_free_space(self) -> Optional[int]:
-        """Intenta obtener espacio libre en bytes probando varios comandos."""
+    def list_files(self, path: str) -> list[str]:
+        """Devuelve los nombres de los archivos directos de *path* (sin
+        subcarpetas). Mismo patrón que list_dirs: MLSD si el servidor lo
+        soporta, si no cae a parsear LIST (formato Unix)."""
+        if not self.is_connected():
+            return []
+        try:
+            names = []
+            for name, facts in self.ftp.mlsd(path):
+                if name in (".", "..") or facts.get("type") != "file":
+                    continue
+                names.append(name)
+            return names
+        except ftplib.all_errors:
+            pass   # servidor sin soporte MLSD -> probar LIST
+        try:
+            lines = self._retrlines_lenient(f"LIST {path}")
+            return _parse_unix_list_files(lines)
+        except ftplib.all_errors:
+            return []
+
+    def _retrlines_lenient(self, cmd: str) -> list[str]:
+        """Igual que ftplib.FTP.retrlines(), pero decodificando cada línea
+        con errors="replace" en vez de estricto. Necesario porque un
+        servidor puede tener archivos antiguos con nombres en latin-1
+        (de antes de activar utf8_filesystem, por ejemplo) mezclados con
+        otros en UTF-8 -- con decodificación estricta, una sola línea con
+        bytes inválidos tira abajo el listado ENTERO de la carpeta
+        (UnicodeDecodeError, que ftplib.all_errors no cubre). Con
+        errors="replace" esa línea concreta sale con un "?" en el
+        carácter problemático (en vez de crash), pero el resto del
+        nombre -- y sobre todo el patrón NxNN de temporada/episodio, que
+        no usa acentos -- se mantiene intacto y se puede seguir parseando."""
+        self.ftp.sendcmd("TYPE A")
+        lines = []
+        with self.ftp.transfercmd(cmd) as conn, \
+                conn.makefile("r", encoding=self.ftp.encoding, errors="replace") as fp:
+            while True:
+                line = fp.readline(self.ftp.maxline + 1)
+                if not line:
+                    break
+                if line[-2:] == "\r\n":
+                    line = line[:-2]
+                elif line[-1:] == "\n":
+                    line = line[:-1]
+                lines.append(line)
+        self.ftp.voidresp()
+        return lines
+
+    def list_files_recursive(self, path: str, max_depth: int = 3) -> list[str]:
+        """Nombres de TODOS los archivos bajo *path*, bajando por sus
+        subcarpetas (p.ej. "Serie/Temporada 01/", "Serie/Temporada 02/")
+        hasta max_depth niveles -- usado por el detector de episodios que
+        faltan para comprobar de verdad qué hay en el FTP para una serie
+        concreta (ver core/missing_episodes.py), sin necesitar saber de
+        antemano cómo se llaman las subcarpetas de temporada. Solo
+        nombres de archivo sueltos (no rutas completas): basta para que
+        detect_episode() saque la temporada/episodio del propio nombre."""
+        if max_depth <= 0 or not self.is_connected():
+            return []
+        files = list(self.list_files(path))
+        for sub in self.list_dirs(path):
+            files.extend(self.list_files_recursive(f"{path.rstrip('/')}/{sub}", max_depth - 1))
+        return files
+
+    def list_tree_recursive(self, path: str) -> "dict | None":
+        """Intenta traer el árbol COMPLETO bajo *path* en una sola
+        petición con "LIST -R" -- una extensión no estándar de FTP que
+        soportan varios servidores (vsftpd, con ls_recurse_enable=YES en
+        vsftpd.conf; también proftpd y pure-ftpd), mucho más rápido que
+        recorrer subcarpeta por subcarpeta con un listado por cada una
+        (ver get_folder_size). Devuelve {ruta_de_carpeta: [(nombre,
+        tamaño), ...], ...} -- una entrada por cada carpeta del árbol,
+        con sus archivos directos -- o None si el servidor no soporta -R
+        o la respuesta no tiene el formato esperado, en cuyo caso hay que
+        recurrir al recorrido manual carpeta por carpeta."""
+        if not self.is_connected():
+            return None
+        try:
+            lines = self._retrlines_lenient(f"LIST -R {path}")
+        except ftplib.all_errors:
+            return None
+        return _parse_recursive_list_sections(lines)
+
+    def list_files_with_sizes(self, path: str) -> list[tuple[str, int]]:
+        """[(nombre, tamaño_en_bytes), ...] de los archivos directos de
+        *path* -- mismo patrón MLSD-primero-LIST-después que list_files,
+        pero conservando el tamaño (que list_files descarta). Usado por
+        get_folder_size(), para la herramienta de liberar espacio."""
+        if not self.is_connected():
+            return []
+        try:
+            result = []
+            for name, facts in self.ftp.mlsd(path):
+                if name in (".", "..") or facts.get("type") != "file":
+                    continue
+                try:
+                    size = int(facts.get("size", 0))
+                except (TypeError, ValueError):
+                    size = 0
+                result.append((name, size))
+            return result
+        except ftplib.all_errors:
+            pass   # servidor sin soporte MLSD -> probar LIST
+        try:
+            lines = self._retrlines_lenient(f"LIST {path}")
+            return _parse_unix_list_files_with_sizes(lines)
+        except ftplib.all_errors:
+            return []
+
+    def get_folder_size(self, path: str, max_depth: int = 6) -> int:
+        """Tamaño total en bytes de todos los archivos bajo *path*,
+        recorriendo subcarpetas -- la herramienta de liberar espacio
+        necesita saber cuánto ocupa cada serie/película completa (con
+        todas sus temporadas) para el filtro de tamaño y para mostrar
+        cuánto se liberaría al borrar. max_depth más alto que
+        list_files_recursive (6 en vez de 3) porque aquí sí puede haber
+        estructuras más profundas (serie/temporada/extras/...) y calcular
+        mal el tamaño (de menos) es peor que tardar un poco más."""
+        if max_depth <= 0 or not self.is_connected():
+            return 0
+        total = sum(size for _name, size in self.list_files_with_sizes(path))
+        for sub in self.list_dirs(path):
+            total += self.get_folder_size(f"{path.rstrip('/')}/{sub}", max_depth - 1)
+        return total
+
+    def delete_folder_recursive(self, path: str, max_depth: int = 8) -> tuple[bool, str]:
+        """Borra una carpeta completa (todos sus archivos y subcarpetas,
+        y al final la propia carpeta) del servidor FTP -- para la
+        herramienta de liberar espacio (primera vez que la app borra algo
+        de verdad; hasta ahora solo subía/listaba/renombraba). Borra
+        primero el contenido de más profundo a menos y al final la propia
+        carpeta, porque el protocolo FTP no permite RMD de una carpeta
+        que no esté vacía. Se detiene y devuelve el fallo en cuanto algo
+        no se puede borrar, en vez de seguir a medias -- mejor que el
+        usuario vea un error claro a que quede la carpeta parcialmente
+        vaciada sin saberlo."""
+        if not self.is_connected():
+            return False, "No conectado al servidor FTP."
+        if max_depth <= 0:
+            return False, "Profundidad máxima de subcarpetas alcanzada"
+        try:
+            for sub in self.list_dirs(path):
+                ok, msg = self.delete_folder_recursive(f"{path.rstrip('/')}/{sub}", max_depth - 1)
+                if not ok:
+                    return False, msg
+            for name in self.list_files(path):
+                self.ftp.delete(f"{path.rstrip('/')}/{name}")
+            self.ftp.rmd(path)
+            return True, "Carpeta eliminada"
+        except ftplib.all_errors as e:
+            return False, str(e)
+
+    def get_free_space(self, path: Optional[str] = None) -> Optional[int]:
+        """Intenta obtener espacio libre en bytes probando varios comandos.
+
+        Si se indica *path*, se cambia primero a ese directorio (y se vuelve
+        al de antes al terminar) para que, en los servidores que sí soportan
+        alguno de estos comandos, el espacio reportado sea el del disco
+        concreto donde va a aterrizar la subida — no el de donde sea que
+        estuviera la conexión en ese momento. Necesario porque un mismo
+        servidor puede tener varias rutas repartidas en discos distintos
+        (visto de primera mano: la misma carpeta lógica montada sobre dos
+        discos físicos separados puede dar cifras de espacio muy distintas
+        según en cuál se pregunte)."""
         if not self.ftp:
             return None
         import re
         _num = re.compile(r'\d{6,}')  # número de ≥6 dígitos = bytes plausibles
 
+        prev_dir = None
+        if path:
+            try:
+                prev_dir = self.ftp.pwd()
+                self.ftp.cwd(path)
+            except ftplib.all_errors:
+                prev_dir = None   # no se pudo entrar -- seguir preguntando donde estuviera
+
+        try:
+            return self._get_free_space_here(_num)
+        finally:
+            if prev_dir is not None:
+                try:
+                    self.ftp.cwd(prev_dir)
+                except ftplib.all_errors:
+                    pass
+
+    def _get_free_space_here(self, _num) -> Optional[int]:
         # vsftpd no soporta ningún comando de espacio libre — salir inmediatamente
         try:
             stat = self.ftp.sendcmd("STAT")
@@ -373,6 +553,20 @@ class FTPClient:
                 except Exception:
                     pass
 
+            # Verificación de integridad: el servidor puede devolver "226
+            # Transfer complete" aunque el archivo haya quedado incompleto o
+            # corrupto (corte de red silencioso, disco lleno sin error FTP
+            # claro...). Comparar el tamaño final contra el local antes de
+            # dar la subida por buena -- si el servidor no soporta SIZE, se
+            # omite el chequeo en vez de fallar (igual que get_free_space).
+            try:
+                final_size = self.ftp.size(remote_file)
+            except ftplib.all_errors:
+                final_size = None
+            if final_size is not None and final_size != total:
+                return False, (f"Subida incompleta: el servidor tiene {final_size} bytes, "
+                                f"se esperaban {total} (posible corte o corrupción)")
+
             return True, remote_file
         except _Cancelled:
             try:
@@ -437,3 +631,103 @@ def _parse_unix_list_dirs(lines: list) -> list:
             if name not in (".", ".."):
                 names.append(name)
     return names
+
+
+def _parse_unix_list_files(lines: list) -> list:
+    """Igual que _parse_unix_list_dirs pero al revés: extrae los nombres de
+    archivo ('-rw-r--r-- ... nombre con espacios'), ignorando directorios."""
+    names = []
+    for line in lines:
+        if not line or line[0] != "-":
+            continue
+        parts = line.split(None, 8)
+        if len(parts) == 9:
+            names.append(parts[8])
+    return names
+
+
+def _parse_unix_list_files_with_sizes(lines: list) -> list[tuple[str, int]]:
+    """Igual que _parse_unix_list_files, pero conservando el tamaño (el
+    5º campo del formato Unix de LIST: permisos, enlaces, dueño, grupo,
+    TAMAÑO, mes, día, hora/año, nombre)."""
+    result = []
+    for line in lines:
+        if not line or line[0] != "-":
+            continue
+        parts = line.split(None, 8)
+        if len(parts) == 9:
+            try:
+                size = int(parts[4])
+            except ValueError:
+                size = 0
+            result.append((parts[8], size))
+    return result
+
+
+def _parse_recursive_list_sections(lines: list) -> "dict | None":
+    """Parsea la salida de "LIST -R": una serie de secciones separadas
+    por línea en blanco, cada una empezando con una línea "ruta:" seguida
+    de líneas de listado Unix normales para esa carpeta -- el mismo
+    formato que produce "ls -R". Devuelve {ruta: [(nombre, tamaño), ...],
+    ...} o None si ninguna línea tiene forma de cabecera de sección (el
+    servidor probablemente ignoró "-R" y devolvió un listado plano de la
+    carpeta pedida nada más, no un árbol)."""
+    sections: dict = {}
+    current_path = None
+    current_lines: list = []
+    saw_header = False
+
+    def _flush():
+        nonlocal current_path, current_lines
+        if current_path is not None:
+            sections[current_path] = _parse_unix_list_files_with_sizes(current_lines)
+        current_path, current_lines = None, []
+
+    for line in lines:
+        if not line.strip():
+            _flush()
+        elif line.endswith(":") and line[0] in ("/", ".") :
+            _flush()
+            current_path = line[:-1]
+            saw_header = True
+        else:
+            current_lines.append(line)
+    _flush()
+
+    return sections if saw_header else None
+
+
+def sizes_by_top_level_folder(tree: dict, root: str) -> dict:
+    """A partir del árbol que devuelve list_tree_recursive(root), suma el
+    tamaño de TODOS los archivos bajo cada carpeta de primer nivel
+    (serie/película completa, con todas sus subcarpetas de temporada,
+    extras, etc.) -- para la herramienta de liberar espacio, que necesita
+    el tamaño total por serie/película, no por subcarpeta suelta.
+    Devuelve {nombre_carpeta: tamaño_total_bytes, ...}."""
+    root = root.rstrip("/")
+    totals: dict = {}
+    for path, files in tree.items():
+        rel = path.rstrip("/")
+        if rel == root or not rel.startswith(root + "/"):
+            continue   # archivos sueltos en la raíz, no dentro de ninguna carpeta de primer nivel
+        top_folder = rel[len(root) + 1:].split("/", 1)[0]
+        totals[top_folder] = totals.get(top_folder, 0) + sum(size for _name, size in files)
+    return totals
+
+
+def files_by_top_level_folder(tree: dict, root: str) -> dict:
+    """Como sizes_by_top_level_folder, pero devolviendo los NOMBRES de
+    archivo (no el tamaño) de todos los archivos bajo cada carpeta de
+    primer nivel -- para el detector de episodios que faltan, que cruza
+    con el FTP real recorriendo los nombres con detect_episode() para
+    sacar temporada/episodio, no necesita el tamaño.
+    Devuelve {nombre_carpeta: [nombre_archivo, ...], ...}."""
+    root = root.rstrip("/")
+    result: dict = {}
+    for path, files in tree.items():
+        rel = path.rstrip("/")
+        if rel == root or not rel.startswith(root + "/"):
+            continue
+        top_folder = rel[len(root) + 1:].split("/", 1)[0]
+        result.setdefault(top_folder, []).extend(name for name, _size in files)
+    return result

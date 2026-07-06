@@ -24,7 +24,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-py -m pip install customtkinter Pillow requests tkinterdnd2
+py -m pip install -r "%~dp0requirements.txt"
 echo.
 echo Creando acceso directo en el Escritorio...
 py "%~dp0crear_acceso_directo.py"

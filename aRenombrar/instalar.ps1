@@ -47,7 +47,11 @@ if (-not $python) {
 
 Write-Host "`nInstalando dependencias..." -ForegroundColor Yellow
 & $python -m pip install --upgrade pip --quiet
-& $python -m pip install customtkinter Pillow requests tkinterdnd2
+# requirements.txt es la unica fuente de verdad (tambien la usa el
+# instalador de macOS) -- instalar paquetes sueltos a mano aqui hacia que
+# este script se desincronizara y dejara de instalar keyring, con lo que
+# la app no llegaba ni a arrancar (config.py importa keyring sin proteger).
+& $python -m pip install -r "$PSScriptRoot\requirements.txt"
 
 Write-Host "`n============================================" -ForegroundColor Cyan
 Write-Host "  Instalacion completada!" -ForegroundColor Green

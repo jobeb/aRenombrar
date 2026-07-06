@@ -1,3 +1,6 @@
+import pytest
+
+import core.api_client as api_client_mod
 from core.api_client import detect_episode, TMDBClient
 
 
@@ -14,6 +17,17 @@ def test_detect_series_1x01_format():
     assert r["title"] == "The Office"
     assert r["season"] == 4
     assert r["episode"] == 12
+    assert r["media_type"] == "tv"
+
+
+def test_detect_series_1x01_format_uppercase_x():
+    # Algunos grupos de release usan la "X" en mayúscula ("2X01" en vez de
+    # "2x01") -- caso real: "Arcadia.2X01...", que sin esto se detectaba
+    # como película (sin temporada/episodio) al no coincidir el patrón.
+    r = detect_episode("Arcadia.2X01.El.Guardian.WEB-DL.1080p.mkv")
+    assert r["title"] == "Arcadia"
+    assert r["season"] == 2
+    assert r["episode"] == 1
     assert r["media_type"] == "tv"
 
 
@@ -68,6 +82,78 @@ def test_detect_strips_trailing_uploader_credit_only_at_end():
     assert r["title"] == "Catch Me If You Can"
 
 
+def test_detect_truncates_at_first_junk_marker_even_if_unlisted_credit_follows():
+    # "Kowalski&Xusman" y "Nocturniap2p" no estan en ninguna lista de basura
+    # conocida, pero como aparecen DESPUES de "Eac3"/"Castellano" (que si lo
+    # estan), se descartan igualmente por venir despues del primer indicio
+    # tecnico -- no hace falta reconocer cada credito de subida posible.
+    r = detect_episode(
+        "La.Residencia.Eac3.Castellano.Frances+Forzados+Completos."
+        "Kowalski&Xusman.Para.Nocturniap2p.mkv")
+    assert r["title"] == "La Residencia"
+    assert r["media_type"] == "movie"
+
+
+def test_detect_eac3_recognized_not_just_ac3():
+    # "EAC3" no matchea \bAC3\b (no hay limite de palabra entre la E y la A)
+    r = detect_episode("Movie.Name.2020.WEB-DL.EAC3.mkv")
+    assert r["title"] == "Movie Name"
+
+
+def test_detect_strips_bit_depth_marker():
+    # "10Bit"/"8-bit" (profundidad de color) no estaba en ninguna lista
+    r = detect_episode("El.Abismo.Secreto.10Bit.WEB-DL.1080p.mkv")
+    assert r["title"] == "El Abismo Secreto"
+
+
+def test_detect_strips_webdl_without_hyphen():
+    # "WEB-DL" exigia el guion literal -- "Webdl"/"WEBDL" sin guion no se reconocia
+    r = detect_episode("Balls.Up.Webdl.mkv")
+    assert r["title"] == "Balls Up"
+
+
+def test_detect_uses_extra_junk_terms_candidate(monkeypatch, tmp_path):
+    # "DSNYP" no esta en ninguna lista (ni estatica ni aprendida) -- sin
+    # pasarlo como candidato, se queda pegado al titulo.
+    import core.learned_terms as lt
+    monkeypatch.setattr(lt, "app_data_dir", lambda: tmp_path)
+    lt._reset_cache_for_tests()
+
+    r_sin = detect_episode("Cazadores De Sombras DSNYP HEVC.mkv")
+    assert "dsnyp" in r_sin["title"].lower()
+
+    r_con = detect_episode("Cazadores De Sombras DSNYP HEVC.mkv", extra_junk_terms=["DSNYP"])
+    assert r_con["title"] == "Cazadores De Sombras"
+
+
+def test_detect_picks_up_persisted_learned_terms(monkeypatch, tmp_path):
+    # Una vez aprendido (persistido), detect_episode lo reconoce solo, sin
+    # necesidad de volver a pasarlo como extra_junk_terms cada vez.
+    import core.learned_terms as lt
+    monkeypatch.setattr(lt, "app_data_dir", lambda: tmp_path)
+    lt._reset_cache_for_tests()
+    lt.add_learned_terms(["DSNYP"])
+
+    r = detect_episode("Cazadores De Sombras DSNYP HEVC.mkv")
+    assert r["title"] == "Cazadores De Sombras"
+
+
+def test_detect_strips_spanish_language_tags():
+    r = detect_episode("Alguna Serie 1x05 Castellano Latino VOSE.mkv")
+    assert r["title"] == "Alguna Serie"
+    assert r["season"] == 1
+    assert r["episode"] == 5
+
+
+def test_detect_junk_marker_inside_parens_cuts_before_the_paren_not_mid_group():
+    # Si el termino de basura cae DENTRO de un parentesis/corchete sin
+    # cerrar, el corte debe hacerse antes de abrirlo, no a la mitad (si no,
+    # queda un "(" o "[" suelto en el titulo).
+    r = detect_episode("Titulo Pelicula (2019) (Spanish English Subs) BDRip.mkv")
+    assert r["title"] == "Titulo Pelicula"
+    assert "(" not in r["title"] and "[" not in r["title"]
+
+
 def test_detect_empty_filename_returns_movie_dict():
     r = detect_episode("")
     assert r["media_type"] == "movie"
@@ -93,3 +179,105 @@ def test_build_media_info_genre_ids_defaults_to_empty_list():
     result = {"id": 1, "media_type": "movie", "title": "X", "release_date": "2020-01-01"}
     info = client.build_media_info(result, season=None, episode=None)
     assert info.genre_ids == []
+
+
+class _FakeTmdbResponse:
+    def __init__(self, json_data, status_code=200):
+        self._json = json_data
+        self.status_code = status_code
+        self.headers = {}
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._json
+
+
+def test_get_season_episodes_returns_episode_numbers_and_names(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    payload = {"episodes": [
+        {"episode_number": 1, "name": "Piloto", "air_date": "2020-01-01"},
+        {"episode_number": 2, "name": "Segundo episodio", "air_date": "2020-01-08"},
+    ]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    episodes = client.get_season_episodes(1396, 1)
+    assert episodes == [
+        {"episode_number": 1, "name": "Piloto"},
+        {"episode_number": 2, "name": "Segundo episodio"},
+    ]
+
+
+def test_get_season_episodes_excludes_unaired_episodes(monkeypatch):
+    # TMDB a veces ya lista episodios de una temporada anunciada/en emisión
+    # que aún no han salido -- no deben contar como "que faltan".
+    client = TMDBClient(api_key="dummy")
+    payload = {"episodes": [
+        {"episode_number": 1, "name": "Ya emitido", "air_date": "2020-01-01"},
+        {"episode_number": 2, "name": "Fecha futura", "air_date": "2099-01-01"},
+        {"episode_number": 3, "name": "Sin fecha todavia", "air_date": None},
+        {"episode_number": 4, "name": "Sin campo air_date"},
+    ]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    episodes = client.get_season_episodes(1396, 1)
+    assert episodes == [{"episode_number": 1, "name": "Ya emitido"}]
+
+
+# ── Límite de peticiones a TMDB (~40/10s por IP) ────────────────────────
+
+def _fake_clock(monkeypatch):
+    """Reloj falso controlable a mano -- avanza solo cuando se llama a
+    time.sleep(), para poder probar el throttle sin esperar de verdad ni
+    caer en un bucle infinito (el fake de time.sleep no hace pasar el
+    tiempo real por sí solo)."""
+    now = [1000.0]
+    monkeypatch.setattr(api_client_mod.time, "monotonic", lambda: now[0])
+    sleeps = []
+    def _sleep(s):
+        sleeps.append(s)
+        now[0] += s
+    monkeypatch.setattr(api_client_mod.time, "sleep", _sleep)
+    return sleeps
+
+
+def test_throttle_allows_up_to_the_limit_without_waiting(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    sleeps = _fake_clock(monkeypatch)
+    for _ in range(client._MAX_REQUESTS_PER_WINDOW):
+        client._throttle()
+    assert sleeps == []
+
+
+def test_throttle_waits_once_the_limit_is_exceeded(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    sleeps = _fake_clock(monkeypatch)
+    for _ in range(client._MAX_REQUESTS_PER_WINDOW):
+        client._throttle()
+    client._throttle()   # el siguiente ya supera el limite -- deberia esperar
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+def test_get_retries_on_429_then_succeeds(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    monkeypatch.setattr(api_client_mod.time, "sleep", lambda s: None)
+    responses = [_FakeTmdbResponse({}, status_code=429),
+                 _FakeTmdbResponse({"ok": True}, status_code=200)]
+    calls = []
+    def _fake_get(url, **kw):
+        calls.append(url)
+        return responses.pop(0)
+    monkeypatch.setattr(client.session, "get", _fake_get)
+
+    result = client._get("/tv/1")
+    assert result == {"ok": True}
+    assert len(calls) == 2
+
+
+def test_get_gives_up_after_max_429_retries(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    monkeypatch.setattr(api_client_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(client.session, "get",
+                        lambda url, **kw: _FakeTmdbResponse({}, status_code=429))
+    with pytest.raises(RuntimeError):
+        client._get("/tv/1")

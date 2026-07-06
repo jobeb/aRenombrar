@@ -13,7 +13,7 @@ Excepciones manejadas:
 import difflib
 import json
 import logging
-import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -24,44 +24,31 @@ from core.ftp_client import _ftp_safe
 from core.series_match import best_match
 from core.ftp_categories import choose_category
 from core.upload_slots import UploadSlotManager
+from core.appdirs import app_data_dir
+from core.applog import get_logger
 
 
 def _app_dir() -> Path:
-    """Carpeta de datos de la app en AppData (Windows) o ~/.config (Linux/Mac)."""
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", Path.home()))
-    else:
-        base = Path.home() / ".config"
-    p = base / "aRenombrar"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return app_data_dir()
 
 
 def _processed_db_path() -> Path:
     return _app_dir() / "auto_processed.json"
 
 
-def _setup_logger() -> logging.Logger:
-    """Configura el logger de depuración rotativo (max 2 MB × 2 archivos)."""
-    from logging.handlers import RotatingFileHandler
-    log_path = _app_dir() / "auto_watcher.log"
-    logger = logging.getLogger("aRenombrar.auto")
-    if logger.handlers:          # ya inicializado (p.ej. segunda instancia)
-        return logger
-    logger.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024,
-                              backupCount=2, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
-
-
-_log = _setup_logger()
+_log = get_logger("aRenombrar.auto", "auto_watcher.log", level=logging.DEBUG)
 
 STABLE_WAIT  = 6    # segundos esperando que el archivo deje de crecer
 DEFAULT_POLL = 10   # segundos entre escaneos (por defecto)
+
+# Fragmentos (en minúsculas) que delatan "archivo bloqueado por otro
+# proceso" en el mensaje de error de rename_file(), sea cual sea el SO:
+# Windows (WinError 32, en español o inglés) o POSIX (EBUSY/EACCES).
+_LOCKED_FILE_HINTS = (
+    "32", "utilizado", "being used", "locked",
+    "resource busy", "ebusy", "device or resource busy",
+    "permission denied", "acceso denegado",
+)
 
 
 class AutoWatcher:
@@ -160,7 +147,7 @@ class AutoWatcher:
                 continue
             if key in self._processed:
                 status = self._processed[key].get("status", "")
-                if status in ("subido", "renombrado", "identificado_manual", "subiendo"):
+                if status in ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado"):
                     # "renombrado", "identificado_manual" y "subiendo" los
                     # escribe la GUI cuando el usuario renombra/identifica/sube
                     # el archivo a mano (ver _mark_auto_processed) — justamente
@@ -174,6 +161,13 @@ class AutoWatcher:
                     # quita solo si la subida manual no termina bien (ver
                     # _unmark_auto_processed), así que no se queda bloqueado
                     # para siempre si algo falla o se cierra la app a medias.
+                    # "duplicado" (detectado por find_duplicate, ver más abajo)
+                    # es una comprobación deliberada, no un fallo -- sin esto
+                    # en la lista, cada escaneo lo trataba como "hay que
+                    # reintentar" y volvía a detectar/marcar el mismo
+                    # duplicado sin parar (visto de verdad con Dr. Stone
+                    # 4x32, que "reaparecía" cada vez que se activaba el
+                    # automático).
                     _log.debug("Saltado (%s): %s", status, item.name)
                     continue
                 # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar
@@ -199,6 +193,42 @@ class AutoWatcher:
             return s1 == s2 and s2 > 0
         except OSError:
             return False
+
+    def _try_ai_fallback(self, path: Path, detected: dict):
+        """Igual que en gui/app.py::_try_ai_fallback -- último recurso
+        cuando TMDB no encuentra nada con el título limpiado localmente. Solo
+        aprende (persiste) los términos nuevos si de verdad ayudan a
+        encontrar resultado, para no contaminar la lista con un despiste de
+        la IA. Devuelve (results, detected) o None."""
+        if not self.config.get("ai_fallback_enabled"):
+            return None
+        api_key = self.config.get("ai_api_key", "")
+        if not api_key:
+            return None
+        from core.ai_title_fallback import guess_title_via_ai
+        stem = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", path.name)
+        ai_result = guess_title_via_ai(stem, api_key)
+        if not ai_result:
+            return None
+        retry_detected = detect_episode(path.name, extra_junk_terms=ai_result["junk_tokens"])
+        if not retry_detected.get("title"):
+            return None
+        retry_media_type = retry_detected.get("media_type", "tv")
+        if retry_media_type == "tv":
+            raw = self.tmdb.search_tv(retry_detected["title"])
+            retry_results = [dict(r, media_type="tv") for r in raw]
+        else:
+            raw = self.tmdb.search_movie(retry_detected["title"])
+            retry_results = [dict(r, media_type="movie") for r in raw]
+        if not retry_results:
+            retry_results = self.tmdb.search_multi(retry_detected["title"])
+        if not retry_results:
+            return None
+        from core.learned_terms import add_learned_terms
+        add_learned_terms(ai_result["junk_tokens"])
+        _log.info("Fallback de IA aprendio terminos nuevos tras %s: %s",
+                   path.name, ai_result["junk_tokens"])
+        return retry_results, retry_detected
 
     # ── Procesado de un archivo ────────────────────────────────────────────────
 
@@ -246,6 +276,12 @@ class AutoWatcher:
                 else:
                     raw = self.tmdb.search_movie(detected["title"])
                     results = [dict(r, media_type="movie") for r in raw]
+
+            if not results:
+                fallback = self._try_ai_fallback(path, detected)
+                if fallback:
+                    results, detected = fallback
+                    media_type = detected.get("media_type", media_type)
 
             if not results:
                 _log.warning("Sin resultados TMDB para: %s", path.name)
@@ -302,7 +338,10 @@ class AutoWatcher:
 
             # 4. Renombrar en origen (opcional — "Renombrar archivos en
             # origen" en Ajustes). Con reintentos si el archivo está
-            # bloqueado en Windows.
+            # bloqueado por otro proceso (típico en Windows — WinError 32 —
+            # pero también se cubren los equivalentes de macOS/Linux, donde
+            # esto es mucho más raro porque POSIX permite renombrar archivos
+            # abiertos, salvo en discos de red con locks o permisos).
             rename_local = self.config.get("rename_local", True)
             if rename_local:
                 ok, result_path = False, ""
@@ -310,7 +349,7 @@ class AutoWatcher:
                     ok, result_path = rename_file(str(path), new_name)
                     if ok:
                         break
-                    _is_locked = any(s in str(result_path) for s in ("32", "utilizado", "being used", "locked"))
+                    _is_locked = any(s in str(result_path).lower() for s in _LOCKED_FILE_HINTS)
                     _log.warning("Rename intento %d falló: %s | locked=%s", _attempt + 1, result_path, _is_locked)
                     if _is_locked and _attempt < 3:
                         self.on_event("info", f"Archivo en uso, reintentando ({_attempt+1}/3): {path.name}")
@@ -452,6 +491,52 @@ class AutoWatcher:
             # organizando por serie/temporada según TMDB.
             remote_filename = new_name if self.config.get("rename_remote", True) else Path(key).name
 
+            # Detección de duplicados: ¿ya hay en esa carpeta remota un
+            # archivo DISTINTO que representa el mismo contenido (mismo
+            # episodio, u otra versión de la misma película)? En modo
+            # automático, sin nadie mirando un diálogo, se omite
+            # directamente en vez de preguntar -- más seguro que subir
+            # (o sobrescribir) sin supervisión.
+            from core.duplicate_detect import find_duplicate
+            existing_files = self.ftp.list_files(remote_path)
+            dup = find_duplicate(existing_files, media_info, remote_filename)
+            if dup:
+                _log.info("Duplicado detectado, se omite: %s (ya existe %s)", new_name, dup)
+                self.on_event("skip", f"Duplicado (ya existe {dup}): {new_name}")
+                self.on_file_event(key, "skip", new_name=new_name,
+                                    reason=f"Ya existe otro archivo para este mismo contenido: {dup}")
+                _mark_both("duplicado", new_name=new_name)
+                return
+
+            # Comprobación de espacio libre en el disco concreto de destino
+            # (no del servidor en general -- el mismo servidor puede tener
+            # varias rutas en discos distintos) antes de empezar a subir
+            # nada. Si el servidor no soporta ningún comando de espacio
+            # libre (p.ej. vsftpd, el nuestro), get_free_space() devuelve
+            # None y este chequeo simplemente no aplica -- igual que en la
+            # subida manual.
+            try:
+                local_size = Path(new_path).stat().st_size
+            except OSError:
+                local_size = 0
+            free = self.ftp.get_free_space(remote_path)
+            if free is None and self.config.get("jellyfin_enabled"):
+                # Igual que en la subida manual: si el FTP no da el dato,
+                # usar el de Jellyfin (>= 10.11) si está configurado,
+                # emparejando por la raíz de la categoría.
+                from core.media_server_refresh import get_jellyfin_free_space_for_root
+                free = get_jellyfin_free_space_for_root(
+                    root, self.config.get("jellyfin_host", ""),
+                    self.config.get("jellyfin_api_key", ""))
+            if free is not None and free < local_size:
+                _log.error("Sin espacio en el disco de destino para %s (libre: %s, necesita: %s)",
+                           new_name, free, local_size)
+                self.on_event("error", f"Disco lleno en el servidor: {new_name}")
+                self.on_file_event(key, "error", new_name=new_name,
+                                    reason=f"Disco lleno en el servidor (libre: {free/(1024**3):.1f} GB)")
+                _mark_both("disco_lleno", new_name=new_name)
+                return
+
             _log.info("Subiendo: %s → %s/%s", new_name, remote_path, remote_filename)
             self.on_event("info", f"Subiendo: {new_name}")
             self.on_file_event(key, "uploading", new_name=new_name, progress=0.0, speed=0.0)
@@ -486,6 +571,8 @@ class AutoWatcher:
                 self.on_event("ok", f"✓ Subido: {new_name}")
                 self.on_file_event(key, "uploaded", new_name=new_name)
                 _mark_both("subido", new_name=new_name)
+                from core.media_server_refresh import trigger_refresh
+                trigger_refresh(self.config)
                 # Acción post-proceso: solo tras subida exitosa
                 action = self.config.get("auto_action", "Mantener original")
                 renamed_path = Path(new_path)

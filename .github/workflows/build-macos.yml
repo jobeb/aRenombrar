@@ -1,0 +1,39 @@
+name: Build macOS
+
+# Solo manual (botón "Run workflow" en la pestaña Actions) -- no se dispara
+# con push ni pull_request, para no cambiar el flujo normal de trabajo.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: aRenombrar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Compilar con PyInstaller
+        run: pyinstaller aRenombrar.spec
+
+      - name: Empaquetar en DMG
+        run: |
+          mkdir dmg_root
+          cp -R dist/aRenombrar.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create -volname aRenombrar -srcfolder dmg_root -ov -format UDZO aRenombrar.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aRenombrar-macos
+          path: aRenombrar/aRenombrar.dmg

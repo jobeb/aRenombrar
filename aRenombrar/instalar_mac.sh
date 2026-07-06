@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 echo "============================================"
 echo "  aRenombrar - Instalador macOS"
 echo "============================================"
@@ -11,9 +12,15 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo "Instalando dependencias..."
 python3 -m pip install --upgrade pip
-python3 -m pip install customtkinter Pillow requests
+# requirements.txt es la única fuente de verdad (la usan también los
+# instaladores de Windows) — instalar los paquetes sueltos a mano aquí
+# hacía que este script se desincronizara y dejara de instalar keyring y
+# tkinterdnd2, con lo que la app no llegaba ni a arrancar.
+python3 -m pip install -r "$SCRIPT_DIR/requirements.txt"
 
 echo
 echo "============================================"

@@ -13,6 +13,11 @@ def write(msg):
     print(msg)
 
 log.write_text("", encoding="utf-8")  # limpiar
+try:
+    from core.version import __version__
+    write(f"aRenombrar: v{__version__}")
+except Exception:
+    pass
 write(f"Python: {sys.version}")
 write(f"Ejecutable: {sys.executable}")
 write(f"Ruta del script: {__file__}")

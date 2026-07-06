@@ -92,6 +92,65 @@ def test_set_many_routes_ftp_password_through_keyring(tmp_path, monkeypatch):
     assert cfg.get("ftp_host") == "ftp.example.com"
 
 
+def test_ai_api_key_never_written_to_disk_in_plaintext(tmp_path, monkeypatch):
+    cfg_file, _ = _isolated_config(tmp_path, monkeypatch)
+    cfg = Config()
+    cfg.set("ai_api_key", "gsk_secreto")
+    cfg.save()
+
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert saved["ai_api_key"] == ""
+    assert cfg.get("ai_api_key") == "gsk_secreto"
+
+
+def test_ai_api_key_persists_across_reload_via_keyring(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)
+    cfg1 = Config()
+    cfg1.set("ai_api_key", "gsk_hunter2")
+    cfg1.save()
+
+    cfg2 = Config()  # simula reabrir la app
+    assert cfg2.get("ai_api_key") == "gsk_hunter2"
+
+
+def test_plex_token_and_jellyfin_key_never_written_to_disk_in_plaintext(tmp_path, monkeypatch):
+    cfg_file, _ = _isolated_config(tmp_path, monkeypatch)
+    cfg = Config()
+    cfg.set("plex_token", "plex_secreto")
+    cfg.set("jellyfin_api_key", "jelly_secreto")
+    cfg.save()
+
+    saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert saved["plex_token"] == ""
+    assert saved["jellyfin_api_key"] == ""
+    assert cfg.get("plex_token") == "plex_secreto"
+    assert cfg.get("jellyfin_api_key") == "jelly_secreto"
+
+
+def test_plex_and_jellyfin_credentials_persist_across_reload(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)
+    cfg1 = Config()
+    cfg1.set("plex_token", "tok1")
+    cfg1.set("jellyfin_api_key", "key1")
+    cfg1.save()
+
+    cfg2 = Config()
+    assert cfg2.get("plex_token") == "tok1"
+    assert cfg2.get("jellyfin_api_key") == "key1"
+
+
+def test_media_server_refresh_disabled_by_default():
+    assert DEFAULTS["plex_enabled"] is False
+    assert DEFAULTS["jellyfin_enabled"] is False
+    assert DEFAULTS["plex_token"] == ""
+    assert DEFAULTS["jellyfin_api_key"] == ""
+
+
+def test_ai_fallback_disabled_by_default():
+    assert DEFAULTS["ai_fallback_enabled"] is False
+    assert DEFAULTS["ai_api_key"] == ""
+
+
 def test_migrates_legacy_ftp_templates_into_wildcard_categories(tmp_path, monkeypatch):
     cfg_file, _ = _isolated_config(tmp_path, monkeypatch)
     cfg_file.write_text(json.dumps({
@@ -142,3 +201,27 @@ def test_blank_movie_template_migrates_to_wildcard_without_root(tmp_path, monkey
     cats = cfg.get("ftp_categories")
 
     assert cats["movie"] == []
+
+
+def test_migrates_legacy_custom_episode_links_into_episode_level(tmp_path, monkeypatch):
+    cfg_file, _ = _isolated_config(tmp_path, monkeypatch)
+    old_links = [{"name": "Mi enlace", "url_template": "https://ejemplo.com/{serie}"}]
+    cfg_file.write_text(json.dumps({"custom_episode_links": old_links}), encoding="utf-8")
+
+    cfg = Config()
+
+    assert cfg.get("custom_links_episode") == old_links
+    assert "custom_episode_links" not in cfg._data
+    # Serie y temporada no existían antes -- arrancan con los nuevos valores por defecto
+    assert cfg.get("custom_links_show")
+    assert cfg.get("custom_links_season")
+
+
+def test_fresh_install_has_separate_defaults_per_level(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)   # sin config.json previo
+
+    cfg = Config()
+
+    assert cfg.get("custom_links_show")[0]["url_template"] == "https://www.themoviedb.org/tv/{tmdb_id}"
+    assert "{temporada}" in cfg.get("custom_links_season")[0]["url_template"]
+    assert "{episodio}" in cfg.get("custom_links_episode")[0]["url_template"]

@@ -14,9 +14,9 @@ if "%PYTHON%"=="" set PYTHON=C:\Users\Jose\AppData\Local\Programs\Python\Python3
 echo Usando Python: %PYTHON%
 echo.
 
-:: Instalar dependencias + PyInstaller
+:: Instalar dependencias (requirements.txt) + PyInstaller
 echo [1/4] Instalando dependencias...
-"%PYTHON%" -m pip install customtkinter Pillow requests pyinstaller pystray --quiet
+"%PYTHON%" -m pip install -r requirements.txt pyinstaller --quiet
 echo       OK
 echo.
 
