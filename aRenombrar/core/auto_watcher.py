@@ -41,6 +41,12 @@ _log = get_logger("aRenombrar.auto", "auto_watcher.log", level=logging.DEBUG)
 STABLE_WAIT  = 6    # segundos esperando que el archivo deje de crecer
 DEFAULT_POLL = 10   # segundos entre escaneos (por defecto)
 
+# Estados que solo escribe la GUI cuando el usuario interviene a mano
+# (identificar, renombrar, subir manualmente -- ver
+# gui/app.py::_mark_auto_processed). AutoWatcher nunca debe pisarlos con un
+# resultado propio: ver _mark().
+_PROTECTED_STATUSES = ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado")
+
 # Fragmentos (en minúsculas) que delatan "archivo bloqueado por otro
 # proceso" en el mensaje de error de rename_file(), sea cual sea el SO:
 # Windows (WinError 32, en español o inglés) o POSIX (EBUSY/EACCES).
@@ -147,7 +153,7 @@ class AutoWatcher:
                 continue
             if key in self._processed:
                 status = self._processed[key].get("status", "")
-                if status in ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado"):
+                if status in _PROTECTED_STATUSES:
                     # "renombrado", "identificado_manual" y "subiendo" los
                     # escribe la GUI cuando el usuario renombra/identifica/sube
                     # el archivo a mano (ver _mark_auto_processed) — justamente
@@ -642,6 +648,25 @@ class AutoWatcher:
     # ── Persistencia ───────────────────────────────────────────────────────────
 
     def _mark(self, key: str, status: str, new_name: str = None):
+        if status not in _PROTECTED_STATUSES:
+            # No pisar en disco un estado protegido que la GUI ya haya
+            # fijado a mano MIENTRAS este archivo se procesaba por su
+            # cuenta -- p.ej. el usuario identifica el TMDB ID a mano justo
+            # mientras un hilo de _process() ya en marcha, con su propia
+            # detección desactualizada, seguía intentando. _save_db() vuelca
+            # TODO self._processed sin fusionar con el disco, así que sin
+            # esta comprobación el resultado tardío de ese hilo borraba la
+            # marca manual del archivo, y el siguiente escaneo lo volvía a
+            # ver como "fallido" y lo reprocesaba con el mismo resultado de
+            # siempre, en bucle indefinido (visto de verdad: "Confianza
+            # insuficiente" repitiéndose cada ciclo tras asignar el TMDB a
+            # mano).
+            current_status = self._load_db().get(key, {}).get("status", "")
+            if current_status in _PROTECTED_STATUSES:
+                _log.info("_mark: se descarta '%s' para %s -- ya protegido en disco como '%s'",
+                          status, Path(key).name, current_status)
+                self._in_progress.discard(key)
+                return
         _log.debug("_mark: %s → %s", Path(key).name, status)
         self._processed[key] = {
             "status":   status,
