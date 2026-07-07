@@ -392,6 +392,47 @@ class _ConfirmDeleteDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class _UpdateAvailableDialog(ctk.CTkToplevel):
+    """Diálogo modal al detectar una versión más nueva en GitHub Releases
+    (ver core/update_check.py). Solo enlaza a la página de la release --
+    nunca descarga ni reemplaza nada en sitio."""
+    def __init__(self, parent, tag: str):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.result = None   # "open" | "skip" | None (cerrado sin elegir)
+        self.title("Actualización disponible")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        dw, dh = 400, 160
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        ctk.CTkLabel(self, text=f"Hay una nueva actualización {tag}.",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(padx=24, pady=(22, 4))
+        ctk.CTkLabel(self, text="¿Quieres descargarla?",
+                     font=ctk.CTkFont(size=11), text_color="#95a5a6").pack(padx=24, pady=(0, 18))
+
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(padx=24, pady=(0, 20))
+        ctk.CTkButton(bf, text="Ir a la release", width=150,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=lambda: self._close("open")).pack(side="left", padx=6)
+        ctk.CTkButton(bf, text="Saltar esta versión", width=150,
+                      fg_color="transparent", border_width=1,
+                      command=lambda: self._close("skip")).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._close(None))
+        self.wait_window()
+
+    def _close(self, result):
+        self.result = result
+        self.destroy()
+
+
 class FileEntry:
     def __init__(self, path):
         # Normalizar separadores (str(Path(...)) usa "\" en Windows) — sin
@@ -656,6 +697,7 @@ class App(_AppBase):
         _map_bind_id[0] = self.bind("<Map>", _mark_first_map, add="+")
 
         self.after(3000, self._refresh_ftp_space_at_startup)
+        self.after(3500, self._check_for_updates_at_startup)
         # Detector de episodios que faltan: comprobación periódica en
         # segundo plano (silenciosa, sin diálogo) para que la caché esté ya
         # al día cuando el usuario abra el diálogo a mano -- ver
@@ -1637,6 +1679,33 @@ class App(_AppBase):
             self.after(0, self._refresh_ftp_space)
             self._prefetch_ftp_category_dirs()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _check_for_updates_at_startup(self):
+        """Comprueba en segundo plano si hay una versión más nueva publicada
+        en GitHub Releases (core/update_check.py) y, si la hay y el usuario
+        no la saltó ya, muestra un aviso para ir a la página de la release.
+        Nunca descarga ni reemplaza el ejecutable en sitio. Silencioso si la
+        consulta falla -- no es una acción que el usuario haya pedido
+        explícitamente."""
+        def worker():
+            from core.update_check import check_for_update
+            result = check_for_update(__version__)
+            if result is None:
+                return
+            tag, html_url = result
+            if tag == self.config_data.get("skipped_update_version", ""):
+                return
+            self.after(0, lambda: self._show_update_dialog(tag, html_url))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_update_dialog(self, tag: str, html_url: str):
+        dlg = _UpdateAvailableDialog(self, tag)
+        if dlg.result == "open":
+            import webbrowser
+            webbrowser.open(html_url)
+        elif dlg.result == "skip":
+            self.config_data.set("skipped_update_version", tag)
+            self.config_data.save()
         # Primer reintento periódico más pronto (20s, no los 5 minutos de
         # costumbre) -- el caso típico que motivó esto es la red tardando
         # unos segundos más en estar lista al arrancar la app junto con
@@ -6043,6 +6112,15 @@ class App(_AppBase):
         self._force_quit()
 
     def _force_quit(self):
+        # Sin esto, cerrar estando minimizado a bandeja (o Cmd+Q en macOS,
+        # que llega aquí directo sin pasar por _tray_quit) dejaba el icono de
+        # pystray corriendo mientras el proceso terminaba -- en macOS en
+        # concreto, el backend darwin reutiliza el runloop de Cocoa de Tk
+        # (ver _minimize_to_tray), así que destruir la ventana sin parar antes
+        # el icono deja su NSStatusItem/observer a medio desregistrar.
+        if self._tray and self._tray_running:
+            self._tray_running = False
+            self._tray.stop()
         if self._watcher:
             self._watcher.stop()
         self.ftp.disconnect()

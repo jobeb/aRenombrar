@@ -91,6 +91,11 @@ DEFAULTS = {
             "https://www.themoviedb.org/tv/{tmdb_id}/season/{temporada}/episode/{episodio}"},
         {"name": "Enviar por WhatsApp", "url_template": "https://wa.me/?text={nombre_archivo}"},
     ],
+    # Etiqueta de release (p.ej. "v1.2.0") que el usuario ya descartó en el
+    # aviso de actualización al arrancar -- ver core/update_check.py. Vacío
+    # = ninguna descartada todavía. No se vuelve a avisar de esa MISMA
+    # versión, pero sí de una posterior.
+    "skipped_update_version": "",
 }
 
 

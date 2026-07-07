@@ -1,6 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import re
 import sys
 from PyInstaller.utils.hooks import collect_all
+
+# Leído del propio código fuente (no reescrito a mano aquí) para que el
+# Info.plist del bundle de macOS nunca se quede desincronizado de la versión
+# real de la app -- antes se quedó clavado en "1.0.0" mientras
+# core/version.py ya iba por 1.1.0.
+with open(os.path.join(SPECPATH, 'core', 'version.py'), encoding='utf-8') as _vf:
+    _app_version = re.search(r'__version__\s*=\s*"([^"]+)"', _vf.read()).group(1)
 
 # Windows quiere .ico; macOS quiere .icns (y Tk en tiempo de ejecución usa
 # el PNG cuadrado en macOS/Linux vía iconphoto — ver gui/app.py:_apply_icon).
@@ -99,7 +108,7 @@ if _is_macos:
         bundle_identifier='com.arenombrar.app',
         info_plist={
             'NSHighResolutionCapable': True,
-            'CFBundleShortVersionString': '1.0.0',
+            'CFBundleShortVersionString': _app_version,
             'LSUIElement': False,
         },
     )
