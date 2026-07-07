@@ -59,7 +59,7 @@ _LOCKED_FILE_HINTS = (
 
 class AutoWatcher:
     def __init__(self, folder: str, config, tmdb_client, ftp_client, on_event, on_file_event=None,
-                 upload_slots=None):
+                 upload_slots=None, ftp_lock=None):
         """
         on_event(tipo, mensaje)
           tipo: "info" | "ok" | "skip" | "error"
@@ -70,6 +70,11 @@ class AutoWatcher:
           GUI, para que "Subidas simultáneas" limite el total real entre
           ambos orígenes. Si no se pasa (uso standalone/tests), se crea uno
           propio — sigue limitando el modo automático consigo mismo.
+        ftp_lock: candado compartido con quien sea que use *ftp_client* fuera
+          de AutoWatcher (ver gui/app.py::App -- self._ftp_cmd_lock). Si no
+          se pasa (uso standalone/tests), se crea uno propio -- pero entonces
+          solo protege a AutoWatcher de sí mismo, no de otros usuarios
+          concurrentes de la misma conexión.
         """
         self.folder         = Path(folder)
         self.config         = config
@@ -88,10 +93,12 @@ class AutoWatcher:
         self._series_folder_cache = {}
         self._ftp_dir_cache       = {}
         # self.ftp es UNA conexión de control compartida por todos los hilos
-        # de _process() (uno por archivo nuevo detectado en un mismo escaneo);
-        # FTP es un protocolo secuencial sobre un único socket, así que hay
-        # que serializar cualquier uso de self.ftp entre hilos.
-        self._ftp_lock = threading.Lock()
+        # de _process() (uno por archivo nuevo detectado en un mismo escaneo)
+        # Y, normalmente, también con quien construya este AutoWatcher (ver
+        # ftp_lock arriba); FTP es un protocolo secuencial sobre un único
+        # socket, así que hay que serializar cualquier uso de self.ftp entre
+        # TODOS esos hilos con el mismo candado, no solo entre los propios.
+        self._ftp_lock = ftp_lock or threading.Lock()
 
     # ── Ciclo de vida ──────────────────────────────────────────────────────────
 

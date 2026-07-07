@@ -571,6 +571,17 @@ class App(_AppBase):
         _mark("Config()")
         self.tmdb = TMDBClient(self.config_data["tmdb_api_key"])
         self.ftp  = FTPClient()
+        # self.ftp es una única conexión de control compartida con AutoWatcher
+        # (ver _toggle_auto) y con varias comprobaciones de fondo de la propia
+        # GUI (espacio libre, precarga de carpetas, "Probar conexión", cruce
+        # FTP del detector de huecos) -- ftplib no es seguro entre hilos, así
+        # que TODAS ellas deben serializarse con este mismo candado, no cada
+        # una con el suyo (AutoWatcher tenía uno propio que no protegía nada
+        # fuera de sí mismo -- visto de verdad: "550 Failed to change
+        # directory" y "200 Switching to Binary mode" tratados como error,
+        # ambos síntomas clásicos de respuestas cruzadas entre hilos en la
+        # misma conexión).
+        self._ftp_cmd_lock = threading.Lock()
         _mark("TMDBClient/FTPClient")
         self.files = []
         self._selected_entry = None
@@ -983,7 +994,7 @@ class App(_AppBase):
             self._watcher = AutoWatcher(
                 folder, self.config_data, self.tmdb, self.ftp,
                 self._on_auto_event, self._on_auto_file_event,
-                upload_slots=self._upload_slots)
+                upload_slots=self._upload_slots, ftp_lock=self._ftp_cmd_lock)
             self._watcher.start()
             self._auto_btn.configure(
                 text="⏹ Detener", width=90, fg_color="#c0392b", hover_color="#96281b",
@@ -1640,7 +1651,8 @@ class App(_AppBase):
             parts = []
             any_low = False
             for disk_name, root in disks.items():
-                free = self._get_free_space_with_jellyfin_fallback(self.ftp, root)
+                with self._ftp_cmd_lock:
+                    free = self._get_free_space_with_jellyfin_fallback(self.ftp, root)
                 if free is None:
                     continue
                 parts.append(f"{disk_name.capitalize()}-{self._fmt_free_space(free)}")
@@ -1667,13 +1679,14 @@ class App(_AppBase):
             return
         def worker():
             try:
-                if not self.ftp.is_connected():
-                    self.ftp.connect(
-                        self.config_data.get("ftp_host", ""),
-                        int(self.config_data.get("ftp_port", 21)),
-                        self.config_data.get("ftp_user", ""),
-                        self.config_data.get("ftp_password", ""),
-                        self.config_data.get("ftp_use_tls", False))
+                with self._ftp_cmd_lock:
+                    if not self.ftp.is_connected():
+                        self.ftp.connect(
+                            self.config_data.get("ftp_host", ""),
+                            int(self.config_data.get("ftp_port", 21)),
+                            self.config_data.get("ftp_user", ""),
+                            self.config_data.get("ftp_password", ""),
+                            self.config_data.get("ftp_use_tls", False))
             except Exception:
                 pass   # silencioso -- ver docstring
             self.after(0, self._refresh_ftp_space)
@@ -1729,19 +1742,20 @@ class App(_AppBase):
         _find_category_with_existing_folder), sin esperar a la primera
         subida real para tener ese dato en caché. Silencioso: si falla,
         la columna se queda con la vista previa por género de siempre."""
-        if not self.ftp.is_connected():
-            return
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
-        roots = {c.get("root", "") for cs in cats.values() for c in cs if c.get("root")}
-        changed = False
-        for root in roots:
-            if root in self._ftp_dir_cache:
-                continue
-            try:
-                self._ftp_dir_cache[root] = self.ftp.list_dirs(root)
-                changed = True
-            except Exception:
-                continue
+        with self._ftp_cmd_lock:
+            if not self.ftp.is_connected():
+                return
+            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+            roots = {c.get("root", "") for cs in cats.values() for c in cs if c.get("root")}
+            changed = False
+            for root in roots:
+                if root in self._ftp_dir_cache:
+                    continue
+                try:
+                    self._ftp_dir_cache[root] = self.ftp.list_dirs(root)
+                    changed = True
+                except Exception:
+                    continue
         if changed:
             self.after(0, lambda: [self._update_row(e) for e in self.files])
 
@@ -1791,17 +1805,18 @@ class App(_AppBase):
 
     def _connect_and_start_upload(self, entries):
         try:
-            if not self.ftp.is_connected():
-                ok, msg = self.ftp.connect(
-                    self.config_data.get("ftp_host", ""),
-                    int(self.config_data.get("ftp_port", 21)),
-                    self.config_data.get("ftp_user", ""),
-                    self.config_data.get("ftp_password", ""),
-                    self.config_data.get("ftp_use_tls", False))
-                self.after(0, lambda: self._set_status(msg, SUCCESS_COLOR if ok else ERROR_COLOR))
-                if not ok:
-                    self._upload_running = False
-                    return
+            with self._ftp_cmd_lock:
+                if not self.ftp.is_connected():
+                    ok, msg = self.ftp.connect(
+                        self.config_data.get("ftp_host", ""),
+                        int(self.config_data.get("ftp_port", 21)),
+                        self.config_data.get("ftp_user", ""),
+                        self.config_data.get("ftp_password", ""),
+                        self.config_data.get("ftp_use_tls", False))
+                    self.after(0, lambda: self._set_status(msg, SUCCESS_COLOR if ok else ERROR_COLOR))
+                    if not ok:
+                        self._upload_running = False
+                        return
         except Exception as e:
             self.after(0, lambda: self._set_status(f"Error FTP: {e}", ERROR_COLOR))
             self._upload_running = False
@@ -4352,21 +4367,29 @@ class App(_AppBase):
         if not self.config_data.get("ftp_host", ""):
             _log.info("Cruce FTP: omitido, sin servidor FTP configurado")
             return results
+        # Conexión propia, NUNCA self.ftp -- este cruce puede tardar bastante
+        # (listado recursivo de varias raíces) y self.ftp lo usan a la vez
+        # AutoWatcher y otras partes de la GUI; compartirla aquí bloquearía
+        # esas subidas durante todo el escaneo, o peor, cruzaría respuestas
+        # entre hilos (ver el candado _ftp_cmd_lock en las demás llamadas).
+        from core.ftp_client import FTPClient as _FTPClient
+        own_ftp = _FTPClient()
         try:
-            if not self.ftp.is_connected():
-                self.ftp.connect(
-                    self.config_data.get("ftp_host", ""),
-                    int(self.config_data.get("ftp_port", 21)),
-                    self.config_data.get("ftp_user", ""),
-                    self.config_data.get("ftp_password", ""),
-                    self.config_data.get("ftp_use_tls", False))
-            if not self.ftp.is_connected():
+            own_ftp.connect(
+                self.config_data.get("ftp_host", ""),
+                int(self.config_data.get("ftp_port", 21)),
+                self.config_data.get("ftp_user", ""),
+                self.config_data.get("ftp_password", ""),
+                self.config_data.get("ftp_use_tls", False))
+            if not own_ftp.is_connected():
                 _log.warning("Cruce FTP: omitido, no se pudo conectar al servidor")
                 return results
-            ftp_index = self._build_ftp_episode_index(self.ftp)
+            ftp_index = self._build_ftp_episode_index(own_ftp)
         except Exception as e:
             _log.warning("Cruce FTP: fallo inesperado, se deja el resultado tal cual: %s", e)
             return results   # sin FTP no se puede cruzar -- se deja tal cual
+        finally:
+            own_ftp.disconnect()
 
         if ftp_index and not any(ftp_index.values()):
             # Todas las raíces devolvieron 0 carpetas -- casi seguro un
@@ -5696,7 +5719,8 @@ class App(_AppBase):
         tls  = self._tls_switch.get() in (True, "1", 1)
         self._ftp_status.configure(text="Conectando...", text_color=WARNING_COLOR)
         def worker():
-            ok, msg = self.ftp.connect(host, port, user, pwd, tls)
+            with self._ftp_cmd_lock:
+                ok, msg = self.ftp.connect(host, port, user, pwd, tls)
             self.after(0, lambda: self._ftp_status.configure(
                 text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
             if ok:
@@ -6123,7 +6147,8 @@ class App(_AppBase):
             self._tray.stop()
         if self._watcher:
             self._watcher.stop()
-        self.ftp.disconnect()
+        with self._ftp_cmd_lock:
+            self.ftp.disconnect()
         self.config_data.save()
         self._save_session()
         self.destroy()
