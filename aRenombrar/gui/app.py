@@ -1059,6 +1059,17 @@ class App(_AppBase):
                 if self._selected_entry is entry:
                     self._update_detail(entry)
 
+            elif tipo == "queued":
+                # Ya se resolvió categoría/duplicado/espacio, pero todavía
+                # no hay turno de "Subidas simultáneas" -- si varios
+                # archivos se detectaron a la vez, todos pasan por aquí casi
+                # al mismo tiempo, y solo uno de ellos conseguirá turno real
+                # (ver "uploading" más abajo, que si eso sí pisa este
+                # estado en cuanto empieza a transferir de verdad).
+                entry.status       = "en_cola"
+                entry.new_name     = new_name or entry.new_name
+                self._update_row(entry)
+
             elif tipo == "uploading":
                 entry.status       = "subiendo"
                 entry.ftp_progress = progress or 0.0
@@ -1657,16 +1668,36 @@ class App(_AppBase):
             return
 
         def worker():
-            parts = []
-            any_low = False
-            for disk_name, root in disks.items():
-                with self._ftp_cmd_lock:
-                    free = self._get_free_space_with_jellyfin_fallback(self.ftp, root)
-                if free is None:
-                    continue
-                parts.append(f"{disk_name.capitalize()}-{self._fmt_free_space(free)}")
-                if free <= 1024**3:   # < 1 GB -- mismo umbral de aviso que antes
-                    any_low = True
+            # Conexión propia, NUNCA self.ftp -- este chequeo es periódico
+            # (cada 5 min) y con el automático subiendo sin pausa durante un
+            # buen rato, self.ftp (y el candado que lo protege) puede estar
+            # ocupado casi todo el tiempo: no es solo un bloqueo puntual, es
+            # inanición real del hilo de este chequeo, que nunca consigue su
+            # turno. Con conexión propia no depende de lo ocupado que esté
+            # el automático -- mismo patrón que ya usa el detector de huecos.
+            from core.ftp_client import FTPClient as _FTPClient
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    self.after(0, lambda: self._ftp_space_lbl.configure(text=""))
+                    return
+                parts = []
+                any_low = False
+                for disk_name, root in disks.items():
+                    free = self._get_free_space_with_jellyfin_fallback(own_ftp, root)
+                    if free is None:
+                        continue
+                    parts.append(f"{disk_name.capitalize()}-{self._fmt_free_space(free)}")
+                    if free <= 1024**3:   # < 1 GB -- mismo umbral de aviso que antes
+                        any_low = True
+            finally:
+                own_ftp.disconnect()
             if not parts:
                 self.after(0, lambda: self._ftp_space_lbl.configure(text=""))
                 return
@@ -1678,29 +1709,16 @@ class App(_AppBase):
     _FTP_SPACE_PERIODIC_MS = 5 * 60 * 1000   # 5 minutos
 
     def _refresh_ftp_space_at_startup(self):
-        """Conecta en segundo plano al arrancar (si hay servidor FTP
-        configurado) solo para poder rellenar el indicador de espacio del
-        toolbar desde el principio -- sin esto, se quedaba vacío hasta
-        pulsar "Probar conexión" en Ajustes o empezar una subida. Silencioso:
-        si el servidor no responde, no muestra ningún error (no es una
-        acción que el usuario haya pedido explícitamente)."""
+        """Al arrancar (si hay servidor FTP configurado), rellena el
+        indicador de espacio del toolbar desde el principio -- sin esto, se
+        quedaba vacío hasta pulsar "Probar conexión" en Ajustes o empezar
+        una subida. _refresh_ftp_space() y _prefetch_ftp_category_dirs() ya
+        conectan con su propia conexión dedicada cada una, en su propio
+        hilo -- no hace falta preparar nada de self.ftp aquí."""
         if not self.config_data.get("ftp_host", ""):
             return
-        def worker():
-            try:
-                with self._ftp_cmd_lock:
-                    if not self.ftp.is_connected():
-                        self.ftp.connect(
-                            self.config_data.get("ftp_host", ""),
-                            int(self.config_data.get("ftp_port", 21)),
-                            self.config_data.get("ftp_user", ""),
-                            self.config_data.get("ftp_password", ""),
-                            self.config_data.get("ftp_use_tls", False))
-            except Exception:
-                pass   # silencioso -- ver docstring
-            self.after(0, self._refresh_ftp_space)
-            self._prefetch_ftp_category_dirs()
-        threading.Thread(target=worker, daemon=True).start()
+        self._refresh_ftp_space()
+        self._prefetch_ftp_category_dirs()
 
     def _check_for_updates_at_startup(self):
         """Comprueba en segundo plano si hay una versión más nueva publicada
@@ -1744,29 +1762,42 @@ class App(_AppBase):
         self.after(self._FTP_SPACE_PERIODIC_MS, self._periodic_refresh_ftp_space)
 
     def _prefetch_ftp_category_dirs(self):
-        """Lista de antemano (en segundo plano, reutilizando la conexión ya
-        abierta al arrancar) las carpetas de todas las categorías FTP
-        configuradas -- así la columna "Destino" de la tabla puede avisar
-        de entrada si una serie ya tiene carpeta en OTRA categoría (ver
-        _find_category_with_existing_folder), sin esperar a la primera
-        subida real para tener ese dato en caché. Silencioso: si falla,
-        la columna se queda con la vista previa por género de siempre."""
-        with self._ftp_cmd_lock:
-            if not self.ftp.is_connected():
-                return
-            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
-            roots = {c.get("root", "") for cs in cats.values() for c in cs if c.get("root")}
-            changed = False
-            for root in roots:
-                if root in self._ftp_dir_cache:
-                    continue
-                try:
-                    self._ftp_dir_cache[root] = self.ftp.list_dirs(root)
-                    changed = True
-                except Exception:
-                    continue
-        if changed:
-            self.after(0, lambda: [self._update_row(e) for e in self.files])
+        """Lista de antemano (en segundo plano, con su propia conexión
+        dedicada -- NUNCA self.ftp, ver _refresh_ftp_space) las carpetas de
+        todas las categorías FTP configuradas -- así la columna "Destino"
+        de la tabla puede avisar de entrada si una serie ya tiene carpeta
+        en OTRA categoría (ver _find_category_with_existing_folder), sin
+        esperar a la primera subida real para tener ese dato en caché.
+        Silencioso: si falla, la columna se queda con la vista previa por
+        género de siempre."""
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+                roots = {c.get("root", "") for cs in cats.values() for c in cs if c.get("root")}
+                changed = False
+                for root in roots:
+                    if root in self._ftp_dir_cache:
+                        continue
+                    try:
+                        self._ftp_dir_cache[root] = own_ftp.list_dirs(root)
+                        changed = True
+                    except Exception:
+                        continue
+            finally:
+                own_ftp.disconnect()
+            if changed:
+                self.after(0, lambda: [self._update_row(e) for e in self.files])
+        threading.Thread(target=worker, daemon=True).start()
 
     _BACKGROUND_MISSING_SCAN_INTERVAL_H = 12    # cada cuanto se repite el escaneo de verdad
     _BACKGROUND_MISSING_SCAN_CHECK_MS = 3_600_000   # cada cuanto se comprueba si "toca" (1h)
@@ -1803,35 +1834,15 @@ class App(_AppBase):
             # de lo que se está subiendo ahora mismo solo añade tiempos de
             # espera/errores de red sin necesidad -- se cancela solo.
             self._cancel_missing_episodes_scan()
-        # Marcar YA como "en marcha" (bloquea clics repetidos) y resolver la
-        # conexión FTP en un hilo aparte: is_connected()/connect() son E/S de
-        # red y pueden tardar mucho más de lo esperado si el servidor no
-        # responde — hacerlo en el hilo de la GUI (como antes) congelaba TODA
-        # la aplicación sin remedio salvo matar el proceso.
+        # Marcar YA como "en marcha" (bloquea clics repetidos). La conexión
+        # de verdad la resuelve _queue_worker con su propio pool dedicado
+        # (con su propio manejo de error si falla) -- no hace falta probar
+        # self.ftp aquí antes, sería una conexión redundante que además
+        # competiría por self.ftp con el modo automático sin necesidad.
         self._upload_running = True
         self._set_status("Conectando al servidor FTP...", WARNING_COLOR)
-        threading.Thread(target=self._connect_and_start_upload, args=(entries,), daemon=True).start()
-
-    def _connect_and_start_upload(self, entries):
-        try:
-            with self._ftp_cmd_lock:
-                if not self.ftp.is_connected():
-                    ok, msg = self.ftp.connect(
-                        self.config_data.get("ftp_host", ""),
-                        int(self.config_data.get("ftp_port", 21)),
-                        self.config_data.get("ftp_user", ""),
-                        self.config_data.get("ftp_password", ""),
-                        self.config_data.get("ftp_use_tls", False))
-                    self.after(0, lambda: self._set_status(msg, SUCCESS_COLOR if ok else ERROR_COLOR))
-                    if not ok:
-                        self._upload_running = False
-                        return
-        except Exception as e:
-            self.after(0, lambda: self._set_status(f"Error FTP: {e}", ERROR_COLOR))
-            self._upload_running = False
-            return
-        self.after(0, self._refresh_ftp_space)
-        self.after(0, lambda: self._begin_ftp_upload(entries))
+        self._refresh_ftp_space()
+        self._begin_ftp_upload(entries)
 
     def _begin_ftp_upload(self, entries):
         """Continuación de _start_ftp_upload en el hilo principal, una vez
@@ -5775,8 +5786,13 @@ class App(_AppBase):
         tls  = self._tls_switch.get() in (True, "1", 1)
         self._ftp_status.configure(text="Conectando...", text_color=WARNING_COLOR)
         def worker():
-            with self._ftp_cmd_lock:
-                ok, msg = self.ftp.connect(host, port, user, pwd, tls)
+            # Conexión propia y de usar y tirar -- solo para validar que
+            # estas credenciales funcionan, NUNCA self.ftp (ver
+            # _refresh_ftp_space): no hace falta dejarla abierta para nadie.
+            from core.ftp_client import FTPClient as _FTPClient
+            own_ftp = _FTPClient()
+            ok, msg = own_ftp.connect(host, port, user, pwd, tls)
+            own_ftp.disconnect()
             self.after(0, lambda: self._ftp_status.configure(
                 text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
             if ok:

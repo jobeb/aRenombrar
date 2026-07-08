@@ -23,7 +23,7 @@ class _FakeConfig:
         return self.d.get(key, default)
 
 
-def _make_watcher(folder, upload_calls):
+def _make_watcher(folder, upload_calls, on_file_event=None):
     config = _FakeConfig({
         "poll_interval": 10,
         "movie_template": "{serie} ({año}){ext}",
@@ -58,7 +58,7 @@ def _make_watcher(folder, upload_calls):
 
     watcher = AutoWatcher(str(folder), config, tmdb, ftp,
                            on_event=lambda *a, **k: None,
-                           on_file_event=lambda *a, **k: None)
+                           on_file_event=on_file_event or (lambda *a, **k: None))
     watcher._is_stable = lambda path: True
     return watcher
 
@@ -99,3 +99,40 @@ def test_ftp_lock_is_free_while_waiting_for_an_upload_slot(tmp_path):
     t.join(timeout=5)
     assert done.is_set()
     assert len(upload_calls) == 1
+
+
+def test_fires_queued_before_slot_and_uploading_only_after(tmp_path):
+    """Antes, el evento "uploading" se disparaba ANTES de esperar turno de
+    upload_slots -- si varios archivos se detectaban a la vez, los 5 hilos
+    marcaban la fila como "Subiendo" aunque solo uno pudiera transferir de
+    verdad al mismo tiempo. Ahora debe dispararse "queued" mientras espera
+    turno, y "uploading" recien al conseguirlo."""
+    original = tmp_path / "1.mi.pelicula.WEB-DL.2024.mkv"
+    original.write_bytes(b"contenido")
+    upload_calls = []
+    events = []
+    watcher = _make_watcher(
+        tmp_path, upload_calls,
+        on_file_event=lambda path, tipo, **kw: events.append(tipo))
+
+    assert watcher.upload_slots.acquire()   # ocupa el unico cupo (ftp_parallel=1)
+
+    done = threading.Event()
+
+    def _run():
+        watcher._process(original)
+        done.set()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.3)
+
+    assert not done.is_set()
+    assert "queued" in events, "deberia marcarse en cola mientras espera turno"
+    assert "uploading" not in events, \
+        "no deberia marcarse como subiendo todavia -- el cupo sigue ocupado"
+
+    watcher.upload_slots.release()
+    t.join(timeout=5)
+    assert done.is_set()
+    assert events.index("queued") < events.index("uploading") < events.index("uploaded")

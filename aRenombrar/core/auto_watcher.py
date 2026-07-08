@@ -64,7 +64,7 @@ class AutoWatcher:
         on_event(tipo, mensaje)
           tipo: "info" | "ok" | "skip" | "error"
         on_file_event(path, tipo, **kwargs)
-          tipos: "start" | "renamed" | "uploading" | "uploaded" | "skip" | "error"
+          tipos: "start" | "renamed" | "queued" | "uploading" | "uploaded" | "skip" | "error"
           kwargs: new_name, progress, speed
         upload_slots: UploadSlotManager compartido con la subida manual de la
           GUI, para que "Subidas simultáneas" limite el total real entre
@@ -191,8 +191,15 @@ class AutoWatcher:
             _log.info("NUEVO ARCHIVO DETECTADO: %s", item.name)
             self.on_event("info", f"Nuevo archivo detectado: {item.name}")
             self._in_progress.add(key)
+            # Turno de subida reservado YA, en el orden de la carpeta (items_found
+            # está ordenado, ver arriba) -- no cuando el hilo llegue a subir de
+            # verdad, que depende de cuánto tarde SU propia identificación TMDB.
+            # Sin esto, con varios archivos nuevos detectados en el mismo
+            # escaneo, el que más rápido identificara ganaba la carrera y
+            # subía antes aunque estuviera más abajo en la carpeta.
+            ticket = self.upload_slots.reserve_ticket()
             threading.Thread(
-                target=self._process, args=(item,), daemon=True
+                target=self._process, args=(item, ticket), daemon=True
             ).start()
 
     def _is_stable(self, path: Path) -> bool:
@@ -245,7 +252,7 @@ class AutoWatcher:
 
     # ── Procesado de un archivo ────────────────────────────────────────────────
 
-    def _process(self, path: Path):
+    def _process(self, path: Path, ticket: int = None):
         key = str(path)
         _log.info("--- Procesando: %s ---", path.name)
         try:
@@ -429,7 +436,7 @@ class AutoWatcher:
 
             # 5. Subir por FTP (serializado: self.ftp es una única conexión
             # compartida por todos los hilos de _process)
-            self._upload_to_ftp(key, new_name, media_info, season, new_path, _mark_both, _discard_both)
+            self._upload_to_ftp(key, new_name, media_info, season, new_path, _mark_both, _discard_both, ticket)
 
         except Exception as e:
             _log.exception("Error inesperado procesando: %s", path.name)
@@ -446,7 +453,7 @@ class AutoWatcher:
         except Exception:
             return 0
 
-    def _upload_to_ftp(self, key, new_name, media_info, season, new_path, _mark_both, _discard_both):
+    def _upload_to_ftp(self, key, new_name, media_info, season, new_path, _mark_both, _discard_both, ticket=None):
         """Construye la ruta remota y sube el archivo ya renombrado.
         Todo el bloque que usa self.ftp va bajo self._ftp_lock: es una única
         conexión de control compartida entre hilos, y FTP es un protocolo
@@ -565,9 +572,16 @@ class AutoWatcher:
                 _mark_both("disco_lleno", new_name=new_name)
                 return
 
-            _log.info("Subiendo: %s → %s/%s", new_name, remote_path, remote_filename)
-            self.on_event("info", f"Subiendo: {new_name}")
-            self.on_file_event(key, "uploading", new_name=new_name, progress=0.0, speed=0.0)
+            # "en cola": TODAVÍA no hay turno de "Subidas simultáneas"
+            # garantizado -- si varios archivos nuevos se detectan a la vez,
+            # cada uno llega hasta aquí en su propio hilo (esta parte, bajo
+            # self._ftp_lock, es rápida) y todos pasarían este punto casi a
+            # la vez. Marcarlos "subiendo" ya aquí hacía que 5 archivos
+            # detectados juntos se vieran los 5 "Subiendo" aunque solo uno
+            # pudiera transferir de verdad a la vez -- el evento "uploading"
+            # de verdad se dispara más abajo, solo tras conseguir turno.
+            _log.info("En cola: %s → %s/%s", new_name, remote_path, remote_filename)
+            self.on_file_event(key, "queued", new_name=new_name)
 
         # A PROPÓSITO fuera de self._ftp_lock: "Subidas simultáneas" es un
         # cupo GLOBAL compartido con la subida manual (ver
@@ -584,13 +598,16 @@ class AutoWatcher:
             pct = sent / total if total > 0 else 0.0
             self.on_file_event(key, "uploading", new_name=new_name, progress=pct, speed=speed)
 
-        if not self.upload_slots.acquire(cancel_event=self._stop):
+        if not self.upload_slots.acquire(cancel_event=self._stop, ticket=ticket):
             _log.info("Subida cancelada esperando turno: %s", new_name)
             self.on_event("info", "Subida cancelada por parada del modo automático")
             self.on_file_event(key, "skip", new_name=new_name,
                                 reason="Subida cancelada al detener el modo automático")
             _discard_both()
             return
+        _log.info("Subiendo: %s → %s/%s", new_name, remote_path, remote_filename)
+        self.on_event("info", f"Subiendo: {new_name}")
+        self.on_file_event(key, "uploading", new_name=new_name, progress=0.0, speed=0.0)
         try:
             with self._ftp_lock:
                 ok3, msg3 = self.ftp.upload_file(
