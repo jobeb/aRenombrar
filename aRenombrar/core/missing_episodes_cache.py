@@ -50,6 +50,26 @@ def save_cache(cache: dict) -> None:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
+def remove_missing_episode_from_cache(cache: dict, tmdb_id: int, season: int, episode: int) -> bool:
+    """Igual que core.missing_episodes.remove_missing_episode, pero sobre el
+    dict crudo tal cual se persiste aquí (claves de texto, listas de
+    episodios) -- para que la marca sobreviva a un reinicio sin depender de
+    otro escaneo completo. Mutación en sitio. Devuelve True si de verdad
+    había algo que quitar; el llamador es responsable de save_cache()
+    después."""
+    entry = cache.get(str(tmdb_id))
+    if entry is None:
+        return False
+    missing = entry.get("missing", {})
+    season_key = str(season)
+    if season_key not in missing or episode not in missing[season_key]:
+        return False
+    missing[season_key].remove(episode)
+    if not missing[season_key]:
+        del missing[season_key]
+    return True
+
+
 def _reset_cache_for_tests() -> None:
     global _cache
     _cache = None

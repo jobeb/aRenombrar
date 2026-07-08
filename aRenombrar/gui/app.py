@@ -1079,6 +1079,7 @@ class App(_AppBase):
                 self._send_notification("aRenombrar — Subida completada", fname)
                 # Guardar en historial (modo automático)
                 self._save_history_entry(fname, path, "ok", 0)
+                self._remove_uploaded_episode_from_missing_list(entry.media_info)
 
             elif tipo == "skip":
                 entry.status    = "omitido"
@@ -1318,9 +1319,9 @@ class App(_AppBase):
 
     def _compute_cw(self, avail_w=None):
         """Calcula anchos de columna adaptativos. avail_w = px disponibles en la tabla.
-        FIXED incluye los 5 sashes de 4px + padx de botones (4+2+2+2) = 26px constantes,
+        FIXED incluye los 6 sashes de 4px + padx de botones (4+2+2+2) = 30px constantes,
         más la columna "Destino" (140px, ancho fijo, sin sash) y su separador (4px)."""
-        FIXED = 74 + 110 + 80 + 28*3 + 26 + 140 + 4  # widgets fijos + spacing constante = 518
+        FIXED = 74 + 110 + 80 + 60 + 28*3 + 30 + 140 + 4  # widgets fijos + spacing constante = 582
         PAD   = 16                           # padding interno CTkScrollableFrame
         if avail_w is None:
             avail_w = 900
@@ -1328,7 +1329,7 @@ class App(_AppBase):
         name = max(80, int(flex * 0.26))
         det  = max(55, int(flex * 0.12))
         nn   = max(0,  flex - name - det)
-        return dict(name=name, det=det, nn=nn, dest=140, stat=74, bar=110, spd=80, btn=28)
+        return dict(name=name, det=det, nn=nn, dest=140, stat=74, bar=110, spd=80, size=60, btn=28)
 
     def _on_table_resize(self, event):
         """Reescala columnas al cambiar el ancho del canvas."""
@@ -1343,7 +1344,7 @@ class App(_AppBase):
         """Actualiza anchos y texto de cabeceras y filas. nn no recibe ancho fijo (expand=True)."""
         cw = self._col_widths
         for lbl, key in self._hdr_labels:
-            if key in ("name", "det", "dest", "stat", "bar", "spd"):
+            if key in ("name", "det", "dest", "stat", "bar", "spd", "size"):
                 lbl.configure(width=cw[key])
             elif key == "btns":
                 lbl.configure(width=cw["btn"] * 3 + 6)
@@ -1362,6 +1363,7 @@ class App(_AppBase):
             row["status"].configure(width=cw["stat"])
             row["ftp_bar"].configure(width=cw["bar"])
             row["ftp_speed"].configure(width=cw["spd"])
+            row["size"].configure(width=cw["size"])
 
     def _sash_press(self, event, left_col, right_col):
         self._sash_state = {
@@ -1511,6 +1513,13 @@ class App(_AppBase):
         lbl = ctk.CTkLabel(hdr, text="Vel.", font=_BF, width=cw["spd"], anchor="w")
         lbl.pack(side="left", padx=0, pady=4)
         self._hdr_labels.append((lbl, "spd"))
+
+        _sash("spd", "size")   # arrastrable
+
+        # Peso -- tamaño del archivo en disco, ver _file_size_text
+        lbl = ctk.CTkLabel(hdr, text="Peso", font=_BF, width=cw["size"], anchor="w")
+        lbl.pack(side="left", padx=0, pady=4)
+        self._hdr_labels.append((lbl, "size"))
 
         # Cabecera vacía para los 3 botones (btn*3 + inter-btn padx: 2+2+2=6)
         lbl = ctk.CTkLabel(hdr, text="", font=_BF, width=cw["btn"] * 3 + 6, anchor="w")
@@ -2247,6 +2256,10 @@ class App(_AppBase):
             _log.info("Subida: OK %r (%s)", remote_filename, _fmt_size(size))
             from core.media_server_refresh import trigger_refresh
             trigger_refresh(self.config_data)
+            # Este método corre en un hilo de subida, no en el de la GUI --
+            # a diferencia del mismo hook en _on_auto_file_event (que ya
+            # corre dentro de self.after), aquí sí hay que agendarlo.
+            self.after(0, lambda mi=entry.media_info: self._remove_uploaded_episode_from_missing_list(mi))
         elif msg == "cancelado":
             entry.status = "listo"
             self._ftp_row_set(entry, "Cancelado", entry.ftp_progress, 0)
@@ -3275,6 +3288,33 @@ class App(_AppBase):
                 "absolute_numbering": entry.get("absolute_numbering", False),
             })
         return results
+
+    def _remove_uploaded_episode_from_missing_list(self, media_info) -> None:
+        """Tras subir un episodio (automático o manual), si ese episodio
+        concreto aparecía en "Episodios que faltan", lo quita de ahí sin
+        esperar a un nuevo escaneo completo -- la propia app ya sabe que
+        acaba de subirlo, no hace falta volver a preguntarle a Jellyfin/Plex
+        y esperar a que ellos mismos reindexen la biblioteca. Solo aplica a
+        series con temporada/episodio identificados; en películas no hay
+        "episodios que faltan" que actualizar. Debe llamarse desde el hilo
+        de la GUI (los sitios en un hilo de subida ya lo agendan con
+        self.after)."""
+        if media_info is None or media_info.media_type != "tv":
+            return
+        if media_info.season is None or media_info.episode is None:
+            return
+        tmdb_id, season, episode = media_info.tmdb_id, media_info.season, media_info.episode
+
+        from core.missing_episodes import remove_missing_episode
+        if not remove_missing_episode(self._missing_ep_results, tmdb_id, season, episode):
+            return
+
+        from core.missing_episodes_cache import load_cache, save_cache, remove_missing_episode_from_cache
+        cache = load_cache()
+        if remove_missing_episode_from_cache(cache, tmdb_id, season, episode):
+            save_cache(cache)
+
+        self._render_missing_episodes_table()
 
     def _start_missing_episodes_scan(self, force_full: bool = False):
         if not self.config_data.get("jellyfin_enabled") and not self.config_data.get("plex_enabled"):
@@ -5032,10 +5072,14 @@ class App(_AppBase):
                                       font=self._font_small, text_color=PENDING_COLOR)
             ftp_speed.pack(side="left", padx=(4, 0), pady=2) # mirror sash bar|spd
 
+            size_lbl = ctk.CTkLabel(rf, text=self._file_size_text(entry), width=cw["size"],
+                                     anchor="w", font=self._font_small, text_color=PENDING_COLOR)
+            size_lbl.pack(side="left", padx=(4, 0), pady=2)  # mirror sash spd|size
+
             ftp_up = ctk.CTkButton(rf, text="▲", width=cw["btn"], height=26,
                                     font=_BF, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                     command=lambda e=entry: self._upload_one(e))
-            ftp_up.pack(side="left", padx=(4, 0), pady=2)    # mirror sash spd|btns
+            ftp_up.pack(side="left", padx=(4, 0), pady=2)    # mirror sash size|btns
 
             play_btn = ctk.CTkButton(rf, text="▶", width=cw["btn"], height=26,
                                       font=_BF, fg_color="transparent", border_width=1,
@@ -5056,7 +5100,7 @@ class App(_AppBase):
             self._file_rows.append({
                 "frame": rf, "name": name_lbl, "detected": det_lbl,
                 "new_name": nn_lbl, "dest": dest_lbl, "status": st_lbl,
-                "ftp_bar": ftp_bar, "ftp_speed": ftp_speed,
+                "ftp_bar": ftp_bar, "ftp_speed": ftp_speed, "size": size_lbl,
                 "ftp_up": ftp_up, "play_btn": play_btn,
                 "entry": entry,
                 "_raw_name": entry.name,
@@ -5064,6 +5108,17 @@ class App(_AppBase):
             })
 
         self._update_status_bar()
+
+    def _file_size_text(self, entry) -> str:
+        """Peso del archivo en disco (columna "Peso", junto a "Vel.") --
+        directamente del filesystem, no hay que guardarlo en FileEntry ni
+        persistirlo: es una propiedad del archivo, siempre derivable de su
+        ruta. Vacío si el archivo no existe todavía o ya no existe (p.ej.
+        justo tras subir y moverlo/borrarlo), en vez de fallar."""
+        try:
+            return _fmt_size(Path(entry.path).stat().st_size)
+        except OSError:
+            return ""
 
     def _update_row(self, entry):
         sc = {"pendiente": PENDING_COLOR, "buscando": WARNING_COLOR, "listo": SUCCESS_COLOR,
@@ -5080,6 +5135,7 @@ class App(_AppBase):
                     text_color=ACCENT if entry.remote_dir_override else PENDING_COLOR)
                 row["status"].configure(text=_status_label(entry.status),
                                          text_color=sc.get(entry.status, PENDING_COLOR))
+                row["size"].configure(text=self._file_size_text(entry))
                 break
         self._update_status_bar()
 

@@ -1,12 +1,64 @@
 #define MyAppName "aRenombrar"
-;; Version real (core/version.py) pasada por linea de comandos con /D -- ver
-;; crear_instalador.bat -- para que el instalador nunca se quede
-;; desincronizado de la version de la app (antes se quedaba clavada en
-;; "1.0" mientras la app ya iba por 1.1.0). Si se compila este .iss a mano
-;; sin pasar /DMyAppVersion, se usa este valor de emergencia.
-#ifndef MyAppVersion
-#define MyAppVersion "0.0.0-dev"
+
+;; Version real, leida de core/version.py -- para que el instalador nunca
+;; se quede desincronizado de la version de la app (antes se quedaba
+;; clavada en "1.0" mientras la app ya iba por 1.1.0). Se probo primero
+;; pasarla por linea de comandos (/DMyAppVersion) desde crear_instalador.bat,
+;; pero si ese paso fallaba en silencio (entorno del usuario, quoting de
+;; cmd.exe...) el instalador se compilaba con la version VACIA y el propio
+;; Inno Setup lo rechazaba con "must include an AppVersion directive" --
+;; leerlo aqui mismo, sin depender de nada externo, evita ese fallo entero.
+;; OJO: #define dentro de un #sub/#for NO se propaga fuera de esa llamada
+;; en este Inno Setup (probado) -- por eso el bucle va desenrollado a mano
+;; en vez de con #for, y por eso hay margen de sobra (10 lineas) por si el
+;; docstring de core/version.py creciera.
+#define VersionFileHandle FileOpen(AddBackslash(SourcePath) + "core\version.py")
+#define VLine1 FileRead(VersionFileHandle)
+#define VLine2 FileRead(VersionFileHandle)
+#define VLine3 FileRead(VersionFileHandle)
+#define VLine4 FileRead(VersionFileHandle)
+#define VLine5 FileRead(VersionFileHandle)
+#define VLine6 FileRead(VersionFileHandle)
+#define VLine7 FileRead(VersionFileHandle)
+#define VLine8 FileRead(VersionFileHandle)
+#define VLine9 FileRead(VersionFileHandle)
+#define VLine10 FileRead(VersionFileHandle)
+#expr FileClose(VersionFileHandle)
+
+#if Pos("__version__", VLine1) > 0
+  #define VersionLine VLine1
+#elif Pos("__version__", VLine2) > 0
+  #define VersionLine VLine2
+#elif Pos("__version__", VLine3) > 0
+  #define VersionLine VLine3
+#elif Pos("__version__", VLine4) > 0
+  #define VersionLine VLine4
+#elif Pos("__version__", VLine5) > 0
+  #define VersionLine VLine5
+#elif Pos("__version__", VLine6) > 0
+  #define VersionLine VLine6
+#elif Pos("__version__", VLine7) > 0
+  #define VersionLine VLine7
+#elif Pos("__version__", VLine8) > 0
+  #define VersionLine VLine8
+#elif Pos("__version__", VLine9) > 0
+  #define VersionLine VLine9
+#elif Pos("__version__", VLine10) > 0
+  #define VersionLine VLine10
+#else
+  #define VersionLine ""
 #endif
+
+;; Valor de emergencia si por lo que sea no se encontro la linea -- para
+;; que el compilador nunca se quede sin AppVersion en absoluto.
+#define MyAppVersion "0.0.0-dev"
+#if Len(VersionLine) > 0
+  #define VQ1 Pos('"', VersionLine)
+  #define VRest Copy(VersionLine, VQ1 + 1, Len(VersionLine) - VQ1)
+  #define VQ2 Pos('"', VRest)
+  #define MyAppVersion Copy(VRest, 1, VQ2 - 1)
+#endif
+
 #define MyAppPublisher "Jose"
 #define MyAppExeName "aRenombrar.exe"
 

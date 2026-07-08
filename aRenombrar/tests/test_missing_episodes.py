@@ -1,7 +1,7 @@
 from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                     format_missing_ranges, looks_like_season_split,
                                     find_unknown_seasons, looks_like_absolute_numbering,
-                                    remap_absolute_episodes, _season_ranges)
+                                    remap_absolute_episodes, remove_missing_episode, _season_ranges)
 
 
 def test_find_missing_episodes_finds_gaps():
@@ -144,3 +144,52 @@ def test_remap_absolute_episodes_converts_to_per_season():
                 | {(2, n) for n in range(1, 11)}
                 | {(3, n) for n in range(1, 6)})
     assert remapped == expected
+
+
+def _missing_row(tmdb_id=1, name="Serie X", missing=None, unknown_seasons=None):
+    missing = missing if missing is not None else {1: [2, 3]}
+    return {"tmdb_id": tmdb_id, "name": name, "missing": missing,
+            "summary": format_missing_summary(name, missing),
+            "unknown_seasons": unknown_seasons or set()}
+
+
+def test_remove_missing_episode_removes_just_that_episode():
+    row = _missing_row(missing={1: [2, 3]})
+    results = [row]
+    assert remove_missing_episode(results, 1, 1, 2) is True
+    assert row["missing"] == {1: [3]}
+    assert row["summary"] == "Serie X: T1E03"
+
+
+def test_remove_missing_episode_removes_season_when_empty():
+    row = _missing_row(missing={1: [2], 2: [5]})
+    results = [row]
+    assert remove_missing_episode(results, 1, 1, 2) is True
+    assert row["missing"] == {2: [5]}
+
+
+def test_remove_missing_episode_drops_row_when_nothing_left_missing():
+    row = _missing_row(missing={1: [2]})
+    results = [row]
+    assert remove_missing_episode(results, 1, 1, 2) is True
+    assert results == []
+
+
+def test_remove_missing_episode_keeps_row_if_unknown_seasons_remain():
+    row = _missing_row(missing={1: [2]}, unknown_seasons={99})
+    results = [row]
+    assert remove_missing_episode(results, 1, 1, 2) is True
+    assert results == [row]
+    assert row["missing"] == {}
+
+
+def test_remove_missing_episode_returns_false_when_not_actually_missing():
+    row = _missing_row(missing={1: [2, 3]})
+    results = [row]
+    assert remove_missing_episode(results, 1, 1, 99) is False
+    assert row["missing"] == {1: [2, 3]}   # sin tocar
+
+
+def test_remove_missing_episode_returns_false_for_unknown_tmdb_id():
+    results = [_missing_row(tmdb_id=1)]
+    assert remove_missing_episode(results, 999, 1, 2) is False

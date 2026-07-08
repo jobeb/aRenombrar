@@ -55,14 +55,14 @@ if "%ISCC%"=="" (
 echo       Encontrado: %ISCC%
 echo.
 
-:: [4] Compilar el instalador (version real de core/version.py, no la
-:: clavada a mano en setup.iss -- ver el #ifndef MyAppVersion de ahi)
+:: [4] Compilar el instalador -- setup.iss lee la version el mismo
+:: directamente de core/version.py, no hace falta pasarsela desde aqui
+:: (un intento anterior de hacerlo con /DMyAppVersion desde un comando de
+:: Python aparte fallaba en silencio en algunos entornos, dejando la
+:: version vacia y el instalador sin compilar).
 echo [4/4] Generando aRenombrar_Setup.exe...
 if exist installer_output rmdir /s /q installer_output
-set APPVER=
-for /f "delims=" %%v in ('"%PYTHON%" -c "from core.version import __version__; print(__version__)"') do set APPVER=%%v
-echo       Version: %APPVER%
-"%ISCC%" /DMyAppVersion=%APPVER% setup.iss
+"%ISCC%" setup.iss
 
 if errorlevel 1 (
     echo ERROR al generar el instalador.

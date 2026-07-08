@@ -96,3 +96,31 @@ def test_low_confidence_does_not_overwrite_manual_identification(tmp_path, db_pa
 
 def test_protected_statuses_include_identificado_manual():
     assert "identificado_manual" in _PROTECTED_STATUSES
+
+
+def test_already_protected_file_aborts_before_any_tmdb_call_or_event(tmp_path, db_path):
+    """No basta con que _mark() descarte el resultado tardío en disco: si el
+    archivo ya está protegido, _process() no debe ni llegar a buscar en TMDB
+    ni disparar el evento "skip" -- si no, la fila vuelve a parpadear a
+    "Omitido" un instante (aunque no llegue a persistirse), y hacía falta
+    identificar el mismo archivo a mano DOS veces para que la tabla se
+    quedara quieta de verdad."""
+    original = tmp_path / "Serie Completamente Distinta 1x01.mkv"
+    original.write_bytes(b"contenido")
+    key = str(original)
+
+    db_path.write_text(json.dumps({
+        key: {"status": "identificado_manual", "new_name": "Trollhunters (2016).mkv", "ts": 0}
+    }), encoding="utf-8")
+
+    events = []
+    watcher = _make_watcher(tmp_path)
+    watcher.on_event = lambda tipo, msg: events.append(("event", tipo, msg))
+    watcher.on_file_event = lambda path, tipo, **kw: events.append(("file_event", tipo, kw))
+    watcher._in_progress.add(key)
+
+    watcher._process(original)
+
+    watcher.tmdb.search_multi.assert_not_called()
+    assert events == [], f"no debería haberse disparado ningún evento, pero se disparó: {events}"
+    assert key not in watcher._in_progress

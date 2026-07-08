@@ -262,6 +262,21 @@ class AutoWatcher:
                 self._in_progress.discard(key)
                 return
             _log.debug("Archivo estable (%.1f MB): %s", path.stat().st_size / 1024**2, path.name)
+
+            # Si mientras se esperaba la estabilidad (6s) -- o en un reintento
+            # ya en marcha desde un ciclo de escaneo anterior -- el usuario
+            # identificó este archivo a mano desde la GUI, no hay que ni
+            # empezar a re-detectarlo. _mark() ya evita que el resultado
+            # propio de este hilo LLEGUE A PERSISTIRSE, pero sin este chequeo
+            # el evento de "Confianza insuficiente"/etc. se sigue disparando
+            # igual, y la fila vuelve a verse "Omitido" un instante de más --
+            # visto de verdad: hacía falta identificar el mismo archivo a
+            # mano DOS veces para que la tabla dejara de parpadear.
+            if self._load_db().get(key, {}).get("status", "") in _PROTECTED_STATUSES:
+                _log.info("Abandonando proceso: %s ya se gestionó a mano mientras se esperaba", path.name)
+                self._in_progress.discard(key)
+                return
+
             self.on_file_event(key, "start")
             self.on_event("info", f"Identificando: {path.name}")
 
@@ -554,22 +569,30 @@ class AutoWatcher:
             self.on_event("info", f"Subiendo: {new_name}")
             self.on_file_event(key, "uploading", new_name=new_name, progress=0.0, speed=0.0)
 
-            def _progress_cb(sent, total, speed):
-                pct = sent / total if total > 0 else 0.0
-                self.on_file_event(key, "uploading", new_name=new_name, progress=pct, speed=speed)
+        # A PROPÓSITO fuera de self._ftp_lock: "Subidas simultáneas" es un
+        # cupo GLOBAL compartido con la subida manual (ver
+        # core/upload_slots.py) -- si está ocupado por una subida manual
+        # puede tardar minutos en liberarse, y mientras se espera no hay
+        # ningún uso real de self.ftp en curso. Esperar aquí DENTRO del
+        # candado (como estaba antes) monopolizaba la conexión compartida
+        # todo ese tiempo, dejando sin responder cualquier otra parte de la
+        # app que también la necesita (refresco de espacio libre, "Probar
+        # conexión"...) aunque no hubiera ninguna transferencia en marcha --
+        # visto de verdad: el indicador de espacio se quedaba sin
+        # actualizarse mientras el automático llevaba un rato en marcha.
+        def _progress_cb(sent, total, speed):
+            pct = sent / total if total > 0 else 0.0
+            self.on_file_event(key, "uploading", new_name=new_name, progress=pct, speed=speed)
 
-            # "Subidas simultáneas" es un cupo GLOBAL compartido con la subida
-            # manual (ver core/upload_slots.py) — si está a 1, esta subida
-            # espera aquí a que termine cualquier otra (manual o automática)
-            # antes de empezar a transferir.
-            if not self.upload_slots.acquire(cancel_event=self._stop):
-                _log.info("Subida cancelada esperando turno: %s", new_name)
-                self.on_event("info", "Subida cancelada por parada del modo automático")
-                self.on_file_event(key, "skip", new_name=new_name,
-                                    reason="Subida cancelada al detener el modo automático")
-                _discard_both()
-                return
-            try:
+        if not self.upload_slots.acquire(cancel_event=self._stop):
+            _log.info("Subida cancelada esperando turno: %s", new_name)
+            self.on_event("info", "Subida cancelada por parada del modo automático")
+            self.on_file_event(key, "skip", new_name=new_name,
+                                reason="Subida cancelada al detener el modo automático")
+            _discard_both()
+            return
+        try:
+            with self._ftp_lock:
                 ok3, msg3 = self.ftp.upload_file(
                     new_path, remote_path,
                     progress_cb=_progress_cb,
@@ -577,48 +600,48 @@ class AutoWatcher:
                     speed_limit_kbs=self._get_speed_limit_kbs,
                     remote_filename=remote_filename,
                 )
-            finally:
-                self.upload_slots.release()
-            if ok3:
-                _log.info("FTP upload OK: %s -> %s", new_name, remote_path)
-                self.on_event("ok", f"✓ Subido: {new_name}")
-                self.on_file_event(key, "uploaded", new_name=new_name)
-                _mark_both("subido", new_name=new_name)
-                from core.media_server_refresh import trigger_refresh
-                trigger_refresh(self.config)
-                # Acción post-proceso: solo tras subida exitosa
-                action = self.config.get("auto_action", "Mantener original")
-                renamed_path = Path(new_path)
-                _log.debug("Acción post-proceso: %s", action)
-                if action == "Mover a subcarpeta 'procesados'":
-                    try:
-                        dest_dir = renamed_path.parent / "procesados"
-                        dest_dir.mkdir(exist_ok=True)
-                        import shutil
-                        shutil.move(str(renamed_path), str(dest_dir / renamed_path.name))
-                        _log.info("Movido a procesados: %s", renamed_path.name)
-                    except Exception as e:
-                        _log.error("No se pudo mover: %s", e)
-                        self.on_event("skip", f"No se pudo mover archivo: {e}")
-                elif action == "Eliminar original":
-                    try:
-                        if renamed_path.exists():
-                            renamed_path.unlink()
-                            _log.info("Eliminado: %s", renamed_path.name)
-                    except Exception as e:
-                        _log.error("No se pudo eliminar: %s", e)
-                        self.on_event("skip", f"No se pudo eliminar archivo: {e}")
-            elif msg3 == "cancelado":
-                _log.info("Subida cancelada: %s", new_name)
-                self.on_event("info", "Subida cancelada por parada del modo automático")
-                self.on_file_event(key, "skip", new_name=new_name,
-                                    reason="Subida cancelada al detener el modo automático")
-                _discard_both()
-            else:
-                _log.error("FTP upload fallido: %s | %s", new_name, msg3)
-                self.on_event("error", f"Error FTP al subir {new_name}: {msg3}")
-                self.on_file_event(key, "error", new_name=new_name, reason=f"Error FTP al subir: {msg3}")
-                _mark_both("error_ftp", new_name=new_name)
+        finally:
+            self.upload_slots.release()
+        if ok3:
+            _log.info("FTP upload OK: %s -> %s", new_name, remote_path)
+            self.on_event("ok", f"✓ Subido: {new_name}")
+            self.on_file_event(key, "uploaded", new_name=new_name)
+            _mark_both("subido", new_name=new_name)
+            from core.media_server_refresh import trigger_refresh
+            trigger_refresh(self.config)
+            # Acción post-proceso: solo tras subida exitosa
+            action = self.config.get("auto_action", "Mantener original")
+            renamed_path = Path(new_path)
+            _log.debug("Acción post-proceso: %s", action)
+            if action == "Mover a subcarpeta 'procesados'":
+                try:
+                    dest_dir = renamed_path.parent / "procesados"
+                    dest_dir.mkdir(exist_ok=True)
+                    import shutil
+                    shutil.move(str(renamed_path), str(dest_dir / renamed_path.name))
+                    _log.info("Movido a procesados: %s", renamed_path.name)
+                except Exception as e:
+                    _log.error("No se pudo mover: %s", e)
+                    self.on_event("skip", f"No se pudo mover archivo: {e}")
+            elif action == "Eliminar original":
+                try:
+                    if renamed_path.exists():
+                        renamed_path.unlink()
+                        _log.info("Eliminado: %s", renamed_path.name)
+                except Exception as e:
+                    _log.error("No se pudo eliminar: %s", e)
+                    self.on_event("skip", f"No se pudo eliminar archivo: {e}")
+        elif msg3 == "cancelado":
+            _log.info("Subida cancelada: %s", new_name)
+            self.on_event("info", "Subida cancelada por parada del modo automático")
+            self.on_file_event(key, "skip", new_name=new_name,
+                                reason="Subida cancelada al detener el modo automático")
+            _discard_both()
+        else:
+            _log.error("FTP upload fallido: %s | %s", new_name, msg3)
+            self.on_event("error", f"Error FTP al subir {new_name}: {msg3}")
+            self.on_file_event(key, "error", new_name=new_name, reason=f"Error FTP al subir: {msg3}")
+            _mark_both("error_ftp", new_name=new_name)
 
     # ── Carpeta de serie en el FTP ─────────────────────────────────────────────
 

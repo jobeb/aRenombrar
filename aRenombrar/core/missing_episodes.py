@@ -127,6 +127,31 @@ def format_missing_summary(show_name: str, missing: dict) -> str:
     return f"{show_name}: {ranges}" if ranges else ""
 
 
+def remove_missing_episode(results: list, tmdb_id: int, season: int, episode: int) -> bool:
+    """Quita (temporada, episodio) de la fila de *results* (misma lista que
+    gui/app.py::App._missing_ep_results) cuyo tmdb_id coincida -- usado justo
+    tras subir ese episodio, para no tener que esperar a un nuevo escaneo
+    completo (que además depende de que Jellyfin/Plex ya hayan reindexado
+    la biblioteca). Si la serie se queda sin ningún hueco (ni
+    unknown_seasons), se quita la fila entera de *results* -- mutación en
+    sitio, results se modifica directamente. Devuelve True si de verdad
+    había algo que quitar."""
+    for r in results:
+        if r.get("tmdb_id") != tmdb_id:
+            continue
+        eps = r.get("missing", {}).get(season)
+        if not eps or episode not in eps:
+            return False
+        eps.remove(episode)
+        if not eps:
+            del r["missing"][season]
+        r["summary"] = format_missing_summary(r["name"], r["missing"])
+        if not r["missing"] and not r.get("unknown_seasons"):
+            results.remove(r)
+        return True
+    return False
+
+
 def _season_ranges(season: int, episodes: list) -> list:
     """[1,2,3,7] -> ['T1E01-T1E03', 'T1E07']"""
     ranges = []
