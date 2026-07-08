@@ -1,5 +1,12 @@
 #define MyAppName "aRenombrar"
-#define MyAppVersion "1.0"
+;; Version real (core/version.py) pasada por linea de comandos con /D -- ver
+;; crear_instalador.bat -- para que el instalador nunca se quede
+;; desincronizado de la version de la app (antes se quedaba clavada en
+;; "1.0" mientras la app ya iba por 1.1.0). Si se compila este .iss a mano
+;; sin pasar /DMyAppVersion, se usa este valor de emergencia.
+#ifndef MyAppVersion
+#define MyAppVersion "0.0.0-dev"
+#endif
 #define MyAppPublisher "Jose"
 #define MyAppExeName "aRenombrar.exe"
 

@@ -14,9 +14,11 @@ if "%PYTHON%"=="" set PYTHON=C:\Users\Jose\AppData\Local\Programs\Python\Python3
 echo Usando Python: %PYTHON%
 echo.
 
-:: [1] Instalar dependencias + PyInstaller
+:: [1] Instalar dependencias + PyInstaller (desde requirements.txt -- una
+:: lista a mano aqui se desincroniza con el tiempo y puede dejar fuera algo
+:: tan critico como "keyring", que config.py importa sin red de seguridad)
 echo [1/4] Instalando dependencias...
-"%PYTHON%" -m pip install customtkinter Pillow requests pyinstaller pystray --quiet
+"%PYTHON%" -m pip install -r requirements.txt pyinstaller --quiet
 echo       OK
 echo.
 
@@ -53,10 +55,14 @@ if "%ISCC%"=="" (
 echo       Encontrado: %ISCC%
 echo.
 
-:: [4] Compilar el instalador
+:: [4] Compilar el instalador (version real de core/version.py, no la
+:: clavada a mano en setup.iss -- ver el #ifndef MyAppVersion de ahi)
 echo [4/4] Generando aRenombrar_Setup.exe...
 if exist installer_output rmdir /s /q installer_output
-"%ISCC%" setup.iss
+set APPVER=
+for /f "delims=" %%v in ('"%PYTHON%" -c "from core.version import __version__; print(__version__)"') do set APPVER=%%v
+echo       Version: %APPVER%
+"%ISCC%" /DMyAppVersion=%APPVER% setup.iss
 
 if errorlevel 1 (
     echo ERROR al generar el instalador.
