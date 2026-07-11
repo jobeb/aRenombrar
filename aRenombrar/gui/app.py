@@ -43,6 +43,7 @@ from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively
 from core.ftp_categories import choose_category, new_category_id
 from core.upload_slots import UploadSlotManager
+from gui.table_view import TableView, ColumnSpec
 from core.appdirs import app_data_dir, is_windows, is_macos
 from core.applog import get_logger
 from core.version import __version__
@@ -299,6 +300,53 @@ class _SeriesMatchDialog(ctk.CTkToplevel):
         self.wait_window()
 
     def _close(self, result: str):
+        self.result = result
+        self.destroy()
+
+
+class _RenameReservationsDialog(ctk.CTkToplevel):
+    """Diálogo modal al cambiar "Tu nombre" en Ajustes teniendo reservas
+    propias con el nombre anterior -- ver App._resolve_app_user_name_change.
+    "Traspasarlas" solo se ofrece si hay un nombre nuevo real (no al
+    vaciar el campo, no tiene sentido traspasar a "nadie")."""
+    def __init__(self, parent, old_name: str, new_name: str):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.result = None   # "transfer" | "unprotect" | None (cancelado)
+        self.title("Cambio de nombre")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        dw, dh = 460, 230
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        ctk.CTkLabel(self, text=f"Tienes contenido reservado como \"{old_name}\".",
+                     font=ctk.CTkFont(size=13, weight="bold"), wraplength=400).pack(padx=24, pady=(22, 4))
+        msg = (f"¿Qué quieres hacer con esas reservas al pasar a llamarte \"{new_name}\"?" if new_name else
+               "Vas a quitar tu nombre de Ajustes. ¿Qué quieres hacer con esas reservas?")
+        ctk.CTkLabel(self, text=msg, font=ctk.CTkFont(size=11),
+                     text_color="#95a5a6", wraplength=400, justify="left").pack(padx=24, pady=(0, 18))
+
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(padx=24, pady=(0, 10))
+        if new_name:
+            ctk.CTkButton(bf, text="Traspasarlas al nombre nuevo", width=190,
+                          fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                          command=lambda: self._close("transfer")).pack(side="left", padx=6)
+        ctk.CTkButton(bf, text="Desproteger todas", width=150,
+                      fg_color="#c0392b", hover_color="#96281b",
+                      command=lambda: self._close("unprotect")).pack(side="left", padx=6)
+        ctk.CTkButton(self, text="Cancelar", fg_color="transparent", border_width=1, width=120,
+                      command=lambda: self._close(None)).pack(pady=(0, 16))
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._close(None))
+        self.wait_window()
+
+    def _close(self, result):
         self.result = result
         self.destroy()
 
@@ -583,6 +631,10 @@ class App(_AppBase):
         # misma conexión).
         self._ftp_cmd_lock = threading.Lock()
         _mark("TMDBClient/FTPClient")
+        from core.favorites import load_local_cache
+        self._favorites = load_local_cache()
+        from core.reservations import load_local_cache as _load_reservations_cache
+        self._reservations = _load_reservations_cache()
         self.files = []
         self._selected_entry = None
 
@@ -650,6 +702,26 @@ class App(_AppBase):
             # CTk puede resetear el icono; re-aplicar tras el primer frame
             self.after(50, lambda: self._apply_icon(self))
         _mark("icono")
+
+        # Logos de Plex/Jellyfin -- para distinguir de un vistazo, en la
+        # fila de cada serie de "Episodios que faltan", de qué servidor
+        # viene esa información (antes eran los emoji 📺/🎬, sin relación
+        # visual con ninguno de los dos servicios). CTkImage escala él
+        # solo según el "widget scaling" activo, así que basta con darle
+        # el tamaño final deseado (ver origin_source_icon_size más abajo).
+        self._plex_logo_img = None
+        self._jellyfin_logo_img = None
+        try:
+            base = sys._MEIPASS if getattr(sys, "frozen", False) else \
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            plex_png = os.path.join(base, "plex_logo.png")
+            jellyfin_png = os.path.join(base, "jellyfin_logo.png")
+            if os.path.exists(plex_png):
+                self._plex_logo_img = ctk.CTkImage(Image.open(plex_png), size=(18, 18))
+            if os.path.exists(jellyfin_png):
+                self._jellyfin_logo_img = ctk.CTkImage(Image.open(jellyfin_png), size=(18, 18))
+        except Exception:
+            pass
 
         self._startup_mark = _mark   # usado dentro de _build_ui, ver ahí
         self._build_ui()
@@ -805,6 +877,15 @@ class App(_AppBase):
         self._cleanup_visible = False
         self._build_cleanup_tab(self._cleanup_frame)
         self._startup_mark("  _build_cleanup_tab()")
+
+        # Protegidos -- gestión de todo lo reservado (ver core/reservations.py):
+        # cuota del usuario actual y botón "Liberar" por fila, tanto para lo
+        # reservado desde Archivos como desde Liberar espacio.
+        self._protected_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
+        self._protected_frame.grid_columnconfigure(0, weight=1)
+        self._protected_visible = False
+        self._build_protected_tab(self._protected_frame)
+        self._startup_mark("  _build_protected_tab()")
 
         self._build_status_bar()
         self._startup_mark("  _build_status_bar()")
@@ -1091,6 +1172,7 @@ class App(_AppBase):
                 # Guardar en historial (modo automático)
                 self._save_history_entry(fname, path, "ok", 0)
                 self._remove_uploaded_episode_from_missing_list(entry.media_info)
+                self._refresh_ftp_space()
 
             elif tipo == "skip":
                 entry.status    = "omitido"
@@ -1122,6 +1204,7 @@ class App(_AppBase):
         "files": "📁 Archivos",
         "missing_ep": "🔍 Episodios",
         "cleanup": "🗑 Liberar espacio",
+        "protected": "🔒 Protegidos",
         "history": "📋 Historial",
         "config": "⚙ Configuración",
     }
@@ -1135,6 +1218,8 @@ class App(_AppBase):
             return "history"
         if self._cleanup_visible:
             return "cleanup"
+        if self._protected_visible:
+            return "protected"
         return "files"
 
     def _on_nav_segment_changed(self, value):
@@ -1192,14 +1277,20 @@ class App(_AppBase):
         elif self._cleanup_visible:
             self._cleanup_frame.grid_remove()
             self._cleanup_visible = False
+        elif self._protected_visible:
+            self._protected_frame.grid_remove()
+            self._protected_visible = False
         else:
             self._files_frame.grid_remove()
 
         if view_key == "files":
             self._files_frame.grid(row=0, column=0, sticky="nsew")
+            self._sync_favorites_from_ftp()
+            self._sync_reservations_from_ftp()
         elif view_key == "missing_ep":
             self._missing_ep_frame.grid(row=0, column=0, sticky="nsew")
             self._missing_ep_visible = True
+            self._sync_favorites_from_ftp()
         elif view_key == "history":
             self._history_frame.grid(row=0, column=0, sticky="nsew")
             self._history_visible = True
@@ -1207,6 +1298,13 @@ class App(_AppBase):
         elif view_key == "cleanup":
             self._cleanup_frame.grid(row=0, column=0, sticky="nsew")
             self._cleanup_visible = True
+            self._sync_favorites_from_ftp()
+            self._sync_reservations_from_ftp()
+        elif view_key == "protected":
+            self._protected_frame.grid(row=0, column=0, sticky="nsew")
+            self._protected_visible = True
+            self._render_protected_table()   # con lo que haya en el mirror local, sin esperar al FTP
+            self._sync_reservations_from_ftp()
         elif view_key == "config":
             if not self._config_panel_built:
                 # Construcción diferida hasta la primera visita real --
@@ -1275,9 +1373,6 @@ class App(_AppBase):
         ctk.CTkButton(right_fr, text="Limpiar", command=self._clear_files,
                       fg_color="transparent", border_width=1, width=80).pack(side="right", padx=4, pady=8)
 
-        self._file_list_frame = ctk.CTkScrollableFrame(body, label_text="")
-        self._file_list_frame.grid(row=1, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
-        self._file_list_frame.grid_columnconfigure(0, weight=1)
         # Fuentes compartidas por las columnas truncadas — se reutilizan tanto para
         # dibujar el texto como para medirlo en _fit_text, así ambos ancho coinciden.
         self._font_name = ctk.CTkFont(size=12)
@@ -1289,16 +1384,43 @@ class App(_AppBase):
         # dibujado de la tabla entera.
         self._font_btn   = ctk.CTkFont(size=12)   # botones ▲/▶/✕ de cada fila
         self._font_small = ctk.CTkFont(size=11)   # columnas Estado y Vel.
-        self._col_widths = self._compute_cw()
-        self._sash_state = None   # estado de arrastre de separadores
-        self._hdr_labels = []
+
+        # TableView: mismo componente que Episodios/Liberar espacio/
+        # Historial (ver gui/table_view.py) -- cabecera fija con los
+        # mismos anchos que leen las filas. name/det/nn se recalculan
+        # según el ancho disponible (ver _compute_cw/_on_table_resize,
+        # comportamiento propio de esta tabla, no del componente).
+        cw0 = self._compute_cw()
+        sw0 = self._saved_col_widths("archivos")   # anchos guardados de una sesión anterior, si hay
+        self._col_widths = cw0   # mirror de self._file_table para el código de filas -- ver _apply_col_widths
+        self._file_table = TableView(body, columns=[
+            ColumnSpec("name", "Nombre original", width=sw0.get("name", cw0["name"]), min_width=80, resizable=True),
+            ColumnSpec("det", "Detectado", width=sw0.get("det", cw0["det"]), min_width=55, resizable=True),
+            ColumnSpec("nn", "Nuevo nombre", width=cw0["nn"], expand=True, resizable=True),
+            ColumnSpec("dest", "Destino", width=sw0.get("dest", 140), min_width=60, resizable=True),
+            ColumnSpec("stat", "Estado", width=sw0.get("stat", 74), min_width=50, resizable=True),
+            ColumnSpec("bar", "Subida FTP", width=sw0.get("bar", 110), min_width=50, resizable=True),
+            ColumnSpec("spd", "Vel.", width=sw0.get("spd", 80), min_width=50, resizable=True),
+            ColumnSpec("size", "Peso", width=sw0.get("size", 60), min_width=40),
+            ColumnSpec("fav", "", width=28),
+            ColumnSpec("lock", "", width=28),
+            ColumnSpec("btns", "", width=28 * 3 + 6),
+        ])
+        self._file_table.grid(row=1, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
+        self._file_table.on_column_resize = self._apply_col_widths
+        self._file_table.on_widths_changed = lambda w: self._save_table_col_widths("archivos", w)
+        # Alias -- el resto de la app (drag&drop, _refresh_table, etc.)
+        # ya usaba self._file_list_frame como el contenedor con scroll de
+        # las filas; TableView.body es justo eso.
+        self._file_list_frame = self._file_table.body
+
         # Enlazar redimensionado adaptativo al canvas interno del CTkScrollableFrame
         # add="+" preserva el binding nativo _fit_frame_dimensions_to_canvas de CTkScrollableFrame
         # que ajusta el ancho del frame interno al canvas; sin él las filas no llenan el ancho completo
         self._file_list_frame._parent_canvas.bind(
             "<Configure>", self._on_table_resize, add="+")
-        self._build_table_header(self._file_list_frame)
         self._file_rows = []
+        self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
 
         self._drop_zone = ctk.CTkLabel(self._file_list_frame,
                                         text="Arrastra archivos aquí\no usa + Archivos",
@@ -1306,10 +1428,9 @@ class App(_AppBase):
         self._drop_zone.pack(pady=40)
 
         # Separador arrastrable entre la tabla y el panel de TMDB -- mismo
-        # patrón visual que los separadores internos de columnas de la
-        # tabla (ver _sash_press/_sash_motion/_sash_release), pero
-        # independiente de esos (ajusta el ancho del panel, no columnas
-        # de la tabla).
+        # patrón visual que los separadores de columna de TableView (ver
+        # gui/table_view.py), pero independiente de esos (ajusta el ancho
+        # del panel, no columnas de la tabla).
         self._detail_sash = tk.Frame(body, width=4, bg="#505060",
                                       cursor="sb_h_double_arrow")
         self._detail_sash.grid(row=0, column=1, rowspan=2, sticky="ns", pady=8)
@@ -1328,11 +1449,30 @@ class App(_AppBase):
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self._on_drop)
 
+    def _saved_col_widths(self, table_id: str) -> dict:
+        """Anchos de columna guardados para una tabla (ver
+        _save_table_col_widths) -- {} si nunca se guardó nada, p.ej. en el
+        primer arranque o tras un reset de configuración."""
+        return dict(self.config_data.get("table_col_widths", {}).get(table_id, {}))
+
+    def _save_table_col_widths(self, table_id: str, widths: dict):
+        """Callback de TableView.on_widths_changed: se guarda en disco
+        inmediatamente al soltar un separador (no espera a "Guardar
+        configuración"), como pidió el usuario."""
+        all_saved = dict(self.config_data.get("table_col_widths", {}))
+        all_saved[table_id] = widths
+        self.config_data.set("table_col_widths", all_saved)
+        self.config_data.save()
+
     def _compute_cw(self, avail_w=None):
         """Calcula anchos de columna adaptativos. avail_w = px disponibles en la tabla.
         FIXED incluye los 6 sashes de 4px + padx de botones (4+2+2+2) = 30px constantes,
-        más la columna "Destino" (140px, ancho fijo, sin sash) y su separador (4px)."""
-        FIXED = 74 + 110 + 80 + 60 + 28*3 + 30 + 140 + 4  # widgets fijos + spacing constante = 582
+        más la columna "Destino" (140px, ancho fijo, sin sash) y su separador (4px).
+        28*5 (no *3): 5 botones por fila -- favorito, reservar, subir,
+        reproducir, quitar -- desde que se añadieron favorito y reservar;
+        cada uno de esos dos añade su propio padx aparte de los 30px de
+        los tres originales (ver fav_btn/lock_btn.pack en _refresh_table)."""
+        FIXED = 74 + 110 + 80 + 60 + 28*5 + 4 + 4 + 30 + 140 + 4  # widgets fijos + spacing constante = 646
         PAD   = 16                           # padding interno CTkScrollableFrame
         if avail_w is None:
             avail_w = 900
@@ -1345,20 +1485,22 @@ class App(_AppBase):
     def _on_table_resize(self, event):
         """Reescala columnas al cambiar el ancho del canvas."""
         new_cw = self._compute_cw(event.width)
-        cw = self._col_widths
-        if new_cw["name"] == cw["name"] and new_cw["det"] == cw["det"]:
+        if new_cw["name"] == self._col_widths["name"] and new_cw["det"] == self._col_widths["det"]:
             return
-        self._col_widths.update(new_cw)
+        for key in ("name", "det", "nn"):
+            self._file_table.set_width(key, new_cw[key], refresh=False)
+        self._file_table.refresh_header()
         self._apply_col_widths()
 
     def _apply_col_widths(self):
-        """Actualiza anchos y texto de cabeceras y filas. nn no recibe ancho fijo (expand=True)."""
+        """Sincroniza self._col_widths desde self._file_table (que es la
+        fuente real de los anchos, ver TableView.set_width/col_width) y
+        actualiza las filas ya pintadas -- se llama tanto tras
+        _on_table_resize como tras arrastrar un separador a mano (ver
+        self._file_table.on_column_resize)."""
+        for key in ("name", "det", "nn", "dest", "stat", "bar", "spd", "size"):
+            self._col_widths[key] = self._file_table.col_width(key)
         cw = self._col_widths
-        for lbl, key in self._hdr_labels:
-            if key in ("name", "det", "dest", "stat", "bar", "spd", "size"):
-                lbl.configure(width=cw[key])
-            elif key == "btns":
-                lbl.configure(width=cw["btn"] * 3 + 6)
         for row in self._file_rows:
             row["name"].configure(
                 width=cw["name"],
@@ -1375,29 +1517,6 @@ class App(_AppBase):
             row["ftp_bar"].configure(width=cw["bar"])
             row["ftp_speed"].configure(width=cw["spd"])
             row["size"].configure(width=cw["size"])
-
-    def _sash_press(self, event, left_col, right_col):
-        self._sash_state = {
-            "left":   left_col,
-            "right":  right_col,
-            "x0":     event.x_root,
-            "left_w": self._col_widths[left_col],
-            "right_w": self._col_widths[right_col],
-        }
-
-    def _sash_motion(self, event):
-        if not self._sash_state:
-            return
-        delta = event.x_root - self._sash_state["x0"]
-        MIN = 60
-        new_l = max(MIN, self._sash_state["left_w"]  + delta)
-        new_r = max(MIN, self._sash_state["right_w"] - delta)
-        self._col_widths[self._sash_state["left"]]  = new_l
-        self._col_widths[self._sash_state["right"]] = new_r
-        self._apply_col_widths()
-
-    def _sash_release(self, event):
-        self._sash_state = None
 
     _DETAIL_PANEL_MIN_W = 180
     _DETAIL_PANEL_MAX_W = 500
@@ -1457,85 +1576,6 @@ class App(_AppBase):
         self._autosize_textbox(self._detail_title)
         self._autosize_textbox(self._detail_overview)
         self._autosize_textbox(self._detail_error)
-
-    def _build_table_header(self, parent):
-        import tkinter as tk
-        cw = self._col_widths
-        hdr = ctk.CTkFrame(parent, corner_radius=0)
-        hdr.pack(fill="x", pady=(0, 2))
-        _BF = ctk.CTkFont(weight="bold")
-
-        def _sash(left_col, right_col=None):
-            """Separador de 4px; arrastrable si se dan los nombres de columnas."""
-            draggable = right_col is not None
-            s = tk.Frame(hdr, width=4, bg="#505060",
-                         cursor="sb_h_double_arrow" if draggable else "")
-            s.pack(side="left", fill="y", pady=6)
-            if draggable:
-                s.bind("<ButtonPress-1>",   lambda e: self._sash_press(e, left_col, right_col))
-                s.bind("<B1-Motion>",       self._sash_motion)
-                s.bind("<ButtonRelease-1>", self._sash_release)
-
-        # Nombre original
-        lbl = ctk.CTkLabel(hdr, text="Nombre original", font=_BF, width=cw["name"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "name"))
-
-        _sash("name", "det")   # arrastrable
-
-        # Detectado
-        lbl = ctk.CTkLabel(hdr, text="Detectado", font=_BF, width=cw["det"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "det"))
-
-        _sash("det", "nn")     # arrastrable
-
-        # Nuevo nombre — expande para llenar el espacio sobrante
-        lbl = ctk.CTkLabel(hdr, text="Nuevo nombre", font=_BF, anchor="w")
-        lbl.pack(side="left", padx=0, pady=4, fill="x", expand=True)
-        self._hdr_labels.append((lbl, "nn"))
-
-        _sash("nn", "dest")   # arrastrable
-
-        # Destino -- ancho fijo (no arrastrable): la carpeta remota donde
-        # se subiría, calculada por categoría/género, o la fijada a mano
-        # (columna editable con un clic, ver _edit_remote_dir).
-        lbl = ctk.CTkLabel(hdr, text="Destino", font=_BF, width=cw["dest"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "dest"))
-
-        _sash("dest", "stat")    # arrastrable
-
-        # Estado
-        lbl = ctk.CTkLabel(hdr, text="Estado", font=_BF, width=cw["stat"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "stat"))
-
-        _sash("stat", "bar")   # arrastrable
-
-        # Subida FTP
-        lbl = ctk.CTkLabel(hdr, text="Subida FTP", font=_BF, width=cw["bar"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "bar"))
-
-        _sash("bar", "spd")    # arrastrable
-
-        # Vel.
-        lbl = ctk.CTkLabel(hdr, text="Vel.", font=_BF, width=cw["spd"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "spd"))
-
-        _sash("spd", "size")   # arrastrable
-
-        # Peso -- tamaño del archivo en disco, ver _file_size_text
-        lbl = ctk.CTkLabel(hdr, text="Peso", font=_BF, width=cw["size"], anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "size"))
-
-        # Cabecera vacía para los 3 botones (btn*3 + inter-btn padx: 2+2+2=6)
-        lbl = ctk.CTkLabel(hdr, text="", font=_BF, width=cw["btn"] * 3 + 6, anchor="w")
-        lbl.pack(side="left", padx=0, pady=4)
-        self._hdr_labels.append((lbl, "btns"))
 
     def _build_detail_panel(self, parent):
         panel = ctk.CTkFrame(parent, width=255)
@@ -1719,6 +1759,294 @@ class App(_AppBase):
             return
         self._refresh_ftp_space()
         self._prefetch_ftp_category_dirs()
+
+    def _is_favorite(self, media_type: str, tmdb_id: int) -> bool:
+        from core.favorites import is_favorite
+        return is_favorite(self._favorites, media_type, tmdb_id)
+
+    def _toggle_favorite(self, media_type: str, tmdb_id: int, name: str, on_done=None):
+        """Marca/desmarca favorito -- optimista en local (se ve al instante
+        en las 3 pestañas) y luego intenta sincronizar con el FTP en segundo
+        plano: descarga el JSON remoto fresco, aplica el MISMO cambio sobre
+        ESE contenido (no sobre lo que había en memoria) y lo vuelve a
+        subir, para minimizar la carrera si otro cliente conectado al mismo
+        servidor cambió algo distinto mientras tanto. Si no hay ruta
+        configurada o la subida falla, el cambio se queda en el mirror local
+        nada más -- no es una operación que deba bloquear ni fallar la UI."""
+        from core.favorites import add_favorite, remove_favorite, save_local_cache
+        turning_on = not self._is_favorite(media_type, tmdb_id)
+        op = add_favorite if turning_on else remove_favorite
+        args = (media_type, tmdb_id, name) if turning_on else (media_type, tmdb_id)
+
+        self._favorites = op(self._favorites, *args)
+        save_local_cache(self._favorites)
+        if on_done:
+            on_done()
+
+        remote_path = self.config_data.get("shared_data_ftp_path", "")
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = op(remote_data, *args)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    self.after(0, lambda: self._apply_synced_favorites(merged, on_done))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_favorites(self, merged: dict, on_done=None):
+        from core.favorites import save_local_cache
+        self._favorites = merged
+        save_local_cache(self._favorites)
+        if on_done:
+            on_done()
+        else:
+            # Sin un callback puntual (p.ej. tras _sync_favorites_from_ftp
+            # al abrir una pestaña, en vez de tras marcar/desmarcar una
+            # fila concreta) -- refrescar la vista activa para que las
+            # estrellas reflejen lo que haya cambiado desde otro cliente.
+            if self._current_view_key() == "files":
+                self._refresh_table()
+            elif self._missing_ep_visible:
+                self._render_missing_episodes_table(reset_page=False)
+            elif self._cleanup_visible:
+                self._apply_cleanup_filters()
+
+    def _sync_favorites_from_ftp(self):
+        """Refresca el mirror local desde el FTP en segundo plano -- se
+        llama al abrir cada una de las 3 pestañas que muestran favoritos,
+        para reflejar cambios hechos desde otro cliente del mismo servidor.
+        Silencioso si no hay ruta configurada o la conexión falla: el mirror
+        local ya tiene el último estado conocido."""
+        remote_path = self.config_data.get("shared_data_ftp_path", "")
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_favorites(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reservations_remote_path(self) -> str:
+        """Ruta remota del JSON de reservas -- un archivo hermano junto al
+        de favoritos (shared_data_ftp_path), no un campo de ajustes propio:
+        reservas y favoritos comparten la misma conexión/carpeta FTP, así
+        que basta con una única ruta configurada por el usuario. "" si no
+        hay ruta de favoritos configurada (reservas también deshabilitadas)."""
+        base = self.config_data.get("shared_data_ftp_path", "").strip()
+        if not base:
+            return ""
+        if "." in base.rsplit("/", 1)[-1]:
+            root, ext = base.rsplit(".", 1)
+            return f"{root}_reservas.{ext}"
+        return base + "_reservas"
+
+    def _is_reserved(self, media_type: str, tmdb_id: int) -> bool:
+        from core.reservations import is_reserved
+        return is_reserved(self._reservations, media_type, tmdb_id)
+
+    def _reservation_owner(self, media_type: str, tmdb_id: int):
+        from core.reservations import reserved_by
+        return reserved_by(self._reservations, media_type, tmdb_id)
+
+    def _toggle_reservation(self, media_type: str, tmdb_id: int, name: str,
+                             size_bytes: int, on_done=None):
+        """Reserva/libera un ítem -- mismo patrón optimista+sync que
+        _toggle_favorite, pero con dos comprobaciones previas que favoritos
+        no necesita: (1) hace falta un nombre de usuario configurado, para
+        saber a quién cargarle la cuota; (2) al reservar, el usuario debe
+        tener sitio en su cuota de 100GB; al liberar, solo el usuario que
+        la reservó puede hacerlo (sin esto, cualquier cliente podría
+        liberar por error el hueco de otra persona)."""
+        from core.reservations import (
+            add_reservation, remove_reservation, fits_in_quota, remaining_bytes, reserved_by)
+
+        user = self.config_data.get("app_user_name", "").strip()
+        if not user:
+            messagebox.showwarning(
+                "Falta tu nombre",
+                "Configura \"Tu nombre\" en Ajustes → Conexión FTP antes de reservar espacio, "
+                "así se sabe a quién cargarle la cuota de 100GB.")
+            return
+
+        turning_on = not self._is_reserved(media_type, tmdb_id)
+        if turning_on:
+            if not fits_in_quota(self._reservations, user, size_bytes):
+                remaining_gb = remaining_bytes(self._reservations, user) / (1024 ** 3)
+                messagebox.showwarning(
+                    "Cuota de reservas agotada",
+                    f"Te quedan {remaining_gb:.1f}GB libres de tu cuota de 100GB -- "
+                    f"\"{name}\" no cabe. Libera alguna reserva antes de añadir otra.")
+                return
+            op, args = add_reservation, (media_type, tmdb_id, name, size_bytes, user)
+        else:
+            owner = reserved_by(self._reservations, media_type, tmdb_id)
+            if owner and owner != user:
+                messagebox.showwarning(
+                    "Reservado por otra persona",
+                    f"\"{name}\" lo reservó {owner} -- solo esa persona puede liberarlo.")
+                return
+            op, args = remove_reservation, (media_type, tmdb_id)
+
+        self._reservations = op(self._reservations, *args)
+        from core.reservations import save_local_cache as _save_reservations_cache
+        _save_reservations_cache(self._reservations)
+        if on_done:
+            on_done()
+
+        self._push_reservations_to_ftp(lambda remote_data: op(remote_data, *args), on_done)
+
+    def _push_reservations_to_ftp(self, transform, on_done=None):
+        """Sube el cambio de *transform* al FTP en segundo plano --
+        descarga el JSON remoto fresco, le aplica *transform* (no lo que
+        hubiera en memoria) y lo vuelve a subir, para minimizar la carrera
+        si otro cliente conectado al mismo servidor cambió algo distinto
+        mientras tanto. *transform* recibe el dict remoto y devuelve el
+        dict nuevo -- mismo callable tanto para un cambio de una sola
+        clave (_toggle_reservation) como para uno que toca varias a la vez
+        (_transfer_reservations/_unprotect_all_reservations). Si no hay
+        ruta configurada, el cambio se queda en el mirror local nada más."""
+        remote_path = self._reservations_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = transform(remote_data)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    self.after(0, lambda: self._apply_synced_reservations(merged, on_done))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _transfer_reservations(self, old_owner: str, new_owner: str):
+        """"Traspasarlas al nombre nuevo" en _RenameReservationsDialog --
+        misma entrada, mismo tamaño, solo cambia reserved_by."""
+        from core.reservations import transfer_reservations, save_local_cache as _save_reservations_cache
+        self._reservations = transfer_reservations(self._reservations, old_owner, new_owner)
+        _save_reservations_cache(self._reservations)
+        self._push_reservations_to_ftp(lambda data: transfer_reservations(data, old_owner, new_owner))
+
+    def _unprotect_all_reservations(self, owner: str):
+        """"Desproteger todas" en _RenameReservationsDialog -- la otra
+        opción al cambiar de nombre, empezar de nuevo en vez de traspasar."""
+        from core.reservations import remove_all_by_owner, save_local_cache as _save_reservations_cache
+        self._reservations = remove_all_by_owner(self._reservations, owner)
+        _save_reservations_cache(self._reservations)
+        self._push_reservations_to_ftp(lambda data: remove_all_by_owner(data, owner))
+
+    def _apply_synced_reservations(self, merged: dict, on_done=None):
+        from core.reservations import save_local_cache as _save_reservations_cache
+        self._reservations = merged
+        _save_reservations_cache(self._reservations)
+        if on_done:
+            on_done()
+        elif self._cleanup_visible:
+            self._apply_cleanup_filters()
+        elif self._protected_visible:
+            self._render_protected_table()
+        elif self._current_view_key() == "files":
+            self._refresh_table()
+
+    def _sync_reservations_from_ftp(self):
+        """Refresca el mirror local desde el FTP en segundo plano -- mismo
+        motivo y patrón que _sync_favorites_from_ftp. Se llama al abrir
+        Archivos (los candados de las filas ya subidas), Liberar espacio
+        (protección + cuota) y Protegidos (gestión)."""
+        remote_path = self._reservations_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_reservations(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
 
     def _check_for_updates_at_startup(self):
         """Comprueba en segundo plano si hay una versión más nueva publicada
@@ -2271,6 +2599,7 @@ class App(_AppBase):
             # a diferencia del mismo hook en _on_auto_file_event (que ya
             # corre dentro de self.after), aquí sí hay que agendarlo.
             self.after(0, lambda mi=entry.media_info: self._remove_uploaded_episode_from_missing_list(mi))
+            self.after(0, self._refresh_ftp_space)
         elif msg == "cancelado":
             entry.status = "listo"
             self._ftp_row_set(entry, "Cancelado", entry.ftp_progress, 0)
@@ -2534,6 +2863,23 @@ class App(_AppBase):
         except Exception as e:
             self._set_status(f"No se pudo abrir: {e}", ERROR_COLOR)
 
+    def _open_containing_folder(self, entry):
+        """Abre la carpeta que contiene el archivo en el explorador del
+        sistema -- en Windows/macOS, además, deja el archivo ya
+        seleccionado dentro de esa carpeta (no solo abierta)."""
+        try:
+            if is_windows():
+                # "/select," pegado sin espacio a la ruta es la sintaxis que
+                # entiende explorer.exe para abrir la carpeta con el archivo
+                # ya resaltado, en vez de solo abrir la carpeta a secas.
+                subprocess.run(["explorer", "/select,", entry.path])
+            elif is_macos():
+                subprocess.run(["open", "-R", entry.path], check=True)
+            else:
+                subprocess.run(["xdg-open", str(Path(entry.path).parent)], check=True)
+        except Exception as e:
+            self._set_status(f"No se pudo abrir la carpeta: {e}", ERROR_COLOR)
+
     # ------------------------------------------------------------- FTP tab
 
     def _build_config_panel(self, panel):
@@ -2724,11 +3070,35 @@ class App(_AppBase):
         self._ftp_retries_entry.insert(0, str(self.config_data.get("ftp_retries", 3)))
         self._ftp_retries_entry.grid(row=8, column=1, sticky="w", padx=10, pady=6)
 
+        # Ruta compartida para favoritos y reservas (ver core/favorites.py
+        # y core/reservations.py) -- un único JSON en el FTP que leen/
+        # escriben todos los clientes apuntando al mismo servidor (las
+        # reservas usan un archivo hermano junto a este, ver
+        # _reservations_remote_path). Vacío = favoritos/reservas solo
+        # locales, sin sincronizar.
+        ctk.CTkLabel(conn, text="Ruta compartida (favoritos):").grid(
+            row=9, column=0, sticky="e", padx=10, pady=6)
+        self._shared_data_ftp_path_entry = ctk.CTkEntry(
+            conn, width=200, placeholder_text="/datos2/aRenombrar/favoritos.json")
+        self._shared_data_ftp_path_entry.insert(0, str(self.config_data.get("shared_data_ftp_path", "")))
+        self._shared_data_ftp_path_entry.grid(row=9, column=1, padx=10, pady=6, sticky="ew")
+
+        # Nombre de esta persona -- identifica su cuota de 100GB al
+        # reservar espacio en "Liberar espacio" (ver core/reservations.py).
+        # Solo hace falta si se van a usar reservas; favoritos no lo
+        # necesita (es un concepto sin dueño, compartido por todos).
+        ctk.CTkLabel(conn, text="Tu nombre (reservas):").grid(
+            row=10, column=0, sticky="e", padx=10, pady=6)
+        self._app_user_name_entry = ctk.CTkEntry(
+            conn, width=200, placeholder_text="Para repartir la cuota de reservas por persona")
+        self._app_user_name_entry.insert(0, str(self.config_data.get("app_user_name", "")))
+        self._app_user_name_entry.grid(row=10, column=1, padx=10, pady=6, sticky="ew")
+
         bf = ctk.CTkFrame(conn, fg_color="transparent")
-        bf.grid(row=9, column=0, columnspan=2, pady=10)
+        bf.grid(row=11, column=0, columnspan=2, pady=10)
         ctk.CTkButton(bf, text="Probar conexión", command=self._test_ftp).pack(side="left", padx=4)
         self._ftp_status = ctk.CTkLabel(conn, text="", text_color=PENDING_COLOR)
-        self._ftp_status.grid(row=10, column=0, columnspan=2, pady=4)
+        self._ftp_status.grid(row=12, column=0, columnspan=2, pady=4)
 
     def _build_tmdb_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -3043,7 +3413,6 @@ class App(_AppBase):
 
     def _build_missing_episodes_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(2, weight=1)
 
         # -- Barra de título, mismo estilo que la de la tabla de Archivos --
         header = ctk.CTkFrame(parent, fg_color=("gray90", "gray20"), corner_radius=8)
@@ -3082,6 +3451,9 @@ class App(_AppBase):
         self._missing_ep_hide_ai_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(right_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
                       command=self._render_missing_episodes_table).pack(side="right", padx=4, pady=8)
+        self._missing_ep_hide_no_dub_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(right_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
+                      command=self._on_toggle_hide_no_dub).pack(side="right", padx=4, pady=8)
         self._missing_ep_search_entry = ctk.CTkEntry(right_fr, width=180, placeholder_text="Filtrar por nombre...")
         self._missing_ep_search_entry.pack(side="right", padx=4, pady=8)
         self._missing_ep_search_entry.bind("<KeyRelease>", lambda e: self._render_missing_episodes_table())
@@ -3103,18 +3475,6 @@ class App(_AppBase):
         body.grid_columnconfigure(1, weight=0)
         body.grid_rowconfigure(0, weight=1)
 
-        self._missing_ep_table = ctk.CTkScrollableFrame(body, label_text="")
-        self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
-        self._missing_ep_table.grid_columnconfigure(0, weight=1)
-
-        # Ancho de la columna "Episodios que faltan" -- ajustable con el
-        # separador de la cabecera (ver _missing_ep_sash_press), igual que
-        # las columnas de Archivos. "Serie" no tiene ancho propio: ocupa
-        # el espacio sobrante (fill="x", expand=True), como "Nuevo
-        # nombre" en Archivos.
-        self._missing_ep_summary_width = 180
-        self._missing_ep_sash_state = None
-        self._missing_ep_summary_hdr_lbl = None
         self._missing_ep_empty_msg = None   # label "sin resultados"/"pulsa Comprobar", ver _render_missing_episodes_table
         # Compartidas entre todas las filas -- crear un CTkFont nuevo por
         # cada serie (llamada a Tcl) se notaba con muchas series en la
@@ -3123,19 +3483,58 @@ class App(_AppBase):
         self._missing_ep_summary_font = ctk.CTkFont(size=11)
         self._missing_ep_detail_font = ctk.CTkFont(size=11)         # lista de episodios al desplegar
         self._missing_ep_season_font = ctk.CTkFont(size=12, weight="bold")   # cabecera de cada temporada
-        # Cabecera DENTRO del mismo CTkScrollableFrame que las filas (no
-        # en un contenedor aparte) -- igual que _build_table_header en
-        # Archivos: así no hay hueco de por medio ni una esquina cuadrada
-        # rompiendo el aspecto de tarjeta redondeada de la tabla.
-        self._build_missing_ep_table_header(self._missing_ep_table)
+
+        # TableView: mismo componente que Archivos/Liberar espacio/
+        # Historial (ver gui/table_view.py). "Serie" es la columna
+        # expand=True; el sash entre ella y "Episodios que faltan" solo
+        # necesita resizable=True en "name" (TableView ya sabe que el
+        # lado expand no tiene ancho propio que tocar).
+        sw0 = self._saved_col_widths("episodios")
+        self._missing_ep_table = TableView(body, columns=[
+            ColumnSpec("toggle", "", width=28),
+            ColumnSpec("logo", "", width=28),
+            ColumnSpec("fav", "", width=28),
+            ColumnSpec("name", "Serie", expand=True, resizable=True),
+            ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100),
+            ColumnSpec("trending", "Tendencia", width=70),
+            ColumnSpec("ignore", "", width=90),
+        ])
+        self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
+        self._missing_ep_table.on_column_resize = self._on_missing_ep_column_resize
+        self._missing_ep_table.on_widths_changed = lambda w: self._save_table_col_widths("episodios", w)
 
         self._missing_ep_side_panel = self._build_missing_ep_side_panel(body)
         self._missing_ep_side_panel.grid(row=0, column=1, sticky="nsew")
 
+        # Paginado (ver _MISSING_EP_PAGE_SIZE) -- con varios cientos de
+        # series cacheadas, dibujar la tabla entera de golpe (o incluso en
+        # lotes vía after(), que solo reparte el trabajo en el tiempo pero
+        # no reduce el total) llega a agotar el límite de objetos GUI de
+        # Windows (10000 por proceso) y rompe el pintado de TODA la
+        # ventana, no solo de esta tabla. Mismo paginado en Liberar
+        # espacio/Historial. Debajo de la tabla (no encima) y centrada --
+        # sin sticky="ew", para que el frame ocupe solo su tamaño natural
+        # y quede centrado en la columna (que sí tiene weight=1).
+        nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
+        nav_fr.grid(row=3, column=0, pady=(6, 0))
+        self._missing_ep_prev_btn = ctk.CTkButton(
+            nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._missing_ep_change_page(-1))
+        self._missing_ep_prev_btn.pack(side="left")
+        self._missing_ep_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
+        self._missing_ep_page_lbl.pack(side="left", padx=12)
+        self._missing_ep_next_btn = ctk.CTkButton(
+            nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._missing_ep_change_page(1))
+        self._missing_ep_next_btn.pack(side="left")
+
         self._missing_ep_results = self._load_missing_episodes_from_cache()
+        from core.spanish_dub_cache import load_cache as _load_spanish_dub_cache
+        self._spanish_dub_cache = _load_spanish_dub_cache()
         self._missing_ep_cancel_event = None
         self._missing_ep_scanning = False
         self._missing_ep_row_widgets = {}
+        self._missing_ep_page = 0
         self._missing_ep_selected_tmdb_id = None   # serie pulsada, ver _show_missing_ep_poster
         self._missing_ep_expanded = set()   # tmdb_ids con la fila desplegada
         self._missing_ep_expanded_seasons = set()   # (tmdb_id, temporada) con la temporada desplegada
@@ -3148,55 +3547,12 @@ class App(_AppBase):
         # trabajo real al arranque por algo que el usuario ni ve todavía.
         self.after(50, self._render_missing_episodes_table)
 
-    def _build_missing_ep_table_header(self, parent):
-        """Cabecera de columnas, mismo patrón que _build_table_header de
-        Archivos: PACK con un separador arrastrable de verdad (no solo
-        decorativo) entre "Serie" y "Episodios que faltan" -- las únicas
-        dos columnas de texto de ancho variable; los iconos y el botón de
-        acción son de ancho fijo, igual que en Archivos no todas las
-        columnas tienen separador arrastrable."""
-        hdr = ctk.CTkFrame(parent, corner_radius=0)
-        hdr.pack(fill="x", pady=(0, 2))
-        _BF = ctk.CTkFont(weight="bold")
-
-        ctk.CTkLabel(hdr, text="", width=28).pack(side="left", pady=4)
-        ctk.CTkLabel(hdr, text="", width=28).pack(side="left", pady=4)
-        ctk.CTkLabel(hdr, text="Serie", font=_BF, anchor="w").pack(
-            side="left", padx=4, pady=4, fill="x", expand=True)
-
-        sash = tk.Frame(hdr, width=4, bg="#505060", cursor="sb_h_double_arrow")
-        sash.pack(side="left", fill="y", pady=6)
-        sash.bind("<ButtonPress-1>", self._missing_ep_sash_press)
-        sash.bind("<B1-Motion>", self._missing_ep_sash_motion)
-        sash.bind("<ButtonRelease-1>", self._missing_ep_sash_release)
-
-        self._missing_ep_summary_hdr_lbl = ctk.CTkLabel(
-            hdr, text="Episodios que faltan", font=_BF, width=self._missing_ep_summary_width, anchor="w")
-        self._missing_ep_summary_hdr_lbl.pack(side="left", padx=(4, 4), pady=4)
-
-        ctk.CTkLabel(hdr, text="", width=90).pack(side="left", padx=(4, 12), pady=4)
-
-    def _missing_ep_sash_press(self, event):
-        self._missing_ep_sash_state = {"x0": event.x_root, "w0": self._missing_ep_summary_width}
-
-    def _missing_ep_sash_motion(self, event):
-        if not self._missing_ep_sash_state:
-            return
-        # La columna de resumen está a la derecha del separador: arrastrar
-        # hacia la izquierda (x decrece) la ensancha -- mismo signo que
-        # _detail_sash_motion en Archivos.
-        delta = self._missing_ep_sash_state["x0"] - event.x_root
-        new_w = max(100, self._missing_ep_sash_state["w0"] + delta)
-        self._missing_ep_summary_width = new_w
-        self._apply_missing_ep_summary_width()
-
-    def _missing_ep_sash_release(self, event):
-        self._missing_ep_sash_state = None
-
-    def _apply_missing_ep_summary_width(self):
-        w = self._missing_ep_summary_width
-        if self._missing_ep_summary_hdr_lbl is not None:
-            self._missing_ep_summary_hdr_lbl.configure(width=w)
+    def _on_missing_ep_column_resize(self):
+        """Tras arrastrar el separador de "Episodios que faltan" (ver
+        TableView.on_column_resize), reconfigura solo el ancho de las
+        filas ya pintadas -- no hace falta reconstruir la página entera
+        para esto, a diferencia de Historial/Liberar espacio."""
+        w = self._missing_ep_table.col_width("summary")
         for widgets in self._missing_ep_row_widgets.values():
             lbl = widgets.get("summary_lbl")
             if lbl is not None:
@@ -3297,6 +3653,8 @@ class App(_AppBase):
                 "server_season_counts": present_season_counts,
                 "ai_verdict": None,
                 "absolute_numbering": entry.get("absolute_numbering", False),
+                "play_count": entry.get("play_count", 0),
+                "last_played_ts": entry.get("last_played_ts"),
             })
         return results
 
@@ -3325,7 +3683,7 @@ class App(_AppBase):
         if remove_missing_episode_from_cache(cache, tmdb_id, season, episode):
             save_cache(cache)
 
-        self._render_missing_episodes_table()
+        self._render_missing_episodes_table(reset_page=False)
 
     def _start_missing_episodes_scan(self, force_full: bool = False):
         if not self.config_data.get("jellyfin_enabled") and not self.config_data.get("plex_enabled"):
@@ -3374,19 +3732,15 @@ class App(_AppBase):
         threading.Thread(target=worker, daemon=True).start()
 
     def _append_missing_ep_result_live(self, row: dict):
-        """Añade una fila recién encontrada durante un reescaneo completo
-        -- solo esa fila, sin reconstruir ni tocar las demás ya pintadas
-        (ver _build_missing_ep_row). Si no cumple los filtros actuales
-        (búsqueda, ignorados, descartados por IA) no se pinta, pero se
-        queda igualmente en self._missing_ep_results para cuando cambien."""
+        """Registra una fila recién encontrada durante un reescaneo
+        completo -- solo en los datos (self._missing_ep_results), sin
+        tocar la tabla. Antes del paginado esto pintaba la fila al
+        instante; con páginas de tamaño fijo (ver _MISSING_EP_PAGE_SIZE)
+        ya no tiene sentido ir insertando filas sueltas a media carga --
+        la barra de progreso ya informa de cuántas se han encontrado, y
+        _finish_missing_episodes_scan pinta la tabla completa (paginada)
+        al terminar."""
         self._missing_ep_results.append(row)
-        if not self._missing_ep_row_matches_filters(row):
-            return
-        was_empty = not self._missing_ep_row_widgets
-        if was_empty and self._missing_ep_empty_msg is not None:
-            self._missing_ep_empty_msg.destroy()   # quitar el mensaje "Pulsa Comprobar..." / "Sin resultados"
-            self._missing_ep_empty_msg = None
-        self._build_missing_ep_row(row)
 
     def _cancel_missing_episodes_scan(self):
         if self._missing_ep_cancel_event:
@@ -3424,6 +3778,105 @@ class App(_AppBase):
         if self.config_data.get("ai_fallback_enabled") and self.config_data.get("ai_api_key"):
             self._ask_ai_for_missing_ep_verdicts()
 
+    def _on_toggle_hide_no_dub(self):
+        """Al activar "Ocultar sin doblaje ES": si hay episodios pendientes
+        de comprobar, lanza el chequeo en segundo plano (con barra de
+        progreso, ver _start_spanish_dub_check) antes de redibujar -- al
+        desactivarlo, basta con redibujar (no hay nada que comprobar para
+        volver a MOSTRAR episodios)."""
+        if self._missing_ep_hide_no_dub_var.get():
+            self._start_spanish_dub_check()
+        else:
+            self._render_missing_episodes_table()
+
+    def _start_spanish_dub_check(self):
+        """Comprueba el doblaje ES de todos los episodios que faltan (de
+        series no ignoradas) que aún no estén en self._spanish_dub_cache --
+        una llamada a /watch/providers por serie (cacheada en memoria
+        durante todo el chequeo, para no repetirla por cada episodio de la
+        misma serie) más una a /season/.../episode/... con language=es-ES
+        por episodio pendiente. Reutiliza la barra de progreso y el botón
+        "Cancelar" del escaneo normal (_set_missing_ep_scanning_ui) -- ambos
+        comparten self._missing_ep_scanning para no competir por el mismo
+        límite de peticiones de TMDB."""
+        if self._missing_ep_scanning:
+            return
+        known_cache = self._spanish_dub_cache   # solo lectura mientras corre el worker
+        pending = []
+        for r in self._missing_ep_results:
+            if r.get("ignored"):
+                continue
+            dub_episodes = known_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
+            for season, eps in r["missing"].items():
+                for ep in eps:
+                    if f"{season}x{ep:02d}" not in dub_episodes:
+                        pending.append((r["tmdb_id"], r["name"], season, ep))
+
+        if not pending:
+            self._render_missing_episodes_table()
+            return
+
+        self._missing_ep_scanning = True
+        self._missing_ep_cancel_event = threading.Event()
+        cancel_event = self._missing_ep_cancel_event
+        self._set_missing_ep_scanning_ui(True)
+        self._missing_ep_progress.set(0)
+
+        def worker():
+            from core.missing_episodes import has_spanish_availability, episode_has_spanish_text
+            updates = {}   # tmdb_id_str -> {"spanish_available": bool|None, "episodes": {...}}
+            total = len(pending)
+            for i, (tmdb_id, name, season, ep) in enumerate(pending):
+                if cancel_event.is_set():
+                    break
+                self.after(0, lambda c=i + 1, t=total, n=name: self._update_missing_ep_progress(c, t, n))
+                key = str(tmdb_id)
+                entry = updates.get(key)
+                if entry is None:
+                    entry = dict(known_cache.get(key, {}))
+                    entry["episodes"] = dict(entry.get("episodes", {}))
+                    entry.setdefault("spanish_available", None)
+                    updates[key] = entry
+
+                # available: solo para ESTE episodio/intento. Si la consulta
+                # de disponibilidad falla, entry["spanish_available"] se deja
+                # en None (no se persiste una suposición) para reintentarla
+                # la próxima vez -- pero se sigue comprobando el episodio
+                # ahora mismo, en vez de bloquear todo el resto del chequeo
+                # por un fallo puntual de red.
+                available = entry["spanish_available"]
+                if available is None:
+                    try:
+                        providers = self.tmdb.get_watch_providers(tmdb_id)
+                        available = has_spanish_availability(providers)
+                        entry["spanish_available"] = available
+                    except Exception:
+                        available = True
+
+                ep_key = f"{season}x{ep:02d}"
+                if not available:
+                    entry["episodes"][ep_key] = False
+                    continue
+                try:
+                    info = self.tmdb.get_episode_info_es(tmdb_id, season, ep)
+                    entry["episodes"][ep_key] = episode_has_spanish_text(info)
+                except Exception:
+                    pass   # sin dato fiable -- se deja fuera de la caché, se reintenta la próxima vez
+            self.after(0, lambda: self._finish_spanish_dub_check(updates))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_spanish_dub_check(self, updates: dict):
+        self._missing_ep_scanning = False
+        self._set_missing_ep_scanning_ui(False)
+        for key, entry in updates.items():
+            existing = self._spanish_dub_cache.setdefault(key, {"spanish_available": None, "episodes": {}})
+            existing["spanish_available"] = entry["spanish_available"]
+            existing["episodes"].update(entry["episodes"])
+        from core.spanish_dub_cache import save_cache
+        save_cache(self._spanish_dub_cache)
+        self._update_missing_ep_status_text()
+        self._render_missing_episodes_table()
+
     def _ask_ai_for_missing_ep_verdicts(self):
         """Manda de una sola vez (no una llamada por serie) el recuento de
         episodios por temporada de TODAS las series con huecos actuales a
@@ -3455,7 +3908,7 @@ class App(_AppBase):
                 r["ai_verdict"] = verdicts[r["tmdb_id"]]
         if self._missing_ep_current_row is not None:
             self._update_missing_ep_ai_verdict_label(self._missing_ep_current_row)
-        self._render_missing_episodes_table()
+        self._render_missing_episodes_table(reset_page=False)
 
     def _update_missing_ep_status_text(self):
         from core.missing_episodes_cache import load_cache
@@ -3479,13 +3932,43 @@ class App(_AppBase):
             text = f"{len(pending)} serie(s) con episodios que faltan" + (f" -- último escaneo {when}" if when else "")
         self._missing_ep_status_lbl.configure(text=text)
 
-    def _render_missing_episodes_table(self):
+    _MISSING_EP_PAGE_SIZE = 25   # filas por página -- ver _missing_ep_render_page
+
+    def _render_missing_episodes_table(self, reset_page: bool = True):
+        """Punto de entrada tras cambiar filtros, terminar un escaneo, o
+        cualquier otro cambio que pueda alterar QUÉ filas hay que ver --
+        por defecto vuelve a la primera página. Para redibujar la página
+        actual sin resetearla (p.ej. tras marcar un favorito o un
+        veredicto de IA en una fila concreta) pasar reset_page=False."""
+        if reset_page:
+            self._missing_ep_page = 0
+        self._missing_ep_render_page()
+
+    def _missing_ep_change_page(self, delta: int):
+        rows = self._missing_ep_visible_rows()
+        n_pages = max(1, -(-len(rows) // self._MISSING_EP_PAGE_SIZE))
+        new_page = max(0, min(n_pages - 1, self._missing_ep_page + delta))
+        if new_page == self._missing_ep_page:
+            return
+        self._missing_ep_page = new_page
+        self._missing_ep_render_page()
+
+    def _missing_ep_visible_rows(self) -> list:
+        rows = [row for row in (self._visible_missing_ep_row(r) for r in self._missing_ep_results)
+                if row is not None]
+        return sorted(rows, key=lambda r: r["name"].lower())
+
+    def _missing_ep_render_page(self):
+        """Dibuja solo self._missing_ep_page de las filas que pasan los
+        filtros activos -- ver _MISSING_EP_PAGE_SIZE. Página fija, no
+        lotes acumulativos: con varios cientos de series cacheadas, el
+        número de widgets vivos a la vez tiene que tener un techo fijo
+        pase lo que pase con el tamaño real de la lista (ver el comentario
+        largo en _build_missing_episodes_tab, junto a nav_fr)."""
         # Solo se destruyen las filas (y el mensaje vacío, si estaba) --
-        # NO todos los hijos de la tabla, porque la cabecera (ver
-        # _build_missing_ep_table_header) vive en el mismo
-        # CTkScrollableFrame para no dejar hueco/esquina cuadrada entre
-        # ella y las filas (igual que _build_table_header en Archivos).
-        # Borrar "todos los hijos" aquí se llevaría también la cabecera.
+        # la cabecera vive en TableView.header_frame, aparte del cuerpo
+        # con scroll (ver gui/table_view.py), así que nunca se ve tocada
+        # por esto.
         for widgets in self._missing_ep_row_widgets.values():
             widgets["row_fr"].destroy()
         if self._missing_ep_empty_msg is not None:
@@ -3503,43 +3986,90 @@ class App(_AppBase):
         # temporada en vez de reconstruir el detalle de la serie entero.
         self._missing_ep_season_widgets = {}
 
-        query = self._missing_ep_search_entry.get().strip().lower()
-        show_ignored = self._missing_ep_show_ignored_var.get()
-        hide_ai_dismissed = self._missing_ep_hide_ai_var.get()
+        sorted_rows = self._missing_ep_visible_rows()
 
-        def _ai_dismissed(r):
-            v = r.get("ai_verdict")
-            return bool(v) and v.get("veredicto") == "numeracion_distinta"
-
-        rows = [r for r in self._missing_ep_results
-                if (show_ignored or not r.get("ignored"))
-                and (not query or query in r["name"].lower())
-                and not (hide_ai_dismissed and _ai_dismissed(r))]
-
-        if not rows:
+        if not sorted_rows:
             if self._missing_ep_results:
                 msg = "Sin resultados que coincidan con el filtro."
             else:
                 msg = "Pulsa \"🔍 Comprobar\" para buscar episodios que faltan."
-            self._missing_ep_empty_msg = ctk.CTkLabel(self._missing_ep_table, text=msg, text_color=PENDING_COLOR)
+            self._missing_ep_empty_msg = ctk.CTkLabel(self._missing_ep_table.body, text=msg, text_color=PENDING_COLOR)
             self._missing_ep_empty_msg.pack(pady=30)
+            self._missing_ep_page_lbl.configure(text="")
+            self._missing_ep_prev_btn.configure(state="disabled")
+            self._missing_ep_next_btn.configure(state="disabled")
             return
 
-        for r in sorted(rows, key=lambda r: r["name"].lower()):
-            self._build_missing_ep_row(r)
+        total = len(sorted_rows)
+        n_pages = max(1, -(-total // self._MISSING_EP_PAGE_SIZE))
+        self._missing_ep_page = max(0, min(n_pages - 1, self._missing_ep_page))
+        start = self._missing_ep_page * self._MISSING_EP_PAGE_SIZE
+        page_rows = sorted_rows[start:start + self._MISSING_EP_PAGE_SIZE]
 
-    def _missing_ep_row_matches_filters(self, r: dict) -> bool:
-        """Mismo criterio que el filtrado de _render_missing_episodes_table
-        -- lo usa _append_missing_ep_row_live para saber si la fila
-        recién llegada debe verse ahora mismo o no."""
+        self._missing_ep_page_lbl.configure(text=f"Página {self._missing_ep_page + 1} de {n_pages}")
+        self._missing_ep_prev_btn.configure(state="normal" if self._missing_ep_page > 0 else "disabled")
+        self._missing_ep_next_btn.configure(state="normal" if self._missing_ep_page < n_pages - 1 else "disabled")
+
+        # Volver arriba del todo -- si no, al cambiar de página/filtro con
+        # el scroll bajado, las filas nuevas se dibujan pero el hueco
+        # (ahora vacío) por el que se había bajado se queda visible, dando
+        # la sensación de "no hay resultados" aunque sí los haya.
+        self._missing_ep_table.scroll_to_top()
+
+        # En lotes vía after() dentro de la propia página (no la lista
+        # entera): self._missing_ep_render_token invalida cualquier lote
+        # pendiente de una llamada anterior si esta función se vuelve a
+        # llamar antes de terminar (p.ej. el usuario cambia de página o de
+        # filtro a media carga).
+        self._missing_ep_render_token = getattr(self, "_missing_ep_render_token", 0) + 1
+        token = self._missing_ep_render_token
+        _BATCH = 20
+
+        def _render_batch(start=0):
+            if token != self._missing_ep_render_token:
+                return   # una llamada más reciente ya se está pintando
+            for r in page_rows[start:start + _BATCH]:
+                self._build_missing_ep_row(r)
+            if start + _BATCH < len(page_rows):
+                self.after(1, lambda: _render_batch(start + _BATCH))
+
+        _render_batch()
+
+    def _visible_missing_ep_row(self, r: dict):
+        """Aplica los filtros activos (búsqueda, ignoradas, descartadas por
+        IA y doblaje ES) -- devuelve la fila a pintar, o None si no debe
+        verse ahora mismo. Con "Ocultar sin doblaje ES" activo, devuelve
+        una COPIA con "missing" recortado a solo los episodios con doblaje
+        confirmado (ver core.missing_episodes.filter_missing_by_spanish_dub)
+        -- si tras recortar no queda ningún hueco (ni unknown_seasons), la
+        fila entera se oculta. Usado tanto por _render_missing_episodes_table
+        como por _append_missing_ep_result_live, para que ambos apliquen
+        exactamente el mismo criterio."""
         query = self._missing_ep_search_entry.get().strip().lower()
         show_ignored = self._missing_ep_show_ignored_var.get()
         hide_ai_dismissed = self._missing_ep_hide_ai_var.get()
         ai_verdict = r.get("ai_verdict")
         ai_dismissed = bool(ai_verdict) and ai_verdict.get("veredicto") == "numeracion_distinta"
-        return ((show_ignored or not r.get("ignored"))
-                and (not query or query in r["name"].lower())
-                and not (hide_ai_dismissed and ai_dismissed))
+        if not (show_ignored or not r.get("ignored")):
+            return None
+        if query and query not in r["name"].lower():
+            return None
+        if hide_ai_dismissed and ai_dismissed:
+            return None
+        if not self._missing_ep_hide_no_dub_var.get():
+            return r
+
+        from core.missing_episodes import filter_missing_by_spanish_dub, format_missing_summary
+        dub_episodes = self._spanish_dub_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
+        filtered_missing = filter_missing_by_spanish_dub(r["missing"], dub_episodes)
+        if not filtered_missing and not r.get("unknown_seasons"):
+            return None
+        if filtered_missing == r["missing"]:
+            return r
+        display = dict(r)
+        display["missing"] = filtered_missing
+        display["summary"] = format_missing_summary(r["name"], filtered_missing) if filtered_missing else r["summary"]
+        return display
 
     def _build_missing_ep_row(self, r: dict):
         """Construye y empaqueta la fila de una serie en la tabla --
@@ -3559,21 +4089,38 @@ class App(_AppBase):
         # (también con pack): no se puede mezclar pack y grid dentro de
         # un mismo padre, pero sí anidar frames que usen cada uno el
         # suyo.
-        row_fr = ctk.CTkFrame(self._missing_ep_table,
+        cw = self._missing_ep_table.col_width
+        row_fr = ctk.CTkFrame(self._missing_ep_table.body,
                               fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
         row_fr.pack(fill="x", pady=3, padx=2)
 
         header_row = ctk.CTkFrame(row_fr, fg_color="transparent")
         header_row.pack(fill="x")
 
-        toggle_btn = ctk.CTkButton(
-            header_row, text=("▼" if expanded else "▶"), width=28,
-            fg_color="transparent",
-            command=lambda tid=tmdb_id: self._toggle_missing_ep_expand(tid))
+        # CTkLabel + bind (no CTkButton), sin marco -- mismo estilo que el
+        # triángulo de "Temporada X" al expandir una serie (ver más abajo).
+        toggle_btn = ctk.CTkLabel(header_row, text=("▼" if expanded else "▶"), width=cw("toggle"), cursor="hand2")
         toggle_btn.pack(side="left", padx=(6, 0), pady=6)
+        toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id: self._toggle_missing_ep_expand(tid))
 
-        source_icon = "🎬" if r["source"] == "plex" else "📺"
-        ctk.CTkLabel(header_row, text=source_icon, width=28).pack(side="left", pady=6)
+        source_img = self._plex_logo_img if r["source"] == "plex" else self._jellyfin_logo_img
+        ctk.CTkLabel(header_row, image=source_img, text="", width=cw("logo")).pack(side="left", pady=6)
+
+        # "Episodios que faltan" es siempre sobre series (huecos de
+        # temporada/episodio) -- no aplica a películas.
+        # CTkLabel + bind (no CTkButton): esta fila se construye para las
+        # ~500 series cacheadas de golpe al arrancar (ver más abajo, "self.
+        # after(50, self._render_missing_episodes_table)") -- un CTkButton
+        # por fila (con su dibujo de hover/relleno) multiplicaba tanto el
+        # trabajo síncrono de ese arranque que llegaba a impedir que el
+        # resto de la ventana (cabecera incluida) terminase de pintarse.
+        fav_btn = ctk.CTkLabel(
+            header_row, text="★" if self._is_favorite("tv", tmdb_id) else "☆",
+            width=cw("fav"), cursor="hand2",
+            text_color=ACCENT if self._is_favorite("tv", tmdb_id) else PENDING_COLOR)
+        fav_btn.pack(side="left", pady=6)
+        fav_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["name"]:
+                      self._toggle_missing_ep_favorite(tid, name))
 
         name_color = PENDING_COLOR if r.get("ignored") else None
         name_lbl = ctk.CTkLabel(header_row, text=r["name"], font=self._missing_ep_name_font,
@@ -3602,15 +4149,21 @@ class App(_AppBase):
             summary_color = WARNING_COLOR
         else:
             summary_color = PENDING_COLOR
-        # padx=(4, 4) espeja el separador de 4px de la cabecera (ver
-        # _build_missing_ep_table_header) para que ambas queden alineadas.
+        # padx=(4, 4) espeja el separador de 4px de la cabecera (TableView,
+        # ver gui/table_view.py) para que ambas queden alineadas.
         summary_lbl = ctk.CTkLabel(header_row, text=summary, font=self._missing_ep_summary_font,
-                                   width=self._missing_ep_summary_width,
+                                   width=cw("summary"),
                                    text_color=summary_color, anchor="w")
         summary_lbl.pack(side="left", padx=(4, 4), pady=6)
 
+        from core.trending import trending_score, format_trending_score
+        score = trending_score(r.get("play_count", 0), r.get("last_played_ts"), _time.time())
+        trending_lbl = ctk.CTkLabel(header_row, text=format_trending_score(score), width=cw("trending"),
+                                    font=self._missing_ep_summary_font, text_color=PENDING_COLOR)
+        trending_lbl.pack(side="left", padx=(0, 4), pady=6)
+
         btn_text = "Restaurar" if r.get("ignored") else "Ignorar"
-        ctk.CTkButton(header_row, text=btn_text, width=90, fg_color="transparent", border_width=1,
+        ctk.CTkButton(header_row, text=btn_text, width=cw("ignore"), fg_color="transparent", border_width=1,
                       command=lambda tid=tmdb_id, ig=not r.get("ignored"):
                       self._toggle_missing_ep_ignore(tid, ig)).pack(side="left", padx=(4, 12), pady=6)
 
@@ -3621,8 +4174,18 @@ class App(_AppBase):
 
         self._missing_ep_row_widgets[tmdb_id] = {
             "row_fr": row_fr, "toggle_btn": toggle_btn, "detail_fr": detail_fr, "r": r,
-            "summary_lbl": summary_lbl,
+            "summary_lbl": summary_lbl, "trending_lbl": trending_lbl, "fav_btn": fav_btn,
         }
+
+    def _toggle_missing_ep_favorite(self, tmdb_id: int, name: str):
+        def _refresh():
+            widgets = self._missing_ep_row_widgets.get(tmdb_id)
+            if not widgets:
+                return
+            is_fav = self._is_favorite("tv", tmdb_id)
+            widgets["fav_btn"].configure(text="★" if is_fav else "☆",
+                                          text_color=ACCENT if is_fav else PENDING_COLOR)
+        self._toggle_favorite("tv", tmdb_id, name, on_done=_refresh)
 
     def _build_missing_ep_detail_frame(self, parent, r: dict):
         """Construye (una sola vez por fila, la primera vez que se expande)
@@ -4060,7 +4623,7 @@ class App(_AppBase):
                 text="🤖 No se pudo obtener un veredicto (revisa la API Key de Groq o la conexión).")
         if self._missing_ep_current_row is r:
             self._update_missing_ep_ai_verdict_label(r)
-        self._render_missing_episodes_table()
+        self._render_missing_episodes_table(reset_page=False)
 
     def _load_missing_ep_poster(self, url: str, token):
         try:
@@ -4107,7 +4670,7 @@ class App(_AppBase):
             if r["tmdb_id"] == tmdb_id:
                 r["ignored"] = ignored
         self._update_missing_ep_status_text()
-        self._render_missing_episodes_table()
+        self._render_missing_episodes_table(reset_page=False)
 
     def _scan_missing_episodes(self, progress_cb=None, cancel_event=None, force_full=False,
                                on_result_cb=None) -> list:
@@ -4132,11 +4695,14 @@ class App(_AppBase):
         usa "Reescaneo completo" para que la tabla se vaya rellenando en
         vivo en vez de esperar a tener todo el resultado."""
         from core.media_server_refresh import (get_jellyfin_series, get_jellyfin_episodes,
-                                                get_plex_series, get_plex_episodes)
+                                                get_plex_series, get_plex_episodes,
+                                                get_jellyfin_usage_stats, get_plex_usage_stats,
+                                                parse_media_date)
         from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                            looks_like_season_split, find_unknown_seasons,
                                            looks_like_absolute_numbering, remap_absolute_episodes)
         from core.missing_episodes_cache import load_cache, save_cache
+        from core.cleanup_candidates import merge_usage_entries
 
         cache = dict(load_cache())
 
@@ -4165,6 +4731,31 @@ class App(_AppBase):
             _add_shows("plex", get_plex_series(
                 self.config_data.get("plex_host", ""), self.config_data.get("plex_token", "")))
 
+        # Datos de visionado (veces reproducida, última vez) para la
+        # puntuación de tendencia -- una sola llamada por servidor (igual
+        # que "Liberar espacio"), correlacionado por tmdb_id: a diferencia
+        # de Liberar espacio (que solo tiene nombres de carpeta FTP y
+        # necesita reconciliar por nombre), esta lista de series ya trae
+        # el tmdb_id emparejado, así que no hace falta esa indirección.
+        usage_by_tmdb_id = {}
+
+        def _merge_usage_by_tmdb(entry):
+            tid = entry.get("tmdb_id")
+            if not tid:
+                return
+            existing = usage_by_tmdb_id.get(tid)
+            usage_by_tmdb_id[tid] = merge_usage_entries(existing, entry) if existing else entry
+
+        if self.config_data.get("jellyfin_enabled"):
+            for entry in (get_jellyfin_usage_stats(
+                    self.config_data.get("jellyfin_host", ""), self.config_data.get("jellyfin_api_key", ""),
+                    username=self.config_data.get("jellyfin_username", "")) or {}).values():
+                _merge_usage_by_tmdb(entry)
+        if self.config_data.get("plex_enabled"):
+            for entry in (get_plex_usage_stats(
+                    self.config_data.get("plex_host", ""), self.config_data.get("plex_token", "")) or {}).values():
+                _merge_usage_by_tmdb(entry)
+
         # Quitar de la caché las series que ya no están en el servidor
         # (se borraron, o se desactivó esa fuente) -- si no, un hueco viejo
         # de una serie eliminada seguiría apareciendo para siempre.
@@ -4176,11 +4767,19 @@ class App(_AppBase):
                  present_season_counts=None):
             split_seasons = {season for season, eps in missing.items()
                              if looks_like_season_split((expected or {}).get(season, []), eps)}
+            # Para la puntuación de tendencia (ver core/trending.py) --
+            # parse_media_date() ya es idempotente tanto si la entrada viene
+            # de una sola fuente (fecha cruda, string ISO8601 o epoch de
+            # Plex) como fusionada de las dos (ya convertida a epoch por
+            # merge_usage_entries), así que se puede llamar siempre igual.
+            usage = usage_by_tmdb_id.get(tmdb_id) or {}
             return {
                 "tmdb_id": tmdb_id, "name": name, "source": source,
                 "missing": missing, "summary": format_missing_summary(name, missing),
                 "ignored": ignored, "episode_titles": {}, "split_seasons": split_seasons,
                 "unknown_seasons": unknown_seasons or set(),
+                "play_count": usage.get("play_count", 0),
+                "last_played_ts": parse_media_date(usage.get("last_played")),
                 # Lista real de episodios que debería tener cada temporada
                 # según TMDB -- la usa _cross_check_results_with_ftp para
                 # recalcular el hueco tras cruzar con el FTP, sin tener que
@@ -4292,6 +4891,7 @@ class App(_AppBase):
             present_season_counts = {}
             for season, _ep in present_for_compare:
                 present_season_counts[season] = present_season_counts.get(season, 0) + 1
+            usage = usage_by_tmdb_id.get(tmdb_id) or {}
             cache[key] = {
                 "name": show.get("name", ""),
                 "source": source,
@@ -4305,6 +4905,8 @@ class App(_AppBase):
                 "present_season_counts": {str(k): v for k, v in present_season_counts.items()},
                 "absolute_numbering": absolute_numbering,
                 "ignored": ignored,
+                "play_count": usage.get("play_count", 0),
+                "last_played_ts": parse_media_date(usage.get("last_played")),
             }
             # Se muestra la fila si faltan episodios O si hay temporadas en
             # el servidor que TMDB no conoce -- esto último puede pasar
@@ -5087,6 +5689,29 @@ class App(_AppBase):
                                      anchor="w", font=self._font_small, text_color=PENDING_COLOR)
             size_lbl.pack(side="left", padx=(4, 0), pady=2)  # mirror sash spd|size
 
+            fav_btn = ctk.CTkButton(
+                rf, text=self._fav_symbol(entry), width=cw["btn"], height=26,
+                font=_BF, fg_color="transparent", border_width=0,
+                text_color=ACCENT if self._entry_is_favorite(entry) else PENDING_COLOR,
+                hover_color=("gray85", "#2b2b2b"),
+                state="normal" if entry.media_info else "disabled",
+                command=lambda e=entry: self._toggle_entry_favorite(e))
+            fav_btn.pack(side="left", padx=(4, 0), pady=2)
+
+            # Reservar (ver core/reservations.py) solo tiene sentido una vez
+            # el archivo está de verdad en el servidor -- antes de subir no
+            # hay nada que proteger todavía, así que se deshabilita hasta
+            # que entry.status == "subido" (igual que favorito, deshabilitado
+            # sin media_info).
+            lock_btn = ctk.CTkButton(
+                rf, text=self._lock_symbol(entry), width=cw["btn"], height=26,
+                font=_BF, fg_color="transparent", border_width=0,
+                text_color=ACCENT if self._entry_is_reserved(entry) else PENDING_COLOR,
+                hover_color=("gray85", "#2b2b2b"),
+                state="normal" if (entry.media_info and entry.status == "subido") else "disabled",
+                command=lambda e=entry: self._toggle_entry_reservation(e))
+            lock_btn.pack(side="left", padx=(4, 0), pady=2)
+
             ftp_up = ctk.CTkButton(rf, text="▲", width=cw["btn"], height=26,
                                     font=_BF, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                     command=lambda e=entry: self._upload_one(e))
@@ -5112,7 +5737,7 @@ class App(_AppBase):
                 "frame": rf, "name": name_lbl, "detected": det_lbl,
                 "new_name": nn_lbl, "dest": dest_lbl, "status": st_lbl,
                 "ftp_bar": ftp_bar, "ftp_speed": ftp_speed, "size": size_lbl,
-                "ftp_up": ftp_up, "play_btn": play_btn,
+                "ftp_up": ftp_up, "play_btn": play_btn, "fav": fav_btn, "lock": lock_btn,
                 "entry": entry,
                 "_raw_name": entry.name,
                 "_raw_det":  det_text,
@@ -5147,8 +5772,75 @@ class App(_AppBase):
                 row["status"].configure(text=_status_label(entry.status),
                                          text_color=sc.get(entry.status, PENDING_COLOR))
                 row["size"].configure(text=self._file_size_text(entry))
+                row["fav"].configure(
+                    text=self._fav_symbol(entry),
+                    text_color=ACCENT if self._entry_is_favorite(entry) else PENDING_COLOR,
+                    state="normal" if entry.media_info else "disabled")
+                row["lock"].configure(
+                    text=self._lock_symbol(entry),
+                    text_color=ACCENT if self._entry_is_reserved(entry) else PENDING_COLOR,
+                    state="normal" if (entry.media_info and entry.status == "subido") else "disabled")
                 break
         self._update_status_bar()
+
+    def _entry_is_favorite(self, entry) -> bool:
+        if not entry.media_info:
+            return False
+        return self._is_favorite(entry.media_info.media_type, entry.media_info.tmdb_id)
+
+    def _fav_symbol(self, entry) -> str:
+        return "★" if self._entry_is_favorite(entry) else "☆"
+
+    def _toggle_entry_favorite(self, entry):
+        if not entry.media_info:
+            return
+        mi = entry.media_info
+        self._toggle_favorite(mi.media_type, mi.tmdb_id, mi.title,
+                               on_done=lambda e=entry: self._update_row(e))
+
+    def _entry_is_reserved(self, entry) -> bool:
+        if not entry.media_info:
+            return False
+        return self._is_reserved(entry.media_info.media_type, entry.media_info.tmdb_id)
+
+    def _lock_symbol(self, entry) -> str:
+        return "🔒" if self._entry_is_reserved(entry) else "🔓"
+
+    def _toggle_entry_reservation(self, entry):
+        # Deliberadamente restringido a archivos ya subidos (ver el botón
+        # en _refresh_table): antes de eso no hay nada en el servidor que
+        # proteger. Reservar un episodio protege la serie ENTERA en
+        # Liberar espacio (misma clave media_type+tmdb_id) -- así que la
+        # cuota debe cargarse con el tamaño real de la serie/película
+        # completa, no el de este único archivo, o un usuario podría
+        # protegerse una serie de 80GB pagando solo el 1.2GB de un
+        # episodio (ver _best_known_size_bytes).
+        if not entry.media_info or entry.status != "subido":
+            return
+        mi = entry.media_info
+        size_bytes = self._best_known_size_bytes(mi.media_type, mi.tmdb_id, self._file_size_bytes(entry))
+        self._toggle_reservation(mi.media_type, mi.tmdb_id, mi.title, size_bytes,
+                                  on_done=lambda e=entry: self._update_row(e))
+
+    def _best_known_size_bytes(self, media_type: str, tmdb_id: int, fallback_bytes: int) -> int:
+        """Mejor estimación del tamaño REAL en el servidor de una serie/
+        película completa, para cargar la cuota de reservas con precisión
+        al reservar desde Archivos (un solo archivo) -- si "Liberar
+        espacio" ya la tiene en su caché de último análisis
+        (self._cleanup_raw_items, cargada al arrancar desde
+        cleanup_candidates_cache.json aunque no se haya visitado esa
+        pestaña en esta sesión), se usa ESE tamaño de carpeta completa en
+        vez de fallback_bytes (el de un único archivo)."""
+        for it in getattr(self, "_cleanup_raw_items", []):
+            if it.media_type == media_type and it.tmdb_id == tmdb_id:
+                return it.size_bytes
+        return fallback_bytes
+
+    def _file_size_bytes(self, entry) -> int:
+        try:
+            return Path(entry.path).stat().st_size
+        except OSError:
+            return 0
 
     def _upload_one(self, entry):
         """Añade el archivo a la cola. Si hay subida activa lo encola; si no, la inicia."""
@@ -5965,6 +6657,8 @@ class App(_AppBase):
             "ftp_parallel":    parallel,
             "ftp_speed_limit": speed,
             "ftp_retries":     retries,
+            "shared_data_ftp_path": self._shared_data_ftp_path_entry.get().strip(),
+            "app_user_name":        self._app_user_name_entry.get().strip(),
 
             "tmdb_api_key": self._api_key_entry.get().strip(),
             "language":     self._lang_combo.get(),
@@ -6014,8 +6708,51 @@ class App(_AppBase):
         current = self._collect_settings()
         return any(self.config_data.get(key) != value for key, value in current.items())
 
+    def _resolve_app_user_name_change(self, new_name: str) -> str:
+        """Valida el cambio de "Tu nombre" ANTES de guardar nada -- llamado
+        desde _save_all_settings. Puede devolver un nombre distinto al
+        pedido (revertido al anterior) si el usuario cancela alguno de los
+        pasos, para que _save_all_settings no lo persista.
+
+        Dos comprobaciones, en este orden:
+        1. Unicidad: ¿ya hay reservas de otra persona con ese mismo
+           nombre? Bloquea tanto crear el nombre por primera vez como
+           cambiarlo -- compartir nombre mezclaría cuotas y podría
+           impedir liberar una reserva ajena por confundirla con propia.
+        2. Si había un nombre anterior CON reservas propias, preguntar qué
+           hacer con ellas: traspasarlas al nombre nuevo o desprotegerlas
+           todas (_RenameReservationsDialog). Cancelar aquí revierte el
+           nombre entero, no solo esta comprobación."""
+        old_name = self.config_data.get("app_user_name", "").strip()
+        if new_name == old_name:
+            return new_name
+
+        from core.reservations import is_name_taken, used_bytes
+        if new_name and is_name_taken(self._reservations, new_name, exclude=old_name or None):
+            messagebox.showerror(
+                "Nombre en uso",
+                f"Ya hay reservas hechas por alguien llamado \"{new_name}\" -- elige un nombre "
+                "distinto para no mezclar tu cuota de 100GB con la suya.")
+            return old_name
+
+        if old_name and used_bytes(self._reservations, old_name) > 0:
+            dlg = _RenameReservationsDialog(self, old_name, new_name)
+            if dlg.result == "transfer":
+                self._transfer_reservations(old_name, new_name)
+            elif dlg.result == "unprotect":
+                self._unprotect_all_reservations(old_name)
+            else:
+                return old_name
+
+        return new_name
+
     def _save_all_settings(self):
         data = self._collect_settings()
+        resolved_name = self._resolve_app_user_name_change(data["app_user_name"])
+        if resolved_name != data["app_user_name"]:
+            data["app_user_name"] = resolved_name
+            self._app_user_name_entry.delete(0, "end")
+            self._app_user_name_entry.insert(0, resolved_name)
         self.config_data.set_many(data)
         self.config_data.save()
         self._set_autostart(data["start_with_windows"])
@@ -6280,25 +7017,56 @@ class App(_AppBase):
         dlg.geometry(f"+{pw - dlg.winfo_reqwidth()//2}+{ph - dlg.winfo_reqheight()//2}")
 
     def _show_row_menu(self, event, entry):
+        # Seleccionar la fila al abrir el menú -- si no, es fácil pulsar
+        # con el botón derecho sobre una fila distinta a la que se tenía
+        # seleccionada y acabar aplicando la acción (o viendo el panel de
+        # detalles) sobre la fila equivocada.
+        self._select_entry(entry)
+
         menu = tk.Menu(self, tearoff=0)
         try:
             idx = self.files.index(entry)
         except ValueError:
             return
         n = len(self.files)
+
+        # -- Identificación / subida --
+        if entry.status != "subido":
+            menu.add_command(label="🔍 Buscar de nuevo en TMDB",
+                             command=lambda: self._search_new_entries([entry]))
+        if entry.media_info and entry.status in ("listo", "renombrado", "error", "omitido"):
+            menu.add_command(label="▲  Subir este archivo", command=lambda: self._upload_one(entry))
+        menu.add_command(label="✎  Editar carpeta de destino…",
+                         command=lambda: self._edit_remote_dir(entry))
+        menu.add_separator()
+
+        # -- Archivo --
+        menu.add_command(label="▶  Reproducir", command=lambda: self._play_file(entry))
+        menu.add_command(label="📂 Abrir carpeta contenedora",
+                         command=lambda: self._open_containing_folder(entry))
+        menu.add_command(label="📋 Copiar nombre original",
+                         command=lambda: self._copy_to_clipboard(entry.name))
+        if entry.new_name:
+            menu.add_command(label="📋 Copiar nuevo nombre",
+                             command=lambda: self._copy_to_clipboard(entry.new_name))
+        menu.add_separator()
+
+        # -- Orden en la lista --
         if idx > 0:
             menu.add_command(label="▲  Mover arriba",     command=lambda: self._move_entry(entry, -1))
             menu.add_command(label="⏫ Ir al principio",  command=lambda: self._move_entry_to(entry, 0))
         if idx < n - 1:
             menu.add_command(label="▼  Mover abajo",      command=lambda: self._move_entry(entry, 1))
             menu.add_command(label="⏬ Ir al final",       command=lambda: self._move_entry_to(entry, n - 1))
+
+        # -- Estado / quitar --
         if entry.status in ("subido", "renombrado", "error"):
-            if menu.index("end") is not None:
-                menu.add_separator()
+            menu.add_separator()
             menu.add_command(label="↺  Restablecer (volver a pendiente)",
                              command=lambda: self._reset_entry(entry))
-        if menu.index("end") is None:
-            return  # nada que mostrar
+        menu.add_separator()
+        menu.add_command(label="✕  Quitar de la lista", command=lambda: self._remove_entry(entry))
+
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -6453,6 +7221,8 @@ class App(_AppBase):
             except Exception:
                 pass
 
+    _HISTORY_PAGE_SIZE = 25   # filas por página -- ver _refresh_history_view
+
     def _build_history_tab(self, parent):
         """Vista de historial integrada (igual que Episodios/Configuración,
         ver _show_view) -- sustituye a la antigua ventana emergente para
@@ -6481,28 +7251,54 @@ class App(_AppBase):
         table_fr.grid_columnconfigure(0, weight=1)
         table_fr.grid_rowconfigure(0, weight=1)
 
-        # Columnas: nombre -> ancho, en el mismo orden en que se dibujan.
-        # Ajustable arrastrando los separadores de la cabecera (ver
-        # _history_sash_press) -- igual que en Archivos, se guarda en un
-        # dict de instancia para que la cabecera y cada fila lean SIEMPRE
-        # el mismo ancho (si no, un reajuste desalinearía cabecera y filas).
-        self._history_col_widths = {"fecha": 130, "archivo": 280, "destino": 200, "tamano": 70, "estado": 80}
+        # Paginado (ver _HISTORY_PAGE_SIZE): con hasta 500 registros y 5
+        # widgets por fila, dibujar el historial entero de golpe llega a
+        # sumar miles de ventanas nativas de Tk -- Windows limita a 10000
+        # objetos GUI por proceso, y superarlo rompe el pintado de TODA
+        # la ventana en silencio (no solo de esta tabla). Ver el mismo
+        # paginado en Episodios que faltan y Liberar espacio. Debajo de
+        # la tabla (no encima) y centrada -- sin sticky="ew", para que el
+        # frame ocupe solo su tamaño natural y quede centrado en la
+        # columna (que sí tiene weight=1).
+        nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
+        nav_fr.grid(row=2, column=0, pady=(6, 0))
+        self._history_prev_btn = ctk.CTkButton(
+            nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._history_change_page(-1))
+        self._history_prev_btn.pack(side="left")
+        self._history_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
+        self._history_page_lbl.pack(side="left", padx=12)
+        self._history_next_btn = ctk.CTkButton(
+            nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._history_change_page(1))
+        self._history_next_btn.pack(side="left")
+
         self._history_col_order = ["fecha", "archivo", "destino", "tamano", "estado"]
         self._history_font = ctk.CTkFont(size=11)
-        self._history_hdr_labels = []
         self._history_rows = []
-        self._history_sash_state = None
         self._history_empty_msg = None   # label "sin subidas...", ver _refresh_history_view
+        self._history_all = []   # historial completo (más reciente primero), ver _refresh_history_view
+        self._history_page = 0
 
-        self._history_scroll = ctk.CTkScrollableFrame(table_fr)
-        self._history_scroll.grid(row=0, column=0, sticky="nsew")
-
-        # Cabecera DENTRO del mismo CTkScrollableFrame que las filas (no
-        # en un contenedor aparte) -- igual que en Archivos/Episodios:
-        # CTkScrollableFrame tiene su propio margen interno, así que una
-        # cabecera fuera de ella queda desplazada unos píxeles respecto a
-        # las filas de dentro, por poco que sea el margen.
-        self._build_history_table_header(self._history_scroll)
+        # TableView: cabecera fija (no scrollea con las filas) + cuerpo
+        # con scroll -- mismo componente que usan Archivos/Episodios/
+        # Liberar espacio, ver gui/table_view.py. Los anchos y el propio
+        # arrastre de separadores los gestiona el componente; las filas
+        # solo necesitan leer table.col_width(key) para pintarse.
+        sw0 = self._saved_col_widths("historial")
+        self._history_table = TableView(table_fr, columns=[
+            ColumnSpec("fecha", "Fecha", width=sw0.get("fecha", 130), min_width=50, resizable=True),
+            ColumnSpec("archivo", "Archivo", width=sw0.get("archivo", 280), min_width=50, resizable=True),
+            ColumnSpec("destino", "Destino FTP / motivo", width=sw0.get("destino", 200), min_width=50, resizable=True),
+            ColumnSpec("tamano", "Tamaño", width=sw0.get("tamano", 70), min_width=50, resizable=True),
+            ColumnSpec("estado", "Estado", width=sw0.get("estado", 80), min_width=50),
+        ])
+        self._history_table.grid(row=0, column=0, sticky="nsew")
+        # Al arrastrar un separador, redibujar también las filas ya
+        # pintadas con los anchos nuevos -- TableView solo se encarga de
+        # su propia cabecera.
+        self._history_table.on_column_resize = lambda: self._history_render_page()
+        self._history_table.on_widths_changed = lambda w: self._save_table_col_widths("historial", w)
 
         # Diferido -- ver el mismo motivo en _build_missing_episodes_tab:
         # esta pestaña se construye al arrancar aunque esté oculta, y el
@@ -6512,83 +7308,62 @@ class App(_AppBase):
         # afecta al primer dibujado al arrancar.
         self.after(120, self._refresh_history_view)
 
-    def _build_history_table_header(self, parent):
-        hdr2 = ctk.CTkFrame(parent, corner_radius=0)
-        hdr2.pack(fill="x", pady=(0, 2))
-        titles = {"fecha": "Fecha", "archivo": "Archivo", "destino": "Destino FTP / motivo",
-                  "tamano": "Tamaño", "estado": "Estado"}
-        _BF = ctk.CTkFont(weight="bold")
-        for idx, key in enumerate(self._history_col_order):
-            if idx > 0:
-                left_key = self._history_col_order[idx - 1]
-                sash = tk.Frame(hdr2, width=4, bg="#505060", cursor="sb_h_double_arrow")
-                sash.pack(side="left", fill="y", pady=6)
-                sash.bind("<ButtonPress-1>", lambda e, l=left_key, r=key: self._history_sash_press(e, l, r))
-                sash.bind("<B1-Motion>", self._history_sash_motion)
-                sash.bind("<ButtonRelease-1>", self._history_sash_release)
-            lbl = ctk.CTkLabel(hdr2, text=titles[key], font=_BF, width=self._history_col_widths[key], anchor="w")
-            lbl.pack(side="left", padx=0, pady=4)
-            self._history_hdr_labels.append((lbl, key))
-
-    def _history_sash_press(self, event, left_col, right_col):
-        self._history_sash_state = {
-            "left": left_col, "right": right_col, "x0": event.x_root,
-            "left_w": self._history_col_widths[left_col], "right_w": self._history_col_widths[right_col],
-        }
-
-    def _history_sash_motion(self, event):
-        if not self._history_sash_state:
-            return
-        delta = event.x_root - self._history_sash_state["x0"]
-        MIN = 50
-        new_l = max(MIN, self._history_sash_state["left_w"] + delta)
-        new_r = max(MIN, self._history_sash_state["right_w"] - delta)
-        self._history_col_widths[self._history_sash_state["left"]] = new_l
-        self._history_col_widths[self._history_sash_state["right"]] = new_r
-        self._apply_history_col_widths()
-
-    def _history_sash_release(self, event):
-        self._history_sash_state = None
-
-    def _apply_history_col_widths(self):
-        cw = self._history_col_widths
-        for lbl, key in self._history_hdr_labels:
-            lbl.configure(width=cw[key])
-        for row in self._history_rows:
-            for key in self._history_col_order:
-                row[key].configure(width=cw[key], text=_fit_text(row["_raw"][key], cw[key], self._history_font))
-
     def _refresh_history_view(self):
-        """Redibuja la tabla del historial con lo que haya en disco ahora
-        mismo -- se llama al construir la vista y cada vez que se entra en
-        ella (_show_view), por si hubo subidas nuevas desde la última vez
-        que se miró."""
-        import datetime
+        """Recarga el historial de disco y redibuja la página actual --
+        se llama al construir la vista y cada vez que se entra en ella
+        (_show_view), por si hubo subidas nuevas desde la última vez que
+        se miró. Como es una recarga desde disco (el orden/contenido
+        puede haber cambiado), vuelve siempre a la primera página."""
         history = self._load_history()
+        self._history_all = list(reversed(history))   # más reciente primero
         self._history_title_lbl.configure(text=f"Historial de subidas  ({len(history)} registros)")
+        self._history_page = 0
+        self._history_render_page()
 
-        # Solo se destruyen las filas (y el mensaje vacío, si estaba) --
-        # NO todos los hijos de self._history_scroll, porque la cabecera
-        # (ver _build_history_table_header) vive en el mismo
-        # CTkScrollableFrame para que quede alineada con las filas de
-        # verdad (sin el margen interno que introduciría tenerla fuera).
-        for row in self._history_rows:
-            row["fecha"].master.destroy()
+    def _history_change_page(self, delta: int):
+        n_pages = max(1, -(-len(self._history_all) // self._HISTORY_PAGE_SIZE))
+        new_page = max(0, min(n_pages - 1, self._history_page + delta))
+        if new_page == self._history_page:
+            return
+        self._history_page = new_page
+        self._history_render_page()
+
+    def _history_render_page(self):
+        """Dibuja solo la página actual (self._history_page) de
+        self._history_all -- ver _HISTORY_PAGE_SIZE. Separado de
+        _refresh_history_view para que cambiar de página no implique
+        releer el historial de disco."""
+        import datetime
+
+        self._history_table.clear_rows()
         self._history_rows = []
-        if self._history_empty_msg is not None:
-            self._history_empty_msg.destroy()
-            self._history_empty_msg = None
+        self._history_empty_msg = None
 
-        if not history:
+        total = len(self._history_all)
+        n_pages = max(1, -(-total // self._HISTORY_PAGE_SIZE))
+        start = self._history_page * self._HISTORY_PAGE_SIZE
+        page_items = self._history_all[start:start + self._HISTORY_PAGE_SIZE]
+
+        self._history_page_lbl.configure(
+            text=f"Página {self._history_page + 1} de {n_pages}" if total else "")
+        self._history_prev_btn.configure(state="normal" if self._history_page > 0 else "disabled")
+        self._history_next_btn.configure(state="normal" if self._history_page < n_pages - 1 else "disabled")
+
+        # Volver arriba del todo -- si no, al cambiar de página con el
+        # scroll bajado, las filas nuevas se dibujan pero el hueco (ahora
+        # vacío) por el que se había bajado se queda visible.
+        self._history_table.scroll_to_top()
+
+        if not page_items:
             self._history_empty_msg = ctk.CTkLabel(
-                self._history_scroll, text="Sin subidas registradas todavía.", text_color=PENDING_COLOR)
+                self._history_table.body, text="Sin subidas registradas todavía.", text_color=PENDING_COLOR)
             self._history_empty_msg.pack(pady=30)
             return
 
-        cw = self._history_col_widths
+        cw = {key: self._history_table.col_width(key) for key in self._history_col_order}
         font = self._history_font
         sc = {"ok": SUCCESS_COLOR, "error": ERROR_COLOR}
-        for entry in reversed(history):
+        for entry in page_items:
             try:
                 ts = datetime.datetime.fromtimestamp(entry.get("ts", 0)).strftime("%d/%m/%Y %H:%M")
             except Exception:
@@ -6616,7 +7391,7 @@ class App(_AppBase):
             # Sin fg_color propio -- mismo fondo por defecto que las
             # filas de Archivos/Episodios, no transparente (para que la
             # tabla se vea igual, no "sin color" de fondo).
-            row_fr = ctk.CTkFrame(self._history_scroll)
+            row_fr = ctk.CTkFrame(self._history_table.body)
             row_fr.pack(fill="x", pady=1, padx=2)
             row_labels = {"_raw": raw}
             for idx, key in enumerate(self._history_col_order):
@@ -6698,14 +7473,29 @@ class App(_AppBase):
     def _build_cleanup_tab(self, parent):
         parent.grid_rowconfigure(2, weight=1)
 
+        # Grid a 3 columnas con las dos exteriores en el mismo grupo
+        # "uniform" -- mismo patrón que Archivos/Episodios/Historial para
+        # que el título quede centrado de verdad pase lo que pese cada
+        # lado (con pack normal, el texto explicativo a la izquierda
+        # descentraba el título hacia la derecha).
         header = ctk.CTkFrame(parent, fg_color=("gray90", "gray20"), corner_radius=8)
         header.grid(row=0, column=0, sticky="ew", pady=(0, CONTAINER_GAP))
+        header.grid_columnconfigure(0, weight=1, uniform="cleanup_header_sides")
+        header.grid_columnconfigure(1, weight=0)
+        header.grid_columnconfigure(2, weight=1, uniform="cleanup_header_sides")
+
+        left_fr = ctk.CTkFrame(header, fg_color="transparent")
+        left_fr.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(left_fr, text=("Solo un informe -- nunca borra nada por su cuenta. "
+                                    "Cada eliminación exige tu confirmación."),
+                     font=ctk.CTkFont(size=11), text_color=PENDING_COLOR).pack(side="left", padx=12, pady=8)
+
         ctk.CTkLabel(header, text="Liberar espacio",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=12, pady=8)
-        ctk.CTkLabel(header, text=("Solo un informe -- nunca borra nada por su cuenta. "
-                                   "Cada eliminación exige tu confirmación."),
-                     font=ctk.CTkFont(size=11), text_color=PENDING_COLOR).pack(side="left", padx=(0, 12))
-        self._cleanup_scan_btn = ctk.CTkButton(header, text="🔍 Analizar servidor", width=170,
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=1, padx=16, pady=8)
+
+        right_fr = ctk.CTkFrame(header, fg_color="transparent")
+        right_fr.grid(row=0, column=2, sticky="e")
+        self._cleanup_scan_btn = ctk.CTkButton(right_fr, text="🔍 Analizar servidor", width=170,
                                                command=self._start_cleanup_scan)
         self._cleanup_scan_btn.pack(side="right", padx=(4, 12), pady=8)
 
@@ -6814,6 +7604,24 @@ class App(_AppBase):
                      font=ctk.CTkFont(size=10), text_color=PENDING_COLOR,
                      wraplength=230, justify="left").pack(anchor="w", pady=(0, 12))
 
+        ctk.CTkLabel(filters_fr, text="Protegidas",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
+        # Favoritos y reservados nunca se pueden borrar desde aquí (ver
+        # _build_cleanup_result_row) -- por defecto se ocultan de la lista
+        # igual que siempre, estos dos checkboxes solo sirven para
+        # REVISARLOS (auditar qué protege espacio, liberar una reserva
+        # antigua para hacer sitio a otra) sin salir de esta pestaña.
+        self._cleanup_show_favorites_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(filters_fr, text="Mostrar favoritos", variable=self._cleanup_show_favorites_var
+                        ).pack(anchor="w")
+        self._cleanup_show_reserved_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(filters_fr, text="Mostrar reservados", variable=self._cleanup_show_reserved_var
+                        ).pack(anchor="w", pady=(0, 4))
+        self._cleanup_quota_lbl = ctk.CTkLabel(
+            filters_fr, text="", font=ctk.CTkFont(size=10), text_color=PENDING_COLOR,
+            wraplength=230, justify="left")
+        self._cleanup_quota_lbl.pack(anchor="w", pady=(0, 12))
+
         ctk.CTkLabel(filters_fr, text="Categoría",
                      font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
         self._cleanup_category_frame = ctk.CTkFrame(filters_fr, fg_color="transparent")
@@ -6829,17 +7637,64 @@ class App(_AppBase):
         results_wrap = ctk.CTkFrame(body, fg_color="transparent")
         results_wrap.grid(row=0, column=1, sticky="nsew", padx=(0, CONTAINER_GAP))
         results_wrap.grid_columnconfigure(0, weight=1)
-        results_wrap.grid_rowconfigure(1, weight=1)
+        results_wrap.grid_rowconfigure(0, weight=1)
+
+        # TableView: mismo componente que Archivos/Episodios/Historial
+        # (ver gui/table_view.py) -- cabecera fija con los mismos anchos
+        # que leen las filas, así nunca se desalinean entre sí. La fila
+        # sigue en dos líneas (nombre arriba, tamaño/motivo debajo); la
+        # columna "candidata" solo etiqueta ese bloque, no una línea.
+        self._cleanup_table = TableView(results_wrap, columns=[
+            ColumnSpec("icon", "", width=28),
+            ColumnSpec("candidata", "Candidata", expand=True),
+            ColumnSpec("tendencia", "Tendencia", width=70),
+            ColumnSpec("fav", "", width=32),
+            ColumnSpec("reserve", "", width=32),
+            ColumnSpec("del", "", width=110),
+        ])
+        self._cleanup_table.grid(row=0, column=0, sticky="nsew")
+
+        # Paginado (ver _CLEANUP_PAGE_SIZE) -- mismo motivo que en
+        # Episodios que faltan/Historial: con un servidor grande, cientos
+        # de candidatas de golpe llegan a agotar el límite de objetos GUI
+        # de Windows (10000 por proceso) y rompen el pintado de la
+        # ventana. El contador de candidatas vive en esta misma barra
+        # (izquierda), no encima de la lista -- deja ese hueco libre para
+        # la cabecera de columnas. Columnas laterales "uniform" (mismo
+        # truco que las cabeceras con título centrado) para que
+        # Anterior/Página/Siguiente después del contador, no centrados
+        # sobre el ancho completo -- con el texto del contador variando
+        # bastante de longitud ("1444 candidata(s) -- 10.8 TB
+        # liberables"), forzar columnas simétricas para centrar la
+        # paginación lo dejaba cortado en listas grandes. El contador
+        # tiene todo el espacio libre que necesite (weight=1); la
+        # paginación ocupa su ancho natural justo a continuación.
+        bottom_bar = ctk.CTkFrame(results_wrap, fg_color="transparent")
+        bottom_bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        bottom_bar.grid_columnconfigure(0, weight=1)
 
         self._cleanup_results_lbl = ctk.CTkLabel(
-            results_wrap, text="", font=ctk.CTkFont(size=12), text_color=PENDING_COLOR, anchor="w")
-        self._cleanup_results_lbl.grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self._cleanup_results_scroll = ctk.CTkScrollableFrame(results_wrap, fg_color="transparent")
-        self._cleanup_results_scroll.grid(row=1, column=0, sticky="nsew")
+            bottom_bar, text="", font=ctk.CTkFont(size=12), text_color=PENDING_COLOR, anchor="w")
+        self._cleanup_results_lbl.grid(row=0, column=0, sticky="w")
+
+        cleanup_nav_fr = ctk.CTkFrame(bottom_bar, fg_color="transparent")
+        cleanup_nav_fr.grid(row=0, column=1)
+        self._cleanup_prev_btn = ctk.CTkButton(
+            cleanup_nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._cleanup_change_page(-1))
+        self._cleanup_prev_btn.pack(side="left")
+        self._cleanup_page_lbl = ctk.CTkLabel(cleanup_nav_fr, text="", text_color=PENDING_COLOR)
+        self._cleanup_page_lbl.pack(side="left", padx=12)
+        self._cleanup_next_btn = ctk.CTkButton(
+            cleanup_nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._cleanup_change_page(1))
+        self._cleanup_next_btn.pack(side="left")
 
         # -- Ficha de TMDB de la candidata pulsada, a la derecha --
         self._cleanup_side_panel = self._build_cleanup_side_panel(body)
         self._cleanup_side_panel.grid(row=0, column=2, sticky="ns")
+
+        self._update_cleanup_quota_label()   # estado inicial, antes de cualquier "Aplicar filtros"
 
         self._cleanup_raw_items = []
         self._cleanup_filtered_items = []
@@ -6849,6 +7704,7 @@ class App(_AppBase):
         self._cleanup_current_poster = None
         self._cleanup_selected_item = None   # candidata pulsada, ver _show_cleanup_poster
         self._cleanup_row_widgets = []   # [(item, row_frame), ...] -- para resaltar la fila seleccionada
+        self._cleanup_page = 0
         # Compartidas entre todas las filas -- mismo motivo que en
         # _build_files_tab/_build_missing_episodes_tab: no crear un
         # CTkFont nuevo (llamada a Tcl) por cada candidata de la lista.
@@ -7226,6 +8082,24 @@ class App(_AppBase):
             name_query=self._cleanup_search_entry.get().strip(),
             only_duplicates=self._cleanup_duplicates_var.get())
         self._cleanup_filtered_items = filter_candidates(self._cleanup_raw_items, filters)
+        # Favoritos y reservados nunca son candidatas BORRABLES (el botón
+        # "Eliminar" sale deshabilitado para ellas, ver
+        # _build_cleanup_result_row) -- por defecto tampoco aparecen en la
+        # lista, igual que siempre, pero "Mostrar favoritos"/"Mostrar
+        # reservados" permite revisarlas sin salir de esta pestaña.
+        if not self._cleanup_show_favorites_var.get():
+            self._cleanup_filtered_items = [
+                it for it in self._cleanup_filtered_items
+                if not self._is_favorite(it.media_type, it.tmdb_id)]
+        if not self._cleanup_show_reserved_var.get():
+            self._cleanup_filtered_items = [
+                it for it in self._cleanup_filtered_items
+                if not self._is_reserved(it.media_type, it.tmdb_id)]
+        self._update_cleanup_quota_label()
+        # Alfabético, no el orden en que las devolvió el escaneo del
+        # servidor (que no sigue ningún criterio reconocible para quien
+        # mira la lista).
+        self._cleanup_filtered_items.sort(key=lambda it: it.name.lower())
 
         # Con "Solo duplicados" activo, cada fila necesita saber en qué
         # OTRAS rutas existe el mismo contenido (mismo tmdb_id Y mismo
@@ -7279,83 +8153,102 @@ class App(_AppBase):
             parts.append("nunca vista")
         return ", ".join(parts) if parts else "sin datos de visionado"
 
-    _CLEANUP_PAGE_SIZE = 100   # filas visibles antes de pedir "Mostrar más"
+    _CLEANUP_PAGE_SIZE = 25   # filas por página -- ver _render_cleanup_page
 
     def _render_cleanup_results(self):
-        for w in self._cleanup_results_scroll.winfo_children():
-            w.destroy()
+        """Punto de entrada tras aplicar filtros o terminar un análisis --
+        el conjunto de candidatas cambió, así que vuelve a la primera
+        página. Para redibujar la página actual sin resetearla (p.ej.
+        tras borrar una sola candidata) usar _render_cleanup_page()
+        directamente -- ver _finish_delete_cleanup_item."""
+        items = self._cleanup_filtered_items
+        if items:
+            total_size = sum(it.size_bytes for it in items)
+            self._cleanup_results_lbl.configure(
+                text=f"{len(items)} candidata(s) -- {_fmt_size(total_size)} liberables")
+        else:
+            self._cleanup_results_lbl.configure(text="")
+        self._cleanup_page = 0
+        self._render_cleanup_page()
+
+    def _cleanup_change_page(self, delta: int):
+        n_pages = max(1, -(-len(self._cleanup_filtered_items) // self._CLEANUP_PAGE_SIZE))
+        new_page = max(0, min(n_pages - 1, self._cleanup_page + delta))
+        if new_page == self._cleanup_page:
+            return
+        self._cleanup_page = new_page
+        self._render_cleanup_page()
+
+    def _render_cleanup_page(self):
+        """Dibuja solo self._cleanup_page de self._cleanup_filtered_items
+        -- ver _CLEANUP_PAGE_SIZE. Página fija (no "Mostrar más"
+        acumulativo): con cientos de candidatas (habitual desde que
+        también se detectan archivos sueltos), crear TODAS las filas de
+        golpe -- o ir acumulando cada vez más sin soltar las anteriores --
+        llega a agotar el límite de objetos GUI de Windows (10000 por
+        proceso) y rompe el pintado de TODA la ventana, no solo de esta
+        lista. Con página fija, el número de widgets vivos a la vez tiene
+        un techo pase lo que pase con el tamaño real de la lista."""
+        self._cleanup_table.clear_rows()
         self._cleanup_row_widgets = []
+
         items = self._cleanup_filtered_items
         if not items:
             msg = "Sin candidatas con estos filtros." if self._cleanup_raw_items else \
                   "Pulsa \"🔍 Analizar servidor\" para ver candidatas."
-            ctk.CTkLabel(self._cleanup_results_scroll, text=msg, text_color=PENDING_COLOR).pack(pady=30)
-            self._cleanup_results_lbl.configure(text="")
+            ctk.CTkLabel(self._cleanup_table.body, text=msg, text_color=PENDING_COLOR).pack(pady=30)
+            self._cleanup_page_lbl.configure(text="")
+            self._cleanup_prev_btn.configure(state="disabled")
+            self._cleanup_next_btn.configure(state="disabled")
             return
 
-        total_size = sum(it.size_bytes for it in items)
-        self._cleanup_results_lbl.configure(
-            text=f"{len(items)} candidata(s) -- {_fmt_size(total_size)} liberables si se borran todas")
+        total = len(items)
+        n_pages = max(1, -(-total // self._CLEANUP_PAGE_SIZE))
+        self._cleanup_page = max(0, min(n_pages - 1, self._cleanup_page))
+        start = self._cleanup_page * self._CLEANUP_PAGE_SIZE
+        page_items = items[start:start + self._CLEANUP_PAGE_SIZE]
 
-        # Paginado, no la lista entera de golpe -- con cientos de
-        # candidatas (habitual desde que también se detectan archivos
-        # sueltos), crear TODAS las filas saturaba el lienzo interno de
-        # CTkScrollableFrame y la ventana dejaba de dibujarse bien incluso
-        # repartiendo la creación en lotes con self.after(). Ahora solo se
-        # renderiza la primera página; el resto se pide a mano con
-        # "Mostrar más", así el número de widgets vivos a la vez tiene un
-        # techo fijo pase lo que pase con el tamaño real de la lista.
+        self._cleanup_page_lbl.configure(text=f"Página {self._cleanup_page + 1} de {n_pages}")
+        self._cleanup_prev_btn.configure(state="normal" if self._cleanup_page > 0 else "disabled")
+        self._cleanup_next_btn.configure(state="normal" if self._cleanup_page < n_pages - 1 else "disabled")
+
+        # Volver arriba del todo -- si no, al cambiar de página/filtro con
+        # el scroll bajado, las filas nuevas se dibujan pero el hueco
+        # (ahora vacío) por el que se había bajado se queda visible, dando
+        # la sensación de "no hay resultados" aunque sí los haya.
+        self._cleanup_table.scroll_to_top()
+
         self._cleanup_render_token = getattr(self, "_cleanup_render_token", 0) + 1
-        self._cleanup_rendered_count = 0
-        self._cleanup_show_more_btn = None
-        self._render_cleanup_next_page(items, self._cleanup_render_token)
-
-    def _render_cleanup_next_page(self, items: list, token: int):
-        if token != self._cleanup_render_token:
-            return   # se aplicó otro filtro mientras tanto -- abandonar
-        if self._cleanup_show_more_btn is not None:
-            self._cleanup_show_more_btn.destroy()
-            self._cleanup_show_more_btn = None
-        start = self._cleanup_rendered_count
-        end = min(start + self._CLEANUP_PAGE_SIZE, len(items))
-        self._render_cleanup_rows_batch(items, start, end, token)
+        self._render_cleanup_rows_batch(page_items, 0, len(page_items), self._cleanup_render_token)
 
     def _render_cleanup_rows_batch(self, items: list, start: int, end: int, token: int, batch_size: int = 20):
         if token != self._cleanup_render_token:
-            return   # se aplicó otro filtro mientras tanto -- abandonar este lote
+            return   # se cambió de página/filtro mientras tanto -- abandonar este lote
         batch_end = min(start + batch_size, end)
         for item in items[start:batch_end]:
             self._build_cleanup_result_row(item)
         if batch_end < end:
             self.after(1, lambda: self._render_cleanup_rows_batch(items, batch_end, end, token, batch_size))
-        else:
-            self._cleanup_rendered_count = end
-            remaining = len(items) - end
-            if remaining > 0:
-                self._cleanup_show_more_btn = ctk.CTkButton(
-                    self._cleanup_results_scroll,
-                    text=f"Mostrar más ({remaining} restantes)",
-                    command=lambda: self._render_cleanup_next_page(items, token))
-                self._cleanup_show_more_btn.pack(pady=10)
 
     def _build_cleanup_result_row(self, item):
-        # grid (no pack con side="left"/"right" mezclados) -- con pack, el
-        # frame central expandido (info_fr) se comía todo el ancho de la
-        # fila y dejaba el nombre/motivo sin sitio visible, aunque el
-        # icono y el botón sí se veían. Mismo patrón que
-        # _build_missing_ep_row, que ya funciona bien.
+        # pack (side="left", una columna con fill="x"+expand=True) --
+        # mismo patrón que _build_missing_ep_row/_refresh_table, ver
+        # gui/table_view.py. Los anchos vienen de self._cleanup_table
+        # (col_width), la misma fuente que usa la cabecera, así nunca se
+        # desalinean entre sí.
+        cw = self._cleanup_table.col_width
         is_selected = item is self._cleanup_selected_item
-        row = ctk.CTkFrame(self._cleanup_results_scroll,
+        row = ctk.CTkFrame(self._cleanup_table.body,
                            fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
         row.pack(fill="x", pady=3, padx=2)
-        row.grid_columnconfigure(1, weight=1)
+        row.pack(fill="x", pady=3, padx=2)
         self._cleanup_row_widgets.append((item, row))
 
         icon = "📺" if item.media_type == "tv" else "🎬"
-        ctk.CTkLabel(row, text=icon, width=28).grid(row=0, column=0, padx=(8, 4), pady=8)
+        ctk.CTkLabel(row, text=icon, width=cw("icon")).pack(side="left", padx=(8, 4), pady=8)
 
         info_fr = ctk.CTkFrame(row, fg_color="transparent")
-        info_fr.grid(row=0, column=1, sticky="ew", pady=6)
+        info_fr.pack(side="left", fill="x", expand=True, pady=6)
         name_lbl = ctk.CTkLabel(info_fr, text=item.name, font=self._cleanup_name_font,
                                 anchor="w", cursor="hand2")
         name_lbl.pack(fill="x")
@@ -7367,10 +8260,46 @@ class App(_AppBase):
         reason_lbl.pack(fill="x")
         reason_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
 
-        ctk.CTkButton(row, text="🗑 Eliminar", width=110, fg_color="transparent", border_width=1,
-                      border_color=ERROR_COLOR, text_color=ERROR_COLOR, hover_color=("gray85", "#3d1010"),
-                      command=lambda it=item: self._confirm_and_delete_cleanup_item(it)).grid(
-            row=0, column=2, padx=8, pady=6)
+        from core.trending import trending_score, format_trending_score
+        score = trending_score(item.play_count, item.last_played_ts, _time.time())
+        ctk.CTkLabel(row, text=format_trending_score(score), width=cw("tendencia"),
+                     font=self._cleanup_reason_font, text_color=PENDING_COLOR).pack(
+            side="left", padx=(4, 4), pady=6)
+
+        is_fav = self._is_favorite(item.media_type, item.tmdb_id)
+        is_res = self._is_reserved(item.media_type, item.tmdb_id)
+
+        # Marcar favorito aquí también quita la fila de la lista al
+        # instante (ver _apply_cleanup_filters): un favorito nunca se
+        # muestra como candidata a borrar por defecto -- salvo que el
+        # filtro "Mostrar favoritos" esté activo, ver más abajo.
+        ctk.CTkButton(row, text="★" if is_fav else "☆", width=cw("fav"), fg_color="transparent", border_width=0,
+                      text_color=ACCENT if is_fav else PENDING_COLOR, hover_color=("gray85", "#2b2b2b"),
+                      command=lambda it=item: self._toggle_cleanup_item_favorite(it)).pack(
+            side="left", padx=(0, 4), pady=6)
+
+        # Igual que favoritos pero con cuota de 100GB por usuario (ver
+        # core/reservations.py) -- "🔒" reservado (por cualquiera, no solo
+        # el usuario actual), "🔓" libre.
+        ctk.CTkButton(row, text="🔒" if is_res else "🔓", width=cw("reserve"), fg_color="transparent",
+                      border_width=0, text_color=ACCENT if is_res else PENDING_COLOR,
+                      hover_color=("gray85", "#2b2b2b"),
+                      command=lambda it=item: self._toggle_cleanup_item_reservation(it)).pack(
+            side="left", padx=(0, 4), pady=6)
+
+        # Protegido (favorito o reservado) nunca se borra desde aquí, ni
+        # aunque el filtro correspondiente lo esté mostrando -- deshabilitar
+        # en vez de ocultar, para que quede claro POR QUÉ no se puede.
+        is_protected = is_fav or is_res
+        del_btn = ctk.CTkButton(
+            row, text="🗑 Eliminar" if not is_protected else "🔒 Protegida",
+            width=cw("del"), fg_color="transparent", border_width=1,
+            border_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
+            text_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
+            hover_color=("gray85", "#3d1010") if not is_protected else ("gray90", "gray20"),
+            state="disabled" if is_protected else "normal",
+            command=lambda it=item: self._confirm_and_delete_cleanup_item(it))
+        del_btn.pack(side="left", padx=8, pady=6)
 
     def _build_cleanup_side_panel(self, parent):
         """Ficha de TMDB de la candidata pulsada -- póster + sinopsis,
@@ -7466,9 +8395,44 @@ class App(_AppBase):
         except Exception:
             pass
 
+    def _toggle_cleanup_item_favorite(self, item):
+        # _apply_cleanup_filters() ya llama a _render_cleanup_results() al
+        # final -- reaplicar el filtro es lo que de verdad hace falta,
+        # porque marcar favorito aquí saca la fila de la lista (ver arriba,
+        # salvo que "Mostrar favoritos" esté activo).
+        self._toggle_favorite(item.media_type, item.tmdb_id, item.name,
+                               on_done=self._apply_cleanup_filters)
+
+    def _toggle_cleanup_item_reservation(self, item):
+        self._toggle_reservation(item.media_type, item.tmdb_id, item.name, item.size_bytes,
+                                  on_done=self._apply_cleanup_filters)
+
+    def _update_cleanup_quota_label(self):
+        from core.reservations import used_bytes, QUOTA_BYTES
+        user = self.config_data.get("app_user_name", "").strip()
+        if not user:
+            self._cleanup_quota_lbl.configure(
+                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.")
+            return
+        used_gb = used_bytes(self._reservations, user) / (1024 ** 3)
+        quota_gb = QUOTA_BYTES / (1024 ** 3)
+        self._cleanup_quota_lbl.configure(text=f"Reservado por {user}: {used_gb:.1f} de {quota_gb:.0f}GB")
+
     def _confirm_and_delete_cleanup_item(self, item):
         """Un solo elemento, con confirmación explícita -- nunca hay un
-        "seleccionar todo y borrar" en esta vista. Ver _ConfirmDeleteDialog."""
+        "seleccionar todo y borrar" en esta vista. Ver _ConfirmDeleteDialog.
+
+        El botón "Eliminar" ya sale deshabilitado para favoritos/reservados
+        (ver _build_cleanup_result_row), pero esta comprobación se repite
+        aquí como defensa en profundidad: si otro cliente marcó el mismo
+        ítem como favorito/reservado mientras esta fila ya estaba pintada
+        (sin refrescar), el estado en memoria de este botón podría estar
+        desfasado -- y un borrado accidental de algo protegido no tiene
+        vuelta atrás."""
+        if self._is_favorite(item.media_type, item.tmdb_id) or self._is_reserved(item.media_type, item.tmdb_id):
+            messagebox.showwarning(
+                "Protegida", f"\"{item.name}\" está marcada como favorita o reservada -- no se puede borrar.")
+            return
         reason = self._cleanup_item_reason_text(item)
         dlg = _ConfirmDeleteDialog(self, item.name, item.ftp_path, item.size_bytes, reason)
         if not dlg.result:
@@ -7505,7 +8469,14 @@ class App(_AppBase):
         if ok:
             self._cleanup_raw_items = [it for it in self._cleanup_raw_items if it is not item]
             self._cleanup_filtered_items = [it for it in self._cleanup_filtered_items if it is not item]
-            self._render_cleanup_results()
+            items = self._cleanup_filtered_items
+            if items:
+                total_size = sum(it.size_bytes for it in items)
+                self._cleanup_results_lbl.configure(
+                    text=f"{len(items)} candidata(s) -- {_fmt_size(total_size)} liberables")
+            else:
+                self._cleanup_results_lbl.configure(text="")
+            self._render_cleanup_page()   # preserva la página actual (clamped), no la resetea a la 1ª
             self._set_status(f"Eliminado: {item.name} ({_fmt_size(item.size_bytes)} liberados)", SUCCESS_COLOR)
             self._refresh_ftp_space()   # el borrado cambia el espacio libre real -- refrescar el indicador
             # Actualizar también el caché en disco -- si no, el elemento
@@ -7518,6 +8489,144 @@ class App(_AppBase):
                 _log.warning("Liberar espacio: no se pudo actualizar el caché tras borrar", exc_info=True)
         else:
             self._set_status(f"No se pudo eliminar {item.name}: {msg}", ERROR_COLOR)
+
+    # -------------------------------------------------------- Protegidos tab
+
+    def _build_protected_tab(self, parent):
+        """Gestión de TODO lo que el usuario actual tenga reservado (ver
+        core/reservations.py), venga de Archivos o de Liberar espacio --
+        cuota usada y un botón para liberar cada uno sin tener que ir a
+        buscarlo en la pestaña donde se marcó."""
+        parent.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkFrame(parent, fg_color=("gray90", "gray20"), corner_radius=8)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, CONTAINER_GAP))
+        header.grid_columnconfigure(0, weight=1, uniform="protected_header_sides")
+        header.grid_columnconfigure(1, weight=0)
+        header.grid_columnconfigure(2, weight=1, uniform="protected_header_sides")
+
+        left_fr = ctk.CTkFrame(header, fg_color="transparent")
+        left_fr.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(left_fr, text="Todo lo que hayas reservado desde Archivos o Liberar espacio.",
+                     font=ctk.CTkFont(size=11), text_color=PENDING_COLOR).pack(side="left", padx=12, pady=8)
+
+        ctk.CTkLabel(header, text="Protegidos",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=1, padx=16, pady=8)
+
+        # Columna derecha deliberadamente sin ningún widget dentro -- basta
+        # con declarar el column/weight/uniform para que el título quede
+        # centrado de verdad (ver _build_cleanup_tab); un CTkFrame() vacío
+        # aquí usaría su alto por defecto (~200px, ver el mismo comentario
+        # en _build_cleanup_tab sobre watched_threshold_frame) e inflaba
+        # todo el contenedor de la cabecera.
+
+        top_bar = ctk.CTkFrame(parent, fg_color="transparent")
+        top_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self._protected_quota_lbl = ctk.CTkLabel(
+            top_bar, text="", font=ctk.CTkFont(size=12), text_color=PENDING_COLOR, anchor="w")
+        self._protected_quota_lbl.pack(side="left")
+        self._protected_show_all_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(top_bar, text="Ver todo el servidor", variable=self._protected_show_all_var,
+                      command=self._render_protected_table).pack(side="right")
+
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        sw0 = self._saved_col_widths("protected")
+        self._protected_table = TableView(body, columns=[
+            ColumnSpec("icon", "", width=28),
+            ColumnSpec("name", "Reservado", expand=True),
+            ColumnSpec("size", "Tamaño", width=sw0.get("size", 90), min_width=60),
+            ColumnSpec("owner", "Reservado por", width=sw0.get("owner", 120), min_width=60),
+            ColumnSpec("release", "", width=110),
+        ])
+        self._protected_table.grid(row=0, column=0, sticky="nsew")
+        self._protected_table.on_widths_changed = lambda w: self._save_table_col_widths("protected", w)
+
+        self._protected_name_font = ctk.CTkFont(size=12)
+
+    def _render_protected_table(self):
+        """Redibuja la tabla entera con lo que haya en self._reservations
+        ahora mismo -- se llama al abrir la pestaña, tras liberar una fila,
+        tras alternar "Ver todo el servidor" y tras cualquier
+        sincronización con el FTP mientras esta pestaña esté activa (ver
+        _apply_synced_reservations)."""
+        self._protected_table.clear_rows()
+        user = self.config_data.get("app_user_name", "").strip()
+        show_all = self._protected_show_all_var.get()
+
+        from core.reservations import used_bytes, QUOTA_BYTES
+        if not user:
+            self._protected_quota_lbl.configure(
+                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.")
+        else:
+            used_gb = used_bytes(self._reservations, user) / (1024 ** 3)
+            quota_gb = QUOTA_BYTES / (1024 ** 3)
+            self._protected_quota_lbl.configure(
+                text=f"Tu cuota ({user}): {used_gb:.1f} de {quota_gb:.0f}GB reservados")
+
+        if show_all:
+            shown = list(self._reservations.items())
+        elif user:
+            shown = [(key, entry) for key, entry in self._reservations.items()
+                     if entry.get("reserved_by") == user]
+        else:
+            shown = []
+        shown.sort(key=lambda kv: kv[1].get("name", "").lower())
+
+        if not shown:
+            if show_all:
+                msg = "Nadie ha reservado nada en este servidor todavía."
+            elif user:
+                msg = ("Nada reservado todavía -- usa el candado 🔒 en Archivos o Liberar espacio "
+                       "para proteger algo de borrado.")
+            else:
+                msg = "Configura tu nombre en Ajustes para empezar a reservar espacio."
+            ctk.CTkLabel(self._protected_table.body, text=msg, text_color=PENDING_COLOR).pack(pady=30)
+            return
+
+        for key, entry in shown:
+            self._build_protected_row(key, entry, user)
+
+    def _build_protected_row(self, key: str, entry: dict, user: str):
+        cw = self._protected_table.col_width
+        row = ctk.CTkFrame(self._protected_table.body, fg_color=("gray95", "gray17"))
+        row.pack(fill="x", pady=3, padx=2)
+
+        icon = "📺" if entry.get("media_type") == "tv" else "🎬"
+        ctk.CTkLabel(row, text=icon, width=cw("icon")).pack(side="left", padx=(8, 4), pady=8)
+
+        ctk.CTkLabel(row, text=entry.get("name", ""), font=self._protected_name_font,
+                     anchor="w").pack(side="left", fill="x", expand=True, padx=(4, 4), pady=8)
+
+        ctk.CTkLabel(row, text=_fmt_size(entry.get("size_bytes", 0)), width=cw("size"),
+                     text_color=PENDING_COLOR).pack(side="left", padx=(0, 4), pady=8)
+
+        owner = entry.get("reserved_by", "")
+        ctk.CTkLabel(row, text=owner, width=cw("owner"),
+                     text_color=ACCENT if owner == user else PENDING_COLOR).pack(
+            side="left", padx=(0, 4), pady=8)
+
+        # Solo el dueño puede liberarla de verdad -- _toggle_reservation ya
+        # lo comprueba y avisa, pero deshabilitar el botón aquí (en vez de
+        # dejar que el aviso aparezca cada vez) es más claro en la vista
+        # "Ver todo el servidor", donde la mayoría de filas serán ajenas.
+        is_mine = owner == user
+        ctk.CTkButton(row, text="🔓 Liberar" if is_mine else "🔒 De otra persona",
+                      width=cw("release"), fg_color="transparent", border_width=1,
+                      state="normal" if is_mine else "disabled",
+                      command=lambda k=key, e=entry: self._release_protected_row(k, e)).pack(
+            side="left", padx=8, pady=6)
+
+    def _release_protected_row(self, key: str, entry: dict):
+        # Reutiliza _toggle_reservation tal cual: la fila solo existe
+        # aquí si ya está reservada, así que siempre toma la rama de
+        # liberar (comprueba dueño, sincroniza con FTP, etc. -- mismo
+        # camino que el candado de Archivos/Liberar espacio).
+        self._toggle_reservation(entry["media_type"], entry["tmdb_id"], entry.get("name", ""),
+                                  entry.get("size_bytes", 0), on_done=self._render_protected_table)
 
     def _session_path(self) -> Path:
         return _appdata_dir() / "session.json"

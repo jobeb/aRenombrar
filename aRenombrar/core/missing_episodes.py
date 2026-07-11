@@ -127,6 +127,37 @@ def format_missing_summary(show_name: str, missing: dict) -> str:
     return f"{show_name}: {ranges}" if ranges else ""
 
 
+def has_spanish_availability(providers: dict) -> bool:
+    """True si la serie aparece en /tv/{id}/watch/providers para la región
+    "ES" -- primer filtro (barato, una llamada por serie) del interruptor
+    "Ocultar sin doblaje ES": si ni siquiera está disponible en España, no
+    hace falta gastar una llamada por episodio para comprobar el doblaje."""
+    return "ES" in (providers.get("results") or {})
+
+
+def episode_has_spanish_text(episode_info: dict) -> bool:
+    """True si /tv/{id}/season/{s}/episode/{e}?language=es-ES devuelve texto
+    localizado real -- TMDB, cuando no tiene traducción, suele devolver
+    'overview'/'name' vacíos en vez de dar error, así que hay que mirar el
+    contenido, no solo si la llamada tuvo éxito."""
+    return bool((episode_info.get("overview") or "").strip()) or bool((episode_info.get("name") or "").strip())
+
+
+def filter_missing_by_spanish_dub(missing: dict, dub_by_episode: dict) -> dict:
+    """Reduce *missing* ({temporada: [episodios]}) a solo los episodios con
+    doblaje ES confirmado -- dub_by_episode: {"{temporada}x{episodio:02d}":
+    bool}. Un episodio que TODAVÍA no se ha comprobado (no está en
+    dub_by_episode) se considera visible por defecto: el worker en segundo
+    plano lo irá rellenando, y ocultarlo de entrada escondería contenido
+    real mientras se comprueba, en vez de solo lo ya confirmado sin doblaje."""
+    result = {}
+    for season, episodes in missing.items():
+        kept = [ep for ep in episodes if dub_by_episode.get(f"{season}x{ep:02d}", True)]
+        if kept:
+            result[season] = kept
+    return result
+
+
 def remove_missing_episode(results: list, tmdb_id: int, season: int, episode: int) -> bool:
     """Quita (temporada, episodio) de la fila de *results* (misma lista que
     gui/app.py::App._missing_ep_results) cuyo tmdb_id coincida -- usado justo

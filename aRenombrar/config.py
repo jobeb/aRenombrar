@@ -96,6 +96,21 @@ DEFAULTS = {
     # = ninguna descartada todavía. No se vuelve a avisar de esa MISMA
     # versión, pero sí de una posterior.
     "skipped_update_version": "",
+    # Ruta FTP (explícita, no deducida de ninguna categoría) donde se guarda
+    # el JSON de favoritos compartido entre todos los clientes que apuntan
+    # al mismo servidor -- ver core/favorites.py. Vacío = favoritos
+    # deshabilitados (solo mirror local, sin sincronizar).
+    "shared_data_ftp_path": "",
+    # Nombre que identifica a esta persona frente a las demás que usan
+    # aRenombrar contra el mismo servidor -- clave de su cuota individual
+    # de 100GB en "Liberar espacio" (ver core/reservations.py). Vacío =
+    # no puede reservar espacio todavía (hace falta para saber a quién
+    # cargarle la cuota).
+    "app_user_name": "",
+    # Anchos de columna de las tablas (Archivos/Episodios/Liberar espacio/
+    # Historial), guardados al soltar un separador -- ver gui/table_view.py
+    # y _save_table_col_widths en gui/app.py. {tabla: {columna: ancho_px}}.
+    "table_col_widths": {},
 }
 
 

@@ -52,6 +52,34 @@ class UploadSlotManager:
             self._cancelled_tickets.discard(self._next_to_serve)
             self._next_to_serve += 1
 
+    def _cancel_ticket_locked(self, ticket: int):
+        """Ya con self._cond agarrado: da por perdido *ticket* sin que
+        llegue a consumir cupo. Debe llamarse SIEMPRE que un ticket
+        reservado con reserve_ticket() no vaya a pasar por acquire() de
+        verdad -- si no, el contador de turnos se queda parado en ese
+        ticket para siempre, bloqueando a cualquiera con un ticket mayor
+        aunque haya cupos libres."""
+        if ticket == self._next_to_serve:
+            self._next_to_serve += 1
+            self._advance_past_cancelled()
+        else:
+            self._cancelled_tickets.add(ticket)
+        self._cond.notify_all()
+
+    def release_ticket_unused(self, ticket: int = None):
+        """Libera un ticket reservado con reserve_ticket() que al final no
+        va a pasar por acquire() -- p.ej. el archivo no llegó a necesitar
+        subir (falló la identificación, sin resultados TMDB, confianza
+        insuficiente, sin categoría FTP configurada...). Sin esto, ver el
+        docstring de _cancel_ticket_locked: la cola entera se queda
+        bloqueada para siempre en cuanto CUALQUIER archivo falla antes de
+        llegar a subir, que es el caso más común. No-op si ticket es None
+        (nunca se reservó ninguno)."""
+        if ticket is None:
+            return
+        with self._cond:
+            self._cancel_ticket_locked(ticket)
+
     def acquire(self, cancel_event=None, ticket: int = None) -> bool:
         """Bloquea hasta que haya un cupo libre Y le toque el turno (FIFO
         por orden de llegada, o el *ticket* ya reservado con
@@ -66,12 +94,7 @@ class UploadSlotManager:
             while True:
                 self._advance_past_cancelled()
                 if cancel_event is not None and cancel_event.is_set():
-                    if ticket == self._next_to_serve:
-                        self._next_to_serve += 1
-                        self._advance_past_cancelled()
-                    else:
-                        self._cancelled_tickets.add(ticket)
-                    self._cond.notify_all()
+                    self._cancel_ticket_locked(ticket)
                     return False
                 if ticket == self._next_to_serve and self._active < self._max_slots():
                     self._active += 1

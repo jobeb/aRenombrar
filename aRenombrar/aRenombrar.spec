@@ -20,6 +20,8 @@ datas = [
     ('iconoPrincipal.ico', '.'),
     ('iconoPrincipal.icns', '.'),
     ('IconoSinFondo.png', '.'),
+    ('plex_logo.png', '.'),
+    ('jellyfin_logo.png', '.'),
 ]
 binaries = []
 hiddenimports = ['PIL._tkinter_finder']

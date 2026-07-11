@@ -5,6 +5,7 @@ Variables disponibles en la plantilla de ruta:
 """
 
 import ftplib
+import io
 import os
 from pathlib import Path
 from typing import Optional, Callable
@@ -586,6 +587,85 @@ class FTPClient:
             return False, f"Error FTP: {e}"
         except ftplib.all_errors as e:
             self.ftp = None  # Marcar como desconectado para forzar reconexión
+            return False, f"Error FTP: {e}"
+        except OSError as e:
+            return False, f"Error de archivo: {e}"
+
+    def upload_bytes(self, data: bytes, remote_path: str) -> tuple[bool, str]:
+        """Sube un blob pequeño (p.ej. el JSON de favoritos compartidos)
+        directamente desde memoria, sin pasar por un archivo local temporal
+        -- storbinary acepta cualquier objeto tipo-archivo, y io.BytesIO
+        cumple esa interfaz sobre bytes ya en memoria. Crea la carpeta
+        remota si hace falta, igual que upload_file()."""
+        if not self.is_connected():
+            return False, "No conectado al servidor FTP."
+        remote_dir = remote_path.rsplit("/", 1)[0] or "/"
+        ok, msg = self.ensure_remote_dir(remote_dir)
+        if not ok:
+            return False, msg
+        try:
+            self.ftp.storbinary(f"STOR {remote_path}", io.BytesIO(data))
+            return True, remote_path
+        except ftplib.all_errors as e:
+            return False, f"Error FTP: {e}"
+
+    def download_bytes(self, remote_path: str) -> Optional[bytes]:
+        """Descarga un blob pequeño a memoria -- None si no existe o falla
+        (servidor sin ese archivo todavía, p.ej. la primera vez que se usan
+        favoritos compartidos, se degrada a "sin favoritos" en vez de
+        romper nada)."""
+        if not self.is_connected():
+            return None
+        buf = io.BytesIO()
+        try:
+            self.ftp.retrbinary(f"RETR {remote_path}", buf.write)
+            return buf.getvalue()
+        except ftplib.all_errors:
+            return None
+
+    def rename_file(self, remote_from: str, remote_to: str) -> tuple[bool, str]:
+        """Mueve/renombra un archivo YA en el servidor (RNFR/RNTO) -- mucho
+        más barato que descargar+resubir+borrar cuando origen y destino
+        están en el mismo disco/filesystem. En servidores/discos distintos
+        esto normalmente falla (ver download_file() para el caso
+        alternativo, que sí cruza discos)."""
+        if not self.is_connected():
+            return False, "No conectado al servidor FTP."
+        remote_dir = remote_to.rsplit("/", 1)[0] or "/"
+        ok, msg = self.ensure_remote_dir(remote_dir)
+        if not ok:
+            return False, msg
+        try:
+            self.ftp.rename(remote_from, remote_to)
+            return True, remote_to
+        except ftplib.all_errors as e:
+            return False, f"Error FTP: {e}"
+
+    def download_file(self, remote_file: str, local_path: str,
+                       progress_cb: Optional[Callable[[int], None]] = None) -> tuple[bool, str]:
+        """Descarga un archivo del servidor a disco local -- necesario para
+        mover un archivo ya subido a un disco DISTINTO del servidor (RNFR/
+        RNTO de rename_file() no cruza discos): se descarga aquí, se sube
+        con upload_file() al nuevo destino, y solo entonces se borra el
+        original."""
+        if not self.is_connected():
+            return False, "No conectado al servidor FTP."
+        try:
+            received = [0]
+            def _write(chunk):
+                Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(local_path, "ab") as f:
+                    f.write(chunk)
+                received[0] += len(chunk)
+                if progress_cb:
+                    progress_cb(received[0])
+            # Empezar en blanco: si ya existía un intento anterior a medias,
+            # no se debe seguir escribiendo detrás de esos bytes.
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            open(local_path, "wb").close()
+            self.ftp.retrbinary(f"RETR {remote_file}", _write)
+            return True, local_path
+        except ftplib.all_errors as e:
             return False, f"Error FTP: {e}"
         except OSError as e:
             return False, f"Error de archivo: {e}"

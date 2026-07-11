@@ -1,7 +1,9 @@
 from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                     format_missing_ranges, looks_like_season_split,
                                     find_unknown_seasons, looks_like_absolute_numbering,
-                                    remap_absolute_episodes, remove_missing_episode, _season_ranges)
+                                    remap_absolute_episodes, remove_missing_episode, _season_ranges,
+                                    has_spanish_availability, episode_has_spanish_text,
+                                    filter_missing_by_spanish_dub)
 
 
 def test_find_missing_episodes_finds_gaps():
@@ -193,3 +195,51 @@ def test_remove_missing_episode_returns_false_when_not_actually_missing():
 def test_remove_missing_episode_returns_false_for_unknown_tmdb_id():
     results = [_missing_row(tmdb_id=1)]
     assert remove_missing_episode(results, 999, 1, 2) is False
+
+
+def test_has_spanish_availability_true_when_es_region_present():
+    providers = {"results": {"ES": {"flatrate": [{"provider_name": "Netflix"}]}, "US": {}}}
+    assert has_spanish_availability(providers) is True
+
+
+def test_has_spanish_availability_false_when_es_region_missing():
+    providers = {"results": {"US": {}}}
+    assert has_spanish_availability(providers) is False
+
+
+def test_has_spanish_availability_false_when_no_results_key():
+    assert has_spanish_availability({}) is False
+
+
+def test_episode_has_spanish_text_true_with_overview():
+    assert episode_has_spanish_text({"overview": "Un resumen en castellano.", "name": ""}) is True
+
+
+def test_episode_has_spanish_text_true_with_only_name():
+    assert episode_has_spanish_text({"overview": "", "name": "El principio"}) is True
+
+
+def test_episode_has_spanish_text_false_when_both_empty():
+    assert episode_has_spanish_text({"overview": "", "name": ""}) is False
+
+
+def test_episode_has_spanish_text_false_when_only_whitespace():
+    assert episode_has_spanish_text({"overview": "   ", "name": "\n"}) is False
+
+
+def test_filter_missing_by_spanish_dub_hides_confirmed_non_dubbed():
+    missing = {1: [1, 2, 3]}
+    dub = {"1x01": True, "1x02": False, "1x03": True}
+    assert filter_missing_by_spanish_dub(missing, dub) == {1: [1, 3]}
+
+
+def test_filter_missing_by_spanish_dub_keeps_unchecked_episodes_visible():
+    missing = {1: [1, 2]}
+    dub = {"1x01": False}   # "1x02" todavía no se ha comprobado
+    assert filter_missing_by_spanish_dub(missing, dub) == {1: [2]}
+
+
+def test_filter_missing_by_spanish_dub_drops_season_if_all_hidden():
+    missing = {1: [1], 2: [1]}
+    dub = {"1x01": False, "2x01": True}
+    assert filter_missing_by_spanish_dub(missing, dub) == {2: [1]}

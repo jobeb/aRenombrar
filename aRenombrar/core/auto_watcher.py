@@ -191,12 +191,17 @@ class AutoWatcher:
             _log.info("NUEVO ARCHIVO DETECTADO: %s", item.name)
             self.on_event("info", f"Nuevo archivo detectado: {item.name}")
             self._in_progress.add(key)
-            # Turno de subida reservado YA, en el orden de la carpeta (items_found
-            # está ordenado, ver arriba) -- no cuando el hilo llegue a subir de
-            # verdad, que depende de cuánto tarde SU propia identificación TMDB.
-            # Sin esto, con varios archivos nuevos detectados en el mismo
-            # escaneo, el que más rápido identificara ganaba la carrera y
-            # subía antes aunque estuviera más abajo en la carpeta.
+            # Turno de subida reservado AQUÍ, en el bucle de _scan() -- de un
+            # solo hilo, así que el orden queda fijado sin ninguna carrera
+            # posible. Se probó reservarlo dentro de _process(), justo antes
+            # del evento "start" de cada hilo, pensando que así seguiría el
+            # orden real de la tabla -- pero la propia espera de estabilidad
+            # (STABLE_WAIT) no dura EXACTAMENTE lo mismo para archivos reales
+            # (la E/S de disco varía), así que dos hilos lanzados casi a la
+            # vez podían terminarla en cualquier orden: visto de verdad,
+            # un archivo detectado 4º subió antes que uno detectado 3º.
+            # Aquí, en cambio, no hay hilos todavía -- el orden es el de
+            # items_found (ya ordenado más arriba), sin más.
             ticket = self.upload_slots.reserve_ticket()
             threading.Thread(
                 target=self._process, args=(item, ticket), daemon=True
@@ -255,6 +260,15 @@ class AutoWatcher:
     def _process(self, path: Path, ticket: int = None):
         key = str(path)
         _log.info("--- Procesando: %s ---", path.name)
+        # El ticket ya viene reservado desde _scan() (de un solo hilo, sin
+        # ninguna carrera). El finally de más abajo libera el ticket en
+        # CUALQUIER salida de esta función (return normal o excepción) que
+        # no haya llegado a entregárselo a _upload_to_ftp() -- que a partir
+        # de la entrega pasa a ser el único responsable de liberarlo (ver su
+        # propio try/finally) -- así que las salidas tempranas de aquí abajo
+        # (archivo inestable, desaparecido, o ya gestionado a mano) no
+        # necesitan liberarlo cada una por su cuenta.
+        ticket_handed_off = False
         try:
             # Esperar a que el archivo deje de crecer (en este hilo, no en _scan)
             _log.debug("Esperando estabilidad (%ss): %s", STABLE_WAIT, path.name)
@@ -436,12 +450,16 @@ class AutoWatcher:
 
             # 5. Subir por FTP (serializado: self.ftp es una única conexión
             # compartida por todos los hilos de _process)
+            ticket_handed_off = True
             self._upload_to_ftp(key, new_name, media_info, season, new_path, _mark_both, _discard_both, ticket)
 
         except Exception as e:
             _log.exception("Error inesperado procesando: %s", path.name)
             self.on_event("error", f"Error inesperado ({path.name}): {e}")
             self._in_progress.discard(key)
+        finally:
+            if ticket is not None and not ticket_handed_off:
+                self.upload_slots.release_ticket_unused(ticket)
 
     def _get_speed_limit_kbs(self) -> int:
         """Límite de velocidad configurado, en KB/s (0 = sin límite). Se relee
@@ -468,6 +486,7 @@ class AutoWatcher:
             self.on_file_event(key, "skip", new_name=new_name,
                                 reason="FTP no configurado — el archivo se renombró pero no se subió")
             _mark_both("sin_ftp", new_name=new_name)
+            self.upload_slots.release_ticket_unused(ticket)
             return
 
         with self._ftp_lock:
@@ -485,6 +504,7 @@ class AutoWatcher:
                     self.on_event("error", f"FTP no disponible: {msg2}")
                     self.on_file_event(key, "error", new_name=new_name, reason=f"FTP no disponible: {msg2}")
                     _mark_both("error_ftp", new_name=new_name)
+                    self.upload_slots.release_ticket_unused(ticket)
                     return
                 _log.info("FTP conectado OK")
 
@@ -496,6 +516,7 @@ class AutoWatcher:
                 self.on_file_event(key, "error", new_name=new_name,
                                     reason="Sin categoría FTP configurada para este tipo de contenido")
                 _mark_both("sin_categoria", new_name=new_name)
+                self.upload_slots.release_ticket_unused(ticket)
                 return
             root = category.get("root", "")
             if not root:
@@ -504,6 +525,7 @@ class AutoWatcher:
                 self.on_file_event(key, "error", new_name=new_name,
                                     reason=f"Categoría '{category.get('name')}' sin ruta configurada")
                 _mark_both("sin_ruta", new_name=new_name)
+                self.upload_slots.release_ticket_unused(ticket)
                 return
 
             if media_info.media_type == "tv":
@@ -541,6 +563,7 @@ class AutoWatcher:
                 self.on_file_event(key, "skip", new_name=new_name,
                                     reason=f"Ya existe otro archivo para este mismo contenido: {dup}")
                 _mark_both("duplicado", new_name=new_name)
+                self.upload_slots.release_ticket_unused(ticket)
                 return
 
             # Comprobación de espacio libre en el disco concreto de destino
@@ -570,6 +593,7 @@ class AutoWatcher:
                 self.on_file_event(key, "error", new_name=new_name,
                                     reason=f"Disco lleno en el servidor (libre: {free/(1024**3):.1f} GB)")
                 _mark_both("disco_lleno", new_name=new_name)
+                self.upload_slots.release_ticket_unused(ticket)
                 return
 
             # "en cola": TODAVÍA no hay turno de "Subidas simultáneas"

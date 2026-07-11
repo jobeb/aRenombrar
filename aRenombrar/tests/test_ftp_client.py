@@ -592,3 +592,128 @@ def test_delete_folder_recursive_returns_false_when_not_connected():
     client = FTPClient()
     ok, msg = client.delete_folder_recursive("/peliculas/Pelicula X")
     assert ok is False
+
+
+class _FakeFtpBlob:
+    """Doble para upload_bytes/download_bytes/rename_file -- registra STOR
+    (con los bytes recibidos) y RETR, y simula RNFR/RNTO vía rename()."""
+    def __init__(self, files=None):
+        self.files = dict(files or {})   # {remote_path: bytes}
+        self.stor_calls = []
+        self.rename_calls = []
+
+    def voidcmd(self, cmd):
+        return "200 OK"
+
+    def cwd(self, path):
+        return None   # la carpeta "ya existe" siempre
+
+    def mkd(self, path):
+        raise ftplib.error_perm("550 no debería llamarse")
+
+    def storbinary(self, cmd, fp):
+        self.stor_calls.append(cmd)
+        remote_path = cmd.split(" ", 1)[1]
+        self.files[remote_path] = fp.read()
+
+    def retrbinary(self, cmd, write_cb):
+        remote_path = cmd.split(" ", 1)[1]
+        if remote_path not in self.files:
+            raise ftplib.error_perm("550 no existe")
+        write_cb(self.files[remote_path])
+
+    def rename(self, remote_from, remote_to):
+        if remote_from not in self.files:
+            raise ftplib.error_perm("550 no existe")
+        self.rename_calls.append((remote_from, remote_to))
+        self.files[remote_to] = self.files.pop(remote_from)
+
+
+def test_upload_bytes_stores_data_at_remote_path():
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob()
+
+    ok, msg = client.upload_bytes(b'{"favoritos": []}', "/datos/favoritos.json")
+
+    assert ok is True
+    assert client.ftp.files["/datos/favoritos.json"] == b'{"favoritos": []}'
+
+
+def test_upload_bytes_fails_without_connection():
+    client = FTPClient()
+    ok, msg = client.upload_bytes(b"datos", "/datos/favoritos.json")
+    assert ok is False
+
+
+def test_download_bytes_returns_stored_data():
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob(files={"/datos/favoritos.json": b'{"a": 1}'})
+
+    data = client.download_bytes("/datos/favoritos.json")
+
+    assert data == b'{"a": 1}'
+
+
+def test_download_bytes_returns_none_when_missing():
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob()
+    assert client.download_bytes("/datos/no_existe.json") is None
+
+
+def test_download_bytes_returns_none_without_connection():
+    client = FTPClient()
+    assert client.download_bytes("/datos/favoritos.json") is None
+
+
+def test_rename_file_moves_within_same_disk():
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob(files={"/peliculas/A/Pelicula.mkv": b"contenido"})
+
+    ok, msg = client.rename_file("/peliculas/A/Pelicula.mkv", "/peliculas/B/Pelicula.mkv")
+
+    assert ok is True
+    assert client.ftp.rename_calls == [("/peliculas/A/Pelicula.mkv", "/peliculas/B/Pelicula.mkv")]
+    assert "/peliculas/B/Pelicula.mkv" in client.ftp.files
+
+
+def test_rename_file_fails_without_connection():
+    client = FTPClient()
+    ok, msg = client.rename_file("/a/Pelicula.mkv", "/b/Pelicula.mkv")
+    assert ok is False
+
+
+def test_download_file_writes_local_file(tmp_path):
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob(files={"/peliculas/Pelicula.mkv": b"0123456789"})
+    local_path = tmp_path / "descargas" / "Pelicula.mkv"
+
+    ok, msg = client.download_file("/peliculas/Pelicula.mkv", str(local_path))
+
+    assert ok is True
+    assert local_path.read_bytes() == b"0123456789"
+
+
+def test_download_file_reports_progress():
+    client = FTPClient()
+    client.ftp = _FakeFtpBlob(files={"/peliculas/Pelicula.mkv": b"0123456789"})
+    progress = []
+
+    ok, msg = client.download_file(
+        "/peliculas/Pelicula.mkv", str(_tmp_local_path()),
+        progress_cb=lambda n: progress.append(n),
+    )
+
+    assert ok is True
+    assert progress == [10]
+
+
+def _tmp_local_path():
+    import tempfile
+    from pathlib import Path as _Path
+    return _Path(tempfile.mkdtemp()) / "Pelicula.mkv"
+
+
+def test_download_file_fails_without_connection(tmp_path):
+    client = FTPClient()
+    ok, msg = client.download_file("/peliculas/Pelicula.mkv", str(tmp_path / "Pelicula.mkv"))
+    assert ok is False

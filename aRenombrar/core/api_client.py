@@ -128,6 +128,21 @@ class TMDBClient:
     def get_episode_info(self, tv_id: int, season: int, episode: int) -> dict:
         return self._get(f"/tv/{tv_id}/season/{season}/episode/{episode}")
 
+    def get_watch_providers(self, tv_id: int) -> dict:
+        """Dónde se puede ver la serie, por región -- usado por el
+        interruptor "Ocultar sin doblaje ES" (ver core/missing_episodes.py)
+        para descartar de entrada series que ni siquiera están disponibles
+        en España, antes de gastar una llamada por episodio."""
+        return self._get(f"/tv/{tv_id}/watch/providers")
+
+    def get_episode_info_es(self, tv_id: int, season: int, episode: int) -> dict:
+        """Igual que get_episode_info(), pero siempre en es-ES explícito --
+        independiente del idioma configurado globalmente (self.session
+        params), porque esta llamada existe justo para comprobar si HAY
+        traducción al castellano, no para mostrar la ficha en el idioma que
+        el usuario tenga elegido."""
+        return self._get(f"/tv/{tv_id}/season/{season}/episode/{episode}", language="es-ES")
+
     def get_season_episodes(self, tv_id: int, season: int) -> list:
         """Lista de episodios YA EMITIDOS de una temporada (según air_date)
         -- usado por el detector de huecos (core/missing_episodes.py) para
