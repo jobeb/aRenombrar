@@ -160,10 +160,18 @@ def validate_jellyfin(host: str, api_key: str, timeout: int = 10) -> bool:
 
 def get_jellyfin_series(host: str, api_key: str, timeout: int = 15) -> Optional[list]:
     """Lista todas las series de la biblioteca de Jellyfin. Devuelve
-    [{"id": str, "name": str, "tmdb_id": int|None}, ...] o None si falla o
-    no está configurado -- usado por el detector de episodios que faltan
-    (core/missing_episodes.py), que solo puede comparar con TMDB las
-    series que traen su ID de TMDB emparejado."""
+    [{"id": str, "name": str, "tmdb_id": int|None, "folder_name": str|None}, ...]
+    o None si falla o no está configurado -- usado por el detector de
+    episodios que faltan (core/missing_episodes.py), que solo puede
+    comparar con TMDB las series que traen su ID de TMDB emparejado.
+    folder_name (el último componente de Path, p.ej. "Accused") es el
+    nombre REAL de la carpeta en disco -- puede no parecerse nada al
+    nombre mostrado ("Acusado" en Jellyfin, con el nombre en el idioma
+    configurado, mientras la carpeta se llama como vino la descarga
+    original) -- el detector de coincidencia por nombre difuso (ver
+    App._find_category_with_existing_folder) no siempre lo reconoce con
+    suficiente confianza, así que tenerlo aparte permite un match exacto
+    de carpeta cuando hace falta encontrarla de verdad (p.ej. al borrar)."""
     if not host or not api_key:
         return None
     base = host.rstrip("/")
@@ -171,7 +179,7 @@ def get_jellyfin_series(host: str, api_key: str, timeout: int = 15) -> Optional[
         resp = requests.get(
             f"{base}/Items",
             headers={"X-Emby-Token": api_key},
-            params={"IncludeItemTypes": "Series", "Recursive": "true", "Fields": "ProviderIds"},
+            params={"IncludeItemTypes": "Series", "Recursive": "true", "Fields": "ProviderIds,Path"},
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -186,7 +194,10 @@ def get_jellyfin_series(host: str, api_key: str, timeout: int = 15) -> Optional[
             tmdb_id = int(tmdb_raw) if tmdb_raw else None
         except (TypeError, ValueError):
             tmdb_id = None
-        shows.append({"id": item.get("Id"), "name": item.get("Name", ""), "tmdb_id": tmdb_id})
+        path = item.get("Path") or ""
+        folder_name = path.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else None
+        shows.append({"id": item.get("Id"), "name": item.get("Name", ""), "tmdb_id": tmdb_id,
+                      "folder_name": folder_name})
     _log.info("Jellyfin: %d serie(s) listadas (%d sin ID de TMDB emparejado)",
               len(shows), sum(1 for s in shows if s["tmdb_id"] is None))
     return shows

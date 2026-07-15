@@ -1,7 +1,8 @@
 from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                     format_missing_ranges, looks_like_season_split,
                                     find_unknown_seasons, looks_like_absolute_numbering,
-                                    remap_absolute_episodes, remove_missing_episode, _season_ranges,
+                                    remap_absolute_episodes, remove_missing_episode, remove_series,
+                                    _season_ranges,
                                     has_spanish_availability, episode_has_spanish_text,
                                     filter_missing_by_spanish_dub)
 
@@ -195,6 +196,28 @@ def test_remove_missing_episode_returns_false_when_not_actually_missing():
 def test_remove_missing_episode_returns_false_for_unknown_tmdb_id():
     results = [_missing_row(tmdb_id=1)]
     assert remove_missing_episode(results, 999, 1, 2) is False
+
+
+def test_remove_series_removes_whole_row():
+    row = _missing_row(tmdb_id=1, missing={1: [2, 3], 2: [5]})
+    other = _missing_row(tmdb_id=2, missing={1: [1]})
+    results = [row, other]
+    assert remove_series(results, 1) is True
+    assert results == [other]
+
+
+def test_remove_series_returns_false_for_unknown_tmdb_id():
+    results = [_missing_row(tmdb_id=1)]
+    assert remove_series(results, 999) is False
+    assert len(results) == 1
+
+
+def test_format_missing_ranges_ignores_empty_season_list():
+    """Caché corrupta (ver el arreglo real: una entrada con una temporada
+    de lista vacía tumbaba el arranque de la app con IndexError) -- nunca
+    debería llegar así, pero si llega no debe reventar."""
+    assert format_missing_ranges({1: []}) == ""
+    assert format_missing_ranges({1: [], 2: [3]}) == "T2E03"
 
 
 def test_has_spanish_availability_true_when_es_region_present():

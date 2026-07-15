@@ -70,6 +70,19 @@ def remove_missing_episode_from_cache(cache: dict, tmdb_id: int, season: int, ep
     return True
 
 
+def remove_series_from_cache(cache: dict, tmdb_id: int) -> bool:
+    """Quita la entrada ENTERA de *cache* para tmdb_id -- usado cuando la
+    serie completa se borra del servidor (ver
+    core.missing_episodes.remove_series, la versión para la lista en
+    memoria). Mutación en sitio. El llamador es responsable de
+    save_cache() después."""
+    key = str(tmdb_id)
+    if key not in cache:
+        return False
+    del cache[key]
+    return True
+
+
 def _reset_cache_for_tests() -> None:
     global _cache
     _cache = None

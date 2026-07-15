@@ -242,9 +242,22 @@ def test_get_jellyfin_series_parses_tmdb_id(monkeypatch):
     monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
     shows = msr.get_jellyfin_series("http://jellyfin:8096", "key123")
     assert shows == [
-        {"id": "abc123", "name": "Serie Con Tmdb", "tmdb_id": 9999},
-        {"id": "def456", "name": "Serie Sin Tmdb", "tmdb_id": None},
+        {"id": "abc123", "name": "Serie Con Tmdb", "tmdb_id": 9999, "folder_name": None},
+        {"id": "def456", "name": "Serie Sin Tmdb", "tmdb_id": None, "folder_name": None},
     ]
+
+
+def test_get_jellyfin_series_extracts_real_folder_name_from_path(monkeypatch):
+    """El nombre de carpeta real puede no parecerse al nombre mostrado
+    (traducido) -- ver "Acusado" (Jellyfin, es-ES) vs carpeta real
+    "Accused" en el servidor."""
+    payload = {"Items": [
+        {"Id": "abc123", "Name": "Acusado", "ProviderIds": {"Tmdb": "202097"},
+         "Path": "/home/administrador/datos2/series/Accused"},
+    ]}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    shows = msr.get_jellyfin_series("http://jellyfin:8096", "key123")
+    assert shows[0]["folder_name"] == "Accused"
 
 
 def test_get_jellyfin_episodes_without_config_returns_none():

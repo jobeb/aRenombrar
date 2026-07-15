@@ -54,3 +54,16 @@ def test_remove_missing_episode_from_cache_false_when_not_present():
 def test_remove_missing_episode_from_cache_false_for_unknown_tmdb_id():
     cache = {"1396": {"name": "Breaking Bad", "missing": {"1": [3]}}}
     assert mec.remove_missing_episode_from_cache(cache, 999, 1, 3) is False
+
+
+def test_remove_series_from_cache_removes_whole_entry():
+    cache = {"1396": {"name": "Breaking Bad", "missing": {"1": [3, 5]}},
+             "2": {"name": "Otra", "missing": {"1": [1]}}}
+    assert mec.remove_series_from_cache(cache, 1396) is True
+    assert cache == {"2": {"name": "Otra", "missing": {"1": [1]}}}
+
+
+def test_remove_series_from_cache_false_for_unknown_tmdb_id():
+    cache = {"1396": {"name": "Breaking Bad", "missing": {"1": [3]}}}
+    assert mec.remove_series_from_cache(cache, 999) is False
+    assert "1396" in cache

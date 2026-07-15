@@ -117,6 +117,19 @@ def format_missing_ranges(missing: dict) -> str:
         return ""
     parts = []
     for season in sorted(missing):
+        # Una temporada con lista vacía nunca debería llegar aquí (quien
+        # quita el último episodio de una temporada también debe borrar
+        # la clave, ver remove_missing_episode/remove_missing_episode_from_cache)
+        # -- pero esto lee un caché en disco (missing_episodes_cache.json),
+        # estado externo mutable que puede quedar inconsistente por otras
+        # vías (edición a mano, una versión futura con otro bug...). Sin
+        # este guard, _season_ranges revienta con IndexError al pedir
+        # episodes[0] de una lista vacía, y como esto se llama durante el
+        # arranque (_load_missing_episodes_from_cache), tumbaba la ventana
+        # entera antes de que llegara a abrirse -- sin ningún error visible
+        # si se lanzó sin consola (ver lanzar.vbs).
+        if not missing[season]:
+            continue
         parts.extend(_season_ranges(season, missing[season]))
     return ", ".join(parts)
 
@@ -156,6 +169,19 @@ def filter_missing_by_spanish_dub(missing: dict, dub_by_episode: dict) -> dict:
         if kept:
             result[season] = kept
     return result
+
+
+def remove_series(results: list, tmdb_id: int) -> bool:
+    """Quita la fila ENTERA de *results* cuyo tmdb_id coincida -- usado
+    cuando la serie completa se borra del servidor (botón de borrar en
+    Episodios que faltan, o borrado desde Liberar espacio), a diferencia
+    de remove_missing_episode que solo quita un episodio concreto.
+    Mutación en sitio. Devuelve True si de verdad había algo que quitar."""
+    for r in results:
+        if r.get("tmdb_id") == tmdb_id:
+            results.remove(r)
+            return True
+    return False
 
 
 def remove_missing_episode(results: list, tmdb_id: int, season: int, episode: int) -> bool:
