@@ -197,6 +197,13 @@ def _file_base_name(filename: str) -> str:
     return stem
 
 
+# Alias público -- core/season_grouping.py reutiliza este agrupado de
+# archivos compañeros (pósters/nfo/etc.) para que un episodio y sus
+# archivos asociados siempre se muevan juntos a la misma carpeta de
+# temporada, sin duplicar la lista de sufijos aquí y allá.
+file_base_name = _file_base_name
+
+
 def group_loose_files_by_name(files: list) -> dict:
     """Agrupa archivos sueltos (vídeo + póster/backdrop/logo/.../nfo) que
     comparten el mismo nombre base -- para categorías donde cada

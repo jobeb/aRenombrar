@@ -111,6 +111,39 @@ DEFAULTS = {
     # Historial), guardados al soltar un separador -- ver gui/table_view.py
     # y _save_table_col_widths en gui/app.py. {tabla: {columna: ancho_px}}.
     "table_col_widths": {},
+    # Cuota de reservas por persona, en GB (ver core/reservations.py) --
+    # configuración de SERVIDOR (core/server_config.py): el mismo límite
+    # para todo el que reserve espacio contra este servidor, no una
+    # constante fija en el código.
+    "reservation_quota_gb": 100,
+    # Emparejamiento manual de usuarios Plex<->Jellyfin para la
+    # sincronización de visionado (ver core/watch_sync.py) -- confirmado a
+    # mano una vez por la persona que ejecuta la herramienta y reutilizado
+    # en corridas siguientes; vacío = sin emparejar todavía, la utilidad
+    # pedirá emparejar la primera vez que se abra. CLIENTE, no compartido
+    # (ver core/server_config.py, sección "Excluido a propósito", para el
+    # motivo: es conocimiento personal, y SHARED_CONFIG_KEYS se aplica sin
+    # revisión en cada arranque, lo que rompería la garantía de revisión
+    # humana antes de escribir que es la razón de ser de esta función).
+    # [{"plex_user_id","plex_user_name","jellyfin_user_id","jellyfin_user_name"}, ...]
+    "watch_sync_user_mappings": [],
+    # Epoch de la última sincronización (manual o programada) -- sobre
+    # todo informativo ("hace 3 días" en la pestaña), nunca se usa para
+    # decidir QUÉ sincronizar (cada corrida compara el estado COMPLETO
+    # actual de ambas plataformas, no un delta desde la última vez); sí
+    # se usa para decidir si YA tocó hoy la sincronización programada
+    # (ver App._check_watch_sync_schedule), comparando su fecha con la
+    # de hoy -- así no se repite varias veces si el minuto programado se
+    # vuelve a comprobar.
+    "watch_sync_last_run_ts": 0,
+    # Sincronización automática diaria a una hora fija -- a diferencia
+    # del botón manual, SI escribe sin pedir confirmación (decisión
+    # explícita del usuario: quiso que ocurriera sola, sabiendo que eso
+    # renuncia a la revisión humana previa que tiene el resto de esta
+    # función). watch_sync_schedule_time en formato "HH:MM", vacío =
+    # sin programar. Ver App._start_watch_sync_scheduler.
+    "watch_sync_schedule_enabled": False,
+    "watch_sync_schedule_time": "",
 }
 
 

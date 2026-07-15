@@ -92,17 +92,22 @@ def used_bytes(data: dict, user: str) -> int:
                if entry.get("reserved_by") == user)
 
 
-def remaining_bytes(data: dict, user: str) -> int:
-    return max(0, QUOTA_BYTES - used_bytes(data, user))
+def remaining_bytes(data: dict, user: str, quota_bytes: int = QUOTA_BYTES) -> int:
+    """quota_bytes por defecto es QUOTA_BYTES (100GB), pero el llamador
+    puede pasar la cuota real configurada -- ver config.py::DEFAULTS
+    ["reservation_quota_gb"], configuración de servidor en
+    core/server_config.py -- en vez de asumir siempre el valor fijo."""
+    return max(0, quota_bytes - used_bytes(data, user))
 
 
-def fits_in_quota(data: dict, user: str, size_bytes: int) -> bool:
+def fits_in_quota(data: dict, user: str, size_bytes: int, quota_bytes: int = QUOTA_BYTES) -> bool:
     """True si *user* todavía tiene sitio para reservar *size_bytes* más
-    sin superar QUOTA_BYTES. No tiene en cuenta una reserva ya existente
-    de la misma clave (el llamador debe restar su tamaño antes si el
-    tamaño cambió, aunque en la práctica el tamaño de un ítem ya en el FTP
-    no cambia entre un análisis y otro)."""
-    return used_bytes(data, user) + size_bytes <= QUOTA_BYTES
+    sin superar quota_bytes (100GB por defecto si el llamador no pasa la
+    cuota configurada, ver remaining_bytes). No tiene en cuenta una
+    reserva ya existente de la misma clave (el llamador debe restar su
+    tamaño antes si el tamaño cambió, aunque en la práctica el tamaño de
+    un ítem ya en el FTP no cambia entre un análisis y otro)."""
+    return used_bytes(data, user) + size_bytes <= quota_bytes
 
 
 def is_name_taken(data: dict, name: str, exclude: Optional[str] = None) -> bool:

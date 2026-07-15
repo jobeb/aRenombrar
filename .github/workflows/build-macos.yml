@@ -26,14 +26,20 @@ jobs:
       - name: Compilar con PyInstaller
         run: pyinstaller aRenombrar.spec
 
+      - name: Leer versión de core/version.py
+        id: version
+        run: |
+          VERSION=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('core/version.py', encoding='utf-8').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Empaquetar en DMG
         run: |
           mkdir dmg_root
           cp -R dist/aRenombrar.app dmg_root/
           ln -s /Applications dmg_root/Applications
-          hdiutil create -volname aRenombrar -srcfolder dmg_root -ov -format UDZO aRenombrar.dmg
+          hdiutil create -volname aRenombrar -srcfolder dmg_root -ov -format UDZO "aRenombrar_${{ steps.version.outputs.version }}.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
           name: aRenombrar-macos
-          path: aRenombrar/aRenombrar.dmg
+          path: aRenombrar/aRenombrar_${{ steps.version.outputs.version }}.dmg

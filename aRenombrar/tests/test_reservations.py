@@ -80,6 +80,20 @@ def test_fits_in_quota_exact_boundary_is_allowed():
     assert fits_in_quota(data, "Jose", 50 * _GB) is True
 
 
+def test_remaining_bytes_respects_configured_quota_override():
+    custom_quota = 200 * _GB
+    data = add_reservation({}, "tv", 1, "A", 150 * _GB, "Jose")
+    assert remaining_bytes(data, "Jose", quota_bytes=custom_quota) == 50 * _GB
+
+
+def test_fits_in_quota_respects_configured_quota_override():
+    custom_quota = 200 * _GB
+    data = add_reservation({}, "tv", 1, "A", 150 * _GB, "Jose")
+    # No cabria con la cuota por defecto (100GB), pero si con una mayor configurada
+    assert fits_in_quota(data, "Jose", 40 * _GB) is False
+    assert fits_in_quota(data, "Jose", 40 * _GB, quota_bytes=custom_quota) is True
+
+
 def test_fits_in_quota_ignores_other_users_reservations():
     data = add_reservation({}, "tv", 1, "A", QUOTA_BYTES, "Ana")
     assert fits_in_quota(data, "Jose", QUOTA_BYTES) is True

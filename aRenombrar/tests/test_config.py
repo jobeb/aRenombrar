@@ -9,6 +9,12 @@ def test_tmdb_api_key_default_is_empty():
     assert DEFAULTS["tmdb_api_key"] == ""
 
 
+def test_reservation_quota_gb_default_is_100():
+    """Cuota de reservas configurable (ver core/reservations.py) -- 100GB
+    por defecto, igual que la constante QUOTA_BYTES que sustituye."""
+    assert DEFAULTS["reservation_quota_gb"] == 100
+
+
 class _FakeKeyring:
     """Backend de keyring en memoria: evita tocar el almacén de credenciales
     real del sistema operativo durante los tests."""
@@ -142,6 +148,42 @@ def test_plex_and_jellyfin_credentials_persist_across_reload(tmp_path, monkeypat
 def test_media_server_refresh_disabled_by_default():
     assert DEFAULTS["plex_enabled"] is False
     assert DEFAULTS["jellyfin_enabled"] is False
+
+
+def test_watch_sync_user_mappings_default_is_empty():
+    assert DEFAULTS["watch_sync_user_mappings"] == []
+    assert DEFAULTS["watch_sync_last_run_ts"] == 0
+
+
+def test_watch_sync_schedule_disabled_by_default():
+    assert DEFAULTS["watch_sync_schedule_enabled"] is False
+    assert DEFAULTS["watch_sync_schedule_time"] == ""
+
+
+def test_watch_sync_schedule_persists_across_reload(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)
+    cfg1 = Config()
+    cfg1.set("watch_sync_schedule_enabled", True)
+    cfg1.set("watch_sync_schedule_time", "03:30")
+    cfg1.save()
+
+    cfg2 = Config()
+    assert cfg2.get("watch_sync_schedule_enabled") is True
+    assert cfg2.get("watch_sync_schedule_time") == "03:30"
+
+
+def test_watch_sync_user_mappings_persist_across_reload(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)
+    mapping = [{"plex_user_id": "1", "plex_user_name": "Jose",
+                "jellyfin_user_id": "abc", "jellyfin_user_name": "Jobeb"}]
+    cfg1 = Config()
+    cfg1.set("watch_sync_user_mappings", mapping)
+    cfg1.set("watch_sync_last_run_ts", 12345)
+    cfg1.save()
+
+    cfg2 = Config()
+    assert cfg2.get("watch_sync_user_mappings") == mapping
+    assert cfg2.get("watch_sync_last_run_ts") == 12345
     assert DEFAULTS["plex_token"] == ""
     assert DEFAULTS["jellyfin_api_key"] == ""
 

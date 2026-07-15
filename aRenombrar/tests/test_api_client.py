@@ -55,6 +55,16 @@ def test_detect_anime_cap_spanish():
     assert r["media_type"] == "anime"
 
 
+def test_detect_anime_isolated_number_at_end_of_name():
+    # "NSCast - 320.mp4": el número va pegado al final del nombre (sin
+    # separador tras él, solo la extensión) -- caso real visto en release
+    # groups de anime que antes se quedaba sin season/episode reconocido.
+    r = detect_episode("NSCast - 320.mp4")
+    assert r["season"] == 1
+    assert r["episode"] == 320
+    assert r["media_type"] == "anime"
+
+
 def test_detect_movie_fallback_strips_year():
     r = detect_episode("The.Dark.Knight.2008.1080p.BluRay.x264.mkv")
     assert r["title"] == "The Dark Knight"

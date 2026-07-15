@@ -578,3 +578,278 @@ def test_get_plex_usage_stats_sums_episode_sizes_per_show_via_section_listing(mo
     monkeypatch.setattr(msr.requests, "get", _fake_get)
     stats = msr.get_plex_usage_stats("http://plex:32400", "tok123")
     assert stats["s1"]["size_bytes"] == 2_200_000_000
+
+
+# ── Sincronizar visionado por usuario (core/watch_sync.py) ─────────────────
+
+class _FakePlexUser:
+    def __init__(self, id, title, token=None, token_error=None):
+        self.id = id
+        self.title = title
+        self._token = token
+        self._token_error = token_error
+
+    def get_token(self, machine_identifier):
+        if self._token_error:
+            raise self._token_error
+        return self._token
+
+
+class _FakeMyPlexAccount:
+    def __init__(self, users, token=None):
+        self._users = users
+
+    def users(self):
+        return self._users
+
+
+class _FakeEpisode:
+    def __init__(self, parent_index, index, watched, rating_key="ep1"):
+        self.parentIndex = parent_index
+        self.index = index
+        self.isWatched = watched
+        self.ratingKey = rating_key
+
+
+class _FakeShow:
+    def __init__(self, episodes):
+        self._episodes = episodes
+
+    def episodes(self):
+        return self._episodes
+
+
+class _FakeGuid:
+    def __init__(self, id):
+        self.id = id
+
+
+class _FakeMovie:
+    def __init__(self, guids, watched, rating_key="m1", title="Peli"):
+        self.guids = guids
+        self.isWatched = watched
+        self.ratingKey = rating_key
+        self.title = title
+        self.marked_watched = False
+
+    def markWatched(self):
+        self.marked_watched = True
+
+
+class _FakeSection:
+    def __init__(self, type_, items):
+        self.type = type_
+        self._items = items
+
+    def all(self):
+        return self._items
+
+
+class _FakeLibrary:
+    def __init__(self, sections):
+        self._sections = sections
+
+    def sections(self):
+        return self._sections
+
+
+class _FakePlexServer:
+    def __init__(self, baseurl, token, fetch_item=None, sections=None,
+                 machine_identifier="mach1"):
+        self._baseurl = baseurl
+        self.token = token
+        self.machineIdentifier = machine_identifier
+        self._fetch_item = fetch_item
+        self.library = _FakeLibrary(sections or [])
+
+    def fetchItem(self, key):
+        if self._fetch_item is None:
+            raise RuntimeError("item no encontrado")
+        return self._fetch_item
+
+
+def test_get_plex_home_users_without_config_returns_none():
+    assert msr.get_plex_home_users("", "") is None
+
+
+def test_get_plex_home_users_returns_id_and_title(monkeypatch):
+    users = [_FakePlexUser("1", "Ana"), _FakePlexUser("2", "Bruno")]
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(users))
+    result = msr.get_plex_home_users("http://plex:32400", "owner_tok")
+    assert result == [{"id": "1", "title": "Ana"}, {"id": "2", "title": "Bruno"}]
+
+
+def test_get_plex_home_users_returns_none_on_failure(monkeypatch):
+    def _raise(token):
+        raise RuntimeError("plex.tv caido")
+    monkeypatch.setattr(msr, "MyPlexAccount", _raise)
+    assert msr.get_plex_home_users("http://plex:32400", "owner_tok") is None
+
+
+def test_get_plex_user_token_without_config_returns_none():
+    assert msr.get_plex_user_token("", "", "1") is None
+
+
+def test_get_plex_user_token_returns_token_for_matching_user(monkeypatch):
+    users = [_FakePlexUser("1", "Ana", token="tok_ana"), _FakePlexUser("2", "Bruno", token="tok_bruno")]
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(users))
+    monkeypatch.setattr(msr, "PlexServer", lambda baseurl, token: _FakePlexServer(baseurl, token))
+    assert msr.get_plex_user_token("http://plex:32400", "owner_tok", "2") == "tok_bruno"
+
+
+def test_get_plex_user_token_returns_none_when_user_not_found(monkeypatch):
+    users = [_FakePlexUser("1", "Ana", token="tok_ana")]
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(users))
+    monkeypatch.setattr(msr, "PlexServer", lambda baseurl, token: _FakePlexServer(baseurl, token))
+    assert msr.get_plex_user_token("http://plex:32400", "owner_tok", "no_existe") is None
+
+
+def test_get_plex_user_token_returns_none_when_switch_fails(monkeypatch):
+    """Caso PIN-protegido u otro fallo del cambio de usuario -- se trata
+    igual que "no disponible", nunca lanza."""
+    users = [_FakePlexUser("1", "Ana", token_error=RuntimeError("necesita PIN"))]
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(users))
+    monkeypatch.setattr(msr, "PlexServer", lambda baseurl, token: _FakePlexServer(baseurl, token))
+    assert msr.get_plex_user_token("http://plex:32400", "owner_tok", "1") is None
+
+
+def test_get_plex_episode_watched_without_config_returns_none():
+    assert msr.get_plex_episode_watched("", "", "100") is None
+
+
+def test_get_plex_episode_watched_parses_season_episode_and_watched(monkeypatch):
+    episodes = [
+        _FakeEpisode(1, 1, True, rating_key="e11"),
+        _FakeEpisode(1, 2, False, rating_key="e12"),
+        _FakeEpisode(None, None, False),   # especial sin numero -- se ignora
+    ]
+    show = _FakeShow(episodes)
+    monkeypatch.setattr(msr, "PlexServer",
+                         lambda baseurl, token: _FakePlexServer(baseurl, token, fetch_item=show))
+    result = msr.get_plex_episode_watched("http://plex:32400", "user_tok", "100")
+    assert result == {
+        (1, 1): {"watched": True, "ref": "e11"},
+        (1, 2): {"watched": False, "ref": "e12"},
+    }
+
+
+def test_get_plex_movie_watched_without_config_returns_none():
+    assert msr.get_plex_movie_watched("", "") is None
+
+
+def test_get_plex_movie_watched_parses_tmdb_id_and_watched(monkeypatch):
+    movies = [
+        _FakeMovie([_FakeGuid("tmdb://111"), _FakeGuid("imdb://tt1")], True, rating_key="m111", title="Peli Uno"),
+        _FakeMovie([_FakeGuid("tmdb://222")], False, rating_key="m222", title="Peli Dos"),
+        _FakeMovie([_FakeGuid("imdb://tt3")], True),   # sin tmdb_id -- se excluye
+    ]
+    sections = [_FakeSection("movie", movies), _FakeSection("show", [])]
+    monkeypatch.setattr(msr, "PlexServer",
+                         lambda baseurl, token: _FakePlexServer(baseurl, token, sections=sections))
+    result = msr.get_plex_movie_watched("http://plex:32400", "user_tok")
+    assert result == {
+        111: {"watched": True, "ref": "m111", "name": "Peli Uno"},
+        222: {"watched": False, "ref": "m222", "name": "Peli Dos"},
+    }
+
+
+def test_mark_plex_watched_without_config_returns_false():
+    assert msr.mark_plex_watched("", "", "100") is False
+
+
+def test_mark_plex_watched_calls_markwatched_on_correct_item(monkeypatch):
+    movie = _FakeMovie([], False)
+    monkeypatch.setattr(msr, "PlexServer",
+                         lambda baseurl, token: _FakePlexServer(baseurl, token, fetch_item=movie))
+    assert msr.mark_plex_watched("http://plex:32400", "user_tok", "100") is True
+    assert movie.marked_watched is True
+
+
+def test_mark_plex_watched_returns_false_on_failure(monkeypatch):
+    monkeypatch.setattr(msr, "PlexServer",
+                         lambda baseurl, token: _FakePlexServer(baseurl, token, fetch_item=None))
+    assert msr.mark_plex_watched("http://plex:32400", "user_tok", "100") is False
+
+
+def test_get_jellyfin_users_without_config_returns_none():
+    assert msr.get_jellyfin_users("", "") is None
+
+
+def test_get_jellyfin_users_returns_id_and_name(monkeypatch):
+    payload = [{"Id": "a1", "Name": "Ana"}, {"Id": "b2", "Name": "Bruno"}]
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    assert msr.get_jellyfin_users("http://jf:8096", "key") == [
+        {"id": "a1", "name": "Ana"}, {"id": "b2", "name": "Bruno"}]
+
+
+def test_get_jellyfin_episode_watched_without_config_returns_none():
+    assert msr.get_jellyfin_episode_watched("", "", "u1", "s1") is None
+
+
+def test_get_jellyfin_episode_watched_parses_userdata_played(monkeypatch):
+    payload = {"Items": [
+        {"Id": "ep11", "ParentIndexNumber": 1, "IndexNumber": 1, "UserData": {"Played": True}},
+        {"Id": "ep12", "ParentIndexNumber": 1, "IndexNumber": 2, "UserData": {"Played": False}},
+        {"Id": "ep_x", "ParentIndexNumber": None, "IndexNumber": None, "UserData": {"Played": True}},
+    ]}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    result = msr.get_jellyfin_episode_watched("http://jf:8096", "key", "u1", "s1")
+    assert result == {
+        (1, 1): {"watched": True, "ref": "ep11"},
+        (1, 2): {"watched": False, "ref": "ep12"},
+    }
+
+
+def test_get_jellyfin_movie_watched_without_config_returns_none():
+    assert msr.get_jellyfin_movie_watched("", "", "u1") is None
+
+
+def test_get_jellyfin_movie_watched_parses_tmdb_and_played(monkeypatch):
+    payload = {"Items": [
+        {"Id": "mv111", "Name": "Peli Uno", "ProviderIds": {"Tmdb": "111"}, "UserData": {"Played": True}},
+        {"Id": "mv222", "Name": "Peli Dos", "ProviderIds": {"Tmdb": "222"}, "UserData": {"Played": False}},
+        {"Id": "mv_x", "Name": "Sin Tmdb", "ProviderIds": {}, "UserData": {"Played": True}},   # se excluye
+    ]}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    result = msr.get_jellyfin_movie_watched("http://jf:8096", "key", "u1")
+    assert result == {
+        111: {"watched": True, "ref": "mv111", "name": "Peli Uno"},
+        222: {"watched": False, "ref": "mv222", "name": "Peli Dos"},
+    }
+
+
+def test_mark_jellyfin_watched_without_config_returns_false():
+    assert msr.mark_jellyfin_watched("", "", "u1", "item1") is False
+
+
+def test_mark_jellyfin_watched_success(monkeypatch):
+    monkeypatch.setattr(msr.requests, "post", lambda *a, **kw: _FakeResponse(status=200))
+    assert msr.mark_jellyfin_watched("http://jf:8096", "key", "u1", "item1") is True
+
+
+def test_mark_jellyfin_watched_returns_false_on_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "post", _raise)
+    assert msr.mark_jellyfin_watched("http://jf:8096", "key", "u1", "item1") is False
+
+
+def test_verify_jellyfin_password_without_config_returns_false():
+    assert msr.verify_jellyfin_password("", "", "") is False
+
+
+def test_verify_jellyfin_password_true_on_200(monkeypatch):
+    monkeypatch.setattr(msr.requests, "post", lambda *a, **kw: _FakeResponse(status=200))
+    assert msr.verify_jellyfin_password("http://jf:8096", "Jose", "correcta") is True
+
+
+def test_verify_jellyfin_password_false_on_401(monkeypatch):
+    monkeypatch.setattr(msr.requests, "post", lambda *a, **kw: _FakeResponse(status=401))
+    assert msr.verify_jellyfin_password("http://jf:8096", "Jose", "incorrecta") is False
+
+
+def test_verify_jellyfin_password_false_on_network_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "post", _raise)
+    assert msr.verify_jellyfin_password("http://jf:8096", "Jose", "correcta") is False

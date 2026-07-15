@@ -750,6 +750,15 @@ class App(_AppBase):
         _mark("_setup_tray()")
         self._load_session()   # restaurar lista de archivos de la sesión anterior
         _mark("_load_session()")
+        # Sincronización de visionado programada -- a diferencia de
+        # AutoWatcher (que solo arranca si se inicia minimizado o al
+        # pulsar "Auto"), este hilo se arranca SIEMPRE: una hora
+        # programada tiene que poder saltar sin importar cómo se abrió
+        # la ventana esta vez. No hace nada si no hay programación
+        # activada (comprueba config_data en caliente cada minuto, ver
+        # _check_watch_sync_schedule).
+        self._start_watch_sync_scheduler()
+        _mark("_start_watch_sync_scheduler()")
         self._cleanup_stale_uploading_marks()   # ver docstring: limpia marcas "subiendo" de una sesión anterior cerrada a medias
         _mark("_cleanup_stale_uploading_marks()")
         # Antes, el indicador de espacio libre del toolbar solo se rellenaba
@@ -781,6 +790,12 @@ class App(_AppBase):
 
         self.after(3000, self._refresh_ftp_space_at_startup)
         self.after(3500, self._check_for_updates_at_startup)
+        # Configuración compartida del servidor (TMDB/IA, plantillas,
+        # categorías, servidores de medios, enlaces, cuota de reservas...)
+        # -- ver core/server_config.py. Silencioso si no hay ruta
+        # configurada o la descarga falla; los valores locales se quedan
+        # como estaban.
+        self.after(2200, self._sync_server_config_from_ftp)
         # Detector de episodios que faltan: comprobación periódica en
         # segundo plano (silenciosa, sin diálogo) para que la caché esté ya
         # al día cuando el usuario abra el diálogo a mano -- ver
@@ -886,6 +901,16 @@ class App(_AppBase):
         self._protected_visible = False
         self._build_protected_tab(self._protected_frame)
         self._startup_mark("  _build_protected_tab()")
+
+        # Sincronizar visionado -- pestaña principal, igual que Archivos/
+        # Episodios/etc (el emparejamiento de usuarios y la programación
+        # horaria viven aparte, en Configuración → Cliente -- ver
+        # _build_watch_sync_config_tab).
+        self._watch_sync_top_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
+        self._watch_sync_top_frame.grid_columnconfigure(0, weight=1)
+        self._watch_sync_top_visible = False
+        self._build_watch_sync_top_tab(self._watch_sync_top_frame)
+        self._startup_mark("  _build_watch_sync_top_tab()")
 
         self._build_status_bar()
         self._startup_mark("  _build_status_bar()")
@@ -1170,7 +1195,7 @@ class App(_AppBase):
                 fname = entry.new_name or entry.name
                 self._send_notification("aRenombrar — Subida completada", fname)
                 # Guardar en historial (modo automático)
-                self._save_history_entry(fname, path, "ok", 0)
+                self._save_history_entry(fname, path, "ok", 0, local_path=path)
                 self._remove_uploaded_episode_from_missing_list(entry.media_info)
                 self._refresh_ftp_space()
 
@@ -1206,6 +1231,7 @@ class App(_AppBase):
         "cleanup": "🗑 Liberar espacio",
         "protected": "🔒 Protegidos",
         "history": "📋 Historial",
+        "watch_sync": "🔄 Sincronizar visionado",
         "config": "⚙ Configuración",
     }
 
@@ -1220,6 +1246,8 @@ class App(_AppBase):
             return "cleanup"
         if self._protected_visible:
             return "protected"
+        if self._watch_sync_top_visible:
+            return "watch_sync"
         return "files"
 
     def _on_nav_segment_changed(self, value):
@@ -1280,6 +1308,9 @@ class App(_AppBase):
         elif self._protected_visible:
             self._protected_frame.grid_remove()
             self._protected_visible = False
+        elif self._watch_sync_top_visible:
+            self._watch_sync_top_frame.grid_remove()
+            self._watch_sync_top_visible = False
         else:
             self._files_frame.grid_remove()
 
@@ -1305,6 +1336,10 @@ class App(_AppBase):
             self._protected_visible = True
             self._render_protected_table()   # con lo que haya en el mirror local, sin esperar al FTP
             self._sync_reservations_from_ftp()
+        elif view_key == "watch_sync":
+            self._watch_sync_top_frame.grid(row=0, column=0, sticky="nsew")
+            self._watch_sync_top_visible = True
+            self._refresh_watch_sync_history_view()   # por si hay sincronizaciones nuevas desde la última vez
         elif view_key == "config":
             if not self._config_panel_built:
                 # Construcción diferida hasta la primera visita real --
@@ -1760,6 +1795,26 @@ class App(_AppBase):
         self._refresh_ftp_space()
         self._prefetch_ftp_category_dirs()
 
+    def _shared_data_path(self, filename: str) -> str:
+        """Ruta remota de *filename* dentro de la carpeta compartida (ver
+        "Carpeta compartida (datos)" en Ajustes -> Cliente -> Conexión
+        FTP, shared_data_ftp_path) -- favoritos, reservas y configuración
+        de servidor son 3 archivos independientes con nombre fijo dentro
+        de esa misma carpeta, no derivados unos de otros por sufijo (así
+        se llamaban todos "favoritos_algo.json" antes, aunque no tuvieran
+        nada que ver con favoritos -- ver el nombre de archivo de cada
+        uno en _favorites_remote_path/_reservations_remote_path/
+        _server_config_remote_path). "" si no hay carpeta configurada
+        (las 3 funciones quedan deshabilitadas, cada mirror local se
+        queda con el último estado conocido)."""
+        folder = self.config_data.get("shared_data_ftp_path", "").strip()
+        if not folder:
+            return ""
+        return f"{folder.rstrip('/')}/{filename}"
+
+    def _favorites_remote_path(self) -> str:
+        return self._shared_data_path("aRenombrar_favoritos.json")
+
     def _is_favorite(self, media_type: str, tmdb_id: int) -> bool:
         from core.favorites import is_favorite
         return is_favorite(self._favorites, media_type, tmdb_id)
@@ -1783,7 +1838,7 @@ class App(_AppBase):
         if on_done:
             on_done()
 
-        remote_path = self.config_data.get("shared_data_ftp_path", "")
+        remote_path = self._favorites_remote_path()
         if not remote_path:
             return
 
@@ -1840,7 +1895,7 @@ class App(_AppBase):
         para reflejar cambios hechos desde otro cliente del mismo servidor.
         Silencioso si no hay ruta configurada o la conexión falla: el mirror
         local ya tiene el último estado conocido."""
-        remote_path = self.config_data.get("shared_data_ftp_path", "")
+        remote_path = self._favorites_remote_path()
         if not remote_path:
             return
 
@@ -1872,18 +1927,136 @@ class App(_AppBase):
         threading.Thread(target=worker, daemon=True).start()
 
     def _reservations_remote_path(self) -> str:
-        """Ruta remota del JSON de reservas -- un archivo hermano junto al
-        de favoritos (shared_data_ftp_path), no un campo de ajustes propio:
-        reservas y favoritos comparten la misma conexión/carpeta FTP, así
-        que basta con una única ruta configurada por el usuario. "" si no
-        hay ruta de favoritos configurada (reservas también deshabilitadas)."""
-        base = self.config_data.get("shared_data_ftp_path", "").strip()
-        if not base:
-            return ""
-        if "." in base.rsplit("/", 1)[-1]:
-            root, ext = base.rsplit(".", 1)
-            return f"{root}_reservas.{ext}"
-        return base + "_reservas"
+        """Ruta remota del JSON de reservas -- archivo propio dentro de la
+        carpeta compartida (ver _shared_data_path), no un campo de ajustes
+        aparte: reservas, favoritos y configuración de servidor comparten
+        la misma conexión/carpeta FTP, así que basta con una única ruta
+        (de carpeta) configurada por el usuario."""
+        return self._shared_data_path("aRenombrar_reservas.json")
+
+    def _server_config_remote_path(self) -> str:
+        """Ruta remota de la configuración compartida del servidor (ver
+        core/server_config.py) -- archivo propio dentro de la misma
+        carpeta compartida, mismo motivo que _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_config_servidor.json")
+
+    def _sync_server_config_from_ftp(self):
+        """Descarga la configuración compartida del servidor y la aplica en
+        local (TMDB/IA, plantillas, categorías, servidores de medios,
+        enlaces, cuota de reservas... ver
+        core/server_config.py::SHARED_CONFIG_KEYS) -- se llama una vez al
+        arrancar. Silencioso si no hay ruta configurada, la descarga falla,
+        o el archivo remoto todavía no existe (nadie lo ha publicado
+        nunca): los valores locales se quedan como estaban, no es un
+        error."""
+        remote_path = self._server_config_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.server_config import filter_shared_config
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                updates = filter_shared_config(remote_data)
+                # learned_junk_terms no es una clave de Config -- vive en
+                # core/learned_terms.py, se gestiona aparte (igual que en
+                # _export_config/_import_config).
+                learned_terms = remote_data.get("learned_junk_terms")
+                if updates or learned_terms is not None:
+                    self.after(0, lambda: self._apply_synced_server_config(updates, learned_terms))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_server_config(self, updates: dict, learned_terms=None):
+        self.config_data.set_many(updates)
+        self.config_data.save()
+        if learned_terms is not None:
+            from core.learned_terms import set_learned_terms
+            set_learned_terms(learned_terms)
+        # El panel de Ajustes se construye diferido (ver _build_ui) -- si
+        # el usuario nunca lo ha abierto todavía, no hay widgets que
+        # refrescar; se leerán ya actualizados de self.config_data la
+        # primera vez que se construya.
+        if self._config_panel_built:
+            self._reload_settings_widgets()
+        self._set_status(
+            f"Configuración de servidor actualizada ({len(updates)} parámetro(s))", PENDING_COLOR)
+
+    def _publish_server_config(self):
+        """Sube la configuración de ESTE equipo como la configuración
+        compartida del servidor -- a diferencia de favoritos/reservas
+        (que se fusionan), esto es una publicación deliberada que
+        SOBRESCRIBE por completo lo que hubiera, así que pide confirmación
+        explícita: afecta a cualquier otra persona que use aRenombrar
+        contra este mismo servidor la próxima vez que arranque. Incluye
+        credenciales (TMDB/IA/Plex/Jellyfin) a propósito -- ver la nota de
+        seguridad en core/server_config.py: viajan en texto plano dentro
+        del JSON del FTP, protegidas solo por la contraseña FTP."""
+        remote_path = self._server_config_remote_path()
+        if not remote_path:
+            messagebox.showwarning(
+                "Falta la carpeta compartida",
+                "Configura \"Carpeta compartida (datos)\" en Ajustes → Cliente → Conexión FTP "
+                "antes de publicar la configuración del servidor.")
+            return
+        if not messagebox.askyesno(
+                "Publicar configuración del servidor",
+                "Esto sobrescribirá la configuración compartida (TMDB/IA -- incluidas las claves de "
+                "API --, plantillas de nombre, categorías FTP, Plex/Jellyfin -- incluidos sus tokens --, "
+                "enlaces y la cuota de reservas) con la de este equipo. Cualquier otra persona que use "
+                "aRenombrar contra este servidor la adoptará la próxima vez que abra la app. "
+                "¿Continuar?"):
+            return
+
+        from core.server_config import extract_shared_config
+        from core.learned_terms import load_learned_terms
+        data = extract_shared_config(self.config_data.get)
+        data["learned_junk_terms"] = load_learned_terms()
+        self._set_status("Publicando configuración del servidor...", PENDING_COLOR)
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    self.after(0, lambda: self._set_status(f"No se pudo conectar: {msg}", ERROR_COLOR))
+                    return
+                payload = _json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, up_msg = own_ftp.upload_bytes(payload, remote_path)
+            finally:
+                own_ftp.disconnect()
+            if up_ok:
+                self.after(0, lambda: self._set_status("Configuración de servidor publicada", SUCCESS_COLOR))
+            else:
+                self.after(0, lambda: self._set_status(f"No se pudo publicar: {up_msg}", ERROR_COLOR))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _is_reserved(self, media_type: str, tmdb_id: int) -> bool:
         from core.reservations import is_reserved
@@ -1893,15 +2066,23 @@ class App(_AppBase):
         from core.reservations import reserved_by
         return reserved_by(self._reservations, media_type, tmdb_id)
 
+    def _reservation_quota_bytes(self) -> int:
+        """Cuota de reservas configurada, en bytes -- configuración de
+        SERVIDOR (ver core/server_config.py), 100GB por defecto si nunca
+        se ha sincronizado/publicado nada (config.py::DEFAULTS
+        ["reservation_quota_gb"])."""
+        return int(self.config_data.get("reservation_quota_gb", 100)) * 1024 ** 3
+
     def _toggle_reservation(self, media_type: str, tmdb_id: int, name: str,
                              size_bytes: int, on_done=None):
         """Reserva/libera un ítem -- mismo patrón optimista+sync que
         _toggle_favorite, pero con dos comprobaciones previas que favoritos
         no necesita: (1) hace falta un nombre de usuario configurado, para
         saber a quién cargarle la cuota; (2) al reservar, el usuario debe
-        tener sitio en su cuota de 100GB; al liberar, solo el usuario que
-        la reservó puede hacerlo (sin esto, cualquier cliente podría
-        liberar por error el hueco de otra persona)."""
+        tener sitio en su cuota (configurable, ver _reservation_quota_bytes);
+        al liberar, solo el usuario que la reservó puede hacerlo (sin esto,
+        cualquier cliente podría liberar por error el hueco de otra
+        persona)."""
         from core.reservations import (
             add_reservation, remove_reservation, fits_in_quota, remaining_bytes, reserved_by)
 
@@ -1910,16 +2091,18 @@ class App(_AppBase):
             messagebox.showwarning(
                 "Falta tu nombre",
                 "Configura \"Tu nombre\" en Ajustes → Conexión FTP antes de reservar espacio, "
-                "así se sabe a quién cargarle la cuota de 100GB.")
+                "así se sabe a quién cargarle la cuota.")
             return
 
+        quota_bytes = self._reservation_quota_bytes()
         turning_on = not self._is_reserved(media_type, tmdb_id)
         if turning_on:
-            if not fits_in_quota(self._reservations, user, size_bytes):
-                remaining_gb = remaining_bytes(self._reservations, user) / (1024 ** 3)
+            if not fits_in_quota(self._reservations, user, size_bytes, quota_bytes):
+                remaining_gb = remaining_bytes(self._reservations, user, quota_bytes) / (1024 ** 3)
+                quota_gb = quota_bytes / (1024 ** 3)
                 messagebox.showwarning(
                     "Cuota de reservas agotada",
-                    f"Te quedan {remaining_gb:.1f}GB libres de tu cuota de 100GB -- "
+                    f"Te quedan {remaining_gb:.1f}GB libres de tu cuota de {quota_gb:.0f}GB -- "
                     f"\"{name}\" no cabe. Libera alguna reserva antes de añadir otra.")
                 return
             op, args = add_reservation, (media_type, tmdb_id, name, size_bytes, user)
@@ -2591,7 +2774,7 @@ class App(_AppBase):
             self._mark_auto_processed(entry.path, "subido", entry.new_name)
             self._save_history_entry(
                 entry.new_name or Path(entry.path).name,
-                remote_file, "ok", size)
+                remote_file, "ok", size, local_path=entry.path)
             _log.info("Subida: OK %r (%s)", remote_filename, _fmt_size(size))
             from core.media_server_refresh import trigger_refresh
             trigger_refresh(self.config_data)
@@ -2616,7 +2799,7 @@ class App(_AppBase):
             self._upload_cancel.set()
             self._save_history_entry(
                 entry.new_name or Path(entry.path).name,
-                remote_file, "error", size, error_msg=entry.error_msg)
+                remote_file, "error", size, error_msg=entry.error_msg, local_path=entry.path)
             _log.error("Subida: disco lleno en servidor, cancelando %r", remote_filename)
         else:
             entry.status = "error"
@@ -2630,7 +2813,7 @@ class App(_AppBase):
             self._ftp_row_set(entry, "Error", 0, 0)
             self._save_history_entry(
                 entry.new_name or Path(entry.path).name,
-                remote_file, "error", size, error_msg=entry.error_msg)
+                remote_file, "error", size, error_msg=entry.error_msg, local_path=entry.path)
             _log.error("Subida: ERROR %r — %s", remote_filename, entry.error_msg)
 
         if not ok:
@@ -2896,17 +3079,37 @@ class App(_AppBase):
         self._cfg_font_small_bold = ctk.CTkFont(size=12, weight="bold")
         self._cfg_font_desc = ctk.CTkFont(size=11)
 
+        # División visual Cliente/Servidor -- ver core/server_config.py::
+        # SHARED_CONFIG_KEYS para qué claves son de cada lado. "Cliente":
+        # cada equipo/persona la suya, nunca se toca al sincronizar ni al
+        # publicar. "Servidor": debe ser igual para todo el que use
+        # aRenombrar contra este mismo FTP, se sincroniza sola al arrancar
+        # y "Publicar" (cabecera de esta pestaña, ver
+        # _build_server_publish_header) la sobrescribe para todos.
         tabs = ctk.CTkTabview(panel)
         tabs.grid(row=0, column=0, sticky="nsew")
         self._config_tabs = tabs
 
-        self._build_general_tab(tabs.add("General"))
-        self._build_ftp_connection_tab(tabs.add("Conexión FTP"))
-        self._build_tmdb_tab(tabs.add("TMDB / IA"))
-        self._build_templates_tab(tabs.add("Plantillas"))
-        self._build_ftp_categories_section(tabs.add("Categorías"))
-        self._build_media_servers_section(tabs.add("Servidores de medios"))
-        self._build_config_transfer_section(tabs.add("Copia de seguridad"))
+        client_tab = tabs.add("🖥 Cliente")
+        server_tab = tabs.add("🌐 Servidor")
+
+        client_tabs = ctk.CTkTabview(client_tab)
+        client_tabs.pack(fill="both", expand=True)
+        self._build_general_tab(client_tabs.add("General"))
+        self._build_ftp_connection_tab(client_tabs.add("Conexión FTP"))
+        self._build_watch_sync_config_tab(client_tabs.add("Sincronizar visionado"))
+        self._build_config_transfer_section(client_tabs.add("Copia de seguridad"))
+
+        server_wrap = ctk.CTkFrame(server_tab, fg_color="transparent")
+        server_wrap.pack(fill="both", expand=True)
+        self._build_server_publish_header(server_wrap)
+        server_tabs = ctk.CTkTabview(server_wrap)
+        server_tabs.pack(fill="both", expand=True)
+        self._build_tmdb_tab(server_tabs.add("TMDB / IA"))
+        self._build_templates_tab(server_tabs.add("Plantillas"))
+        self._build_ftp_categories_section(server_tabs.add("Categorías"))
+        self._build_media_servers_section(server_tabs.add("Servidores de medios"))
+        self._build_reservation_quota_tab(server_tabs.add("Reservas"))
 
         ctk.CTkLabel(panel, text=f"aRenombrar v{__version__}",
                      text_color=PENDING_COLOR, font=self._cfg_font_desc).grid(
@@ -2998,24 +3201,23 @@ class App(_AppBase):
         if self.config_data.get("desktop_notifications", True):
             self._notif_switch.select()
 
-        # Renombrar en origen / destino (aplica también a la subida manual)
+        # Renombrar en origen (aplica también a la subida manual) -- el
+        # renombrado en destino/FTP es configuración de SERVIDOR (afecta a
+        # lo que ve todo el mundo en el servidor compartido), se configura
+        # junto a las plantillas en Servidor -> Plantillas, ver
+        # _build_templates_tab.
         self._rename_local_switch = ctk.CTkSwitch(
             auto_fr, text="Renombrar archivos en origen (local)")
         self._rename_local_switch.grid(row=8, column=0, columnspan=4, pady=(8, 2))
         if self.config_data.get("rename_local", True):
             self._rename_local_switch.select()
 
-        self._rename_remote_switch = ctk.CTkSwitch(
-            auto_fr, text="Renombrar archivos en destino (FTP)")
-        self._rename_remote_switch.grid(row=9, column=0, columnspan=4, pady=(2, 4))
-        if self.config_data.get("rename_remote", True):
-            self._rename_remote_switch.select()
-
         ctk.CTkLabel(auto_fr,
-                     text="Si desactivas ambos, los archivos conservan su nombre original — solo se organizan\n"
-                          "en carpetas por serie/temporada según TMDB. Afecta a la subida automática y manual.",
+                     text="Si lo desactivas, los archivos locales conservan su nombre original al\n"
+                          "añadirlos o subirlos. El renombrado en el servidor se configura aparte, "
+                          "en Servidor → Plantillas.",
                      font=self._cfg_font_desc, text_color=PENDING_COLOR, justify="center").grid(
-            row=10, column=0, columnspan=4, pady=(0, 12))
+            row=9, column=0, columnspan=4, pady=(0, 12))
 
     def _build_ftp_connection_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -3070,21 +3272,22 @@ class App(_AppBase):
         self._ftp_retries_entry.insert(0, str(self.config_data.get("ftp_retries", 3)))
         self._ftp_retries_entry.grid(row=8, column=1, sticky="w", padx=10, pady=6)
 
-        # Ruta compartida para favoritos y reservas (ver core/favorites.py
-        # y core/reservations.py) -- un único JSON en el FTP que leen/
-        # escriben todos los clientes apuntando al mismo servidor (las
-        # reservas usan un archivo hermano junto a este, ver
-        # _reservations_remote_path). Vacío = favoritos/reservas solo
+        # Carpeta compartida donde viven favoritos/reservas/configuración
+        # de servidor -- una CARPETA, no un archivo (ver _shared_data_path):
+        # dentro se crean 3 archivos con nombre fijo, uno por función
+        # (aRenombrar_favoritos.json, aRenombrar_reservas.json,
+        # aRenombrar_config_servidor.json). Vacío = las 3 funciones solo
         # locales, sin sincronizar.
-        ctk.CTkLabel(conn, text="Ruta compartida (favoritos):").grid(
+        ctk.CTkLabel(conn, text="Carpeta compartida (datos):").grid(
             row=9, column=0, sticky="e", padx=10, pady=6)
         self._shared_data_ftp_path_entry = ctk.CTkEntry(
-            conn, width=200, placeholder_text="/datos2/aRenombrar/favoritos.json")
+            conn, width=200, placeholder_text="/datos2/aRenombrar")
         self._shared_data_ftp_path_entry.insert(0, str(self.config_data.get("shared_data_ftp_path", "")))
         self._shared_data_ftp_path_entry.grid(row=9, column=1, padx=10, pady=6, sticky="ew")
 
-        # Nombre de esta persona -- identifica su cuota de 100GB al
-        # reservar espacio en "Liberar espacio" (ver core/reservations.py).
+        # Nombre de esta persona -- identifica su cuota de reservas (ver
+        # core/reservations.py, tamaño configurable en Servidor ->
+        # reservation_quota_gb) al reservar espacio en "Liberar espacio".
         # Solo hace falta si se van a usar reservas; favoritos no lo
         # necesita (es un concepto sin dueño, compartido por todos).
         ctk.CTkLabel(conn, text="Tu nombre (reservas):").grid(
@@ -3099,6 +3302,999 @@ class App(_AppBase):
         ctk.CTkButton(bf, text="Probar conexión", command=self._test_ftp).pack(side="left", padx=4)
         self._ftp_status = ctk.CTkLabel(conn, text="", text_color=PENDING_COLOR)
         self._ftp_status.grid(row=12, column=0, columnspan=2, pady=4)
+
+    def _build_server_publish_header(self, parent):
+        """Cabecera fija de la super-pestaña "🌐 Servidor" (ver
+        _build_config_panel) -- publica TODAS las claves de servidor a la
+        vez (TMDB/IA, plantillas, categorías, servidores de medios,
+        enlaces, cuota de reservas -- ver
+        core/server_config.py::SHARED_CONFIG_KEYS, incluye credenciales a
+        propósito), así que vive fuera de cualquier sub-pestaña concreta,
+        visible sin importar cuál esté activa. Se sincroniza sola al
+        arrancar; publicar es la única acción manual, y deliberadamente
+        lo es -- sobrescribe lo de todos, no algo para hacer sin querer
+        al guardar Ajustes normales."""
+        ctk.CTkButton(parent, text="📤 Publicar como configuración del servidor", width=280,
+                      fg_color="transparent", border_width=1,
+                      command=self._publish_server_config).pack(pady=(8, 0))
+        ctk.CTkLabel(parent, text="Sube TMDB/IA, plantillas, categorías FTP, Plex/Jellyfin, enlaces "
+                                  "y la cuota de reservas de este equipo (con sus claves y tokens) "
+                                  "para que los adopten los otros clientes de este mismo servidor.",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=380).pack(pady=(0, 8))
+
+    def _build_reservation_quota_tab(self, tab):
+        """Cuánto puede reservar cada persona en "Protegidos" (ver
+        core/reservations.py) para que su contenido nunca aparezca como
+        candidato a borrar en Liberar espacio -- un único límite para
+        todo el que reserve contra este servidor, no una constante fija
+        en el código ni algo que cada persona decida por su cuenta."""
+        scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        fr = ctk.CTkFrame(scroll)
+        fr.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+        fr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(fr, text="Cuota de reservas",
+                     font=self._cfg_font_title).grid(row=0, column=0, pady=(12, 4))
+        ctk.CTkLabel(fr, text="Cuánto puede reservar cada persona en \"Protegidos\" para que su contenido\n"
+                              "nunca aparezca como candidato a borrar en Liberar espacio.",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, justify="center").grid(
+            row=1, column=0, pady=(0, 12))
+
+        quota_row = ctk.CTkFrame(fr, fg_color="transparent")
+        quota_row.grid(row=2, column=0, pady=(0, 16))
+        ctk.CTkLabel(quota_row, text="GB por persona:").pack(side="left", padx=(0, 6))
+        self._reservation_quota_entry = ctk.CTkEntry(quota_row, width=80)
+        self._reservation_quota_entry.insert(0, str(self.config_data.get("reservation_quota_gb", 100)))
+        self._reservation_quota_entry.pack(side="left")
+
+    def _build_watch_sync_config_tab(self, tab):
+        """Configuración de "Sincronizar visionado" (Cliente, no
+        Servidor -- el emparejamiento es conocimiento personal, "qué
+        persona eres tú en cada plataforma", y la config de servidor se
+        aplica SIN revisión en cada arranque, lo que rompería la
+        garantía de revisión humana que tiene el botón manual de esta
+        función -- ver core/server_config.py, sección "Excluido a
+        propósito"). Aquí solo vive el EMPAREJAMIENTO y la programación
+        horaria; el botón de sincronizar y la vista previa viven en la
+        pestaña principal "🔄 Sincronizar visionado" (ver
+        _build_watch_sync_top_tab), igual que Archivos/Episodios/etc.
+
+        UN único scroll para toda la pestaña -- la lista de usuarios
+        emparejados NO tiene scroll propio (frame normal que crece con
+        cada fila añadida, no un TableView con scrollable=True), porque
+        un scroll interno diminuto para una lista de 2-3 personas no
+        sirve de nada; si algún día crece mucho, la usa el scroll de la
+        pestaña."""
+        outer = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        outer.pack(fill="both", expand=True)
+        fr = ctk.CTkFrame(outer, fg_color="transparent")
+        fr.pack(fill="both", expand=True)
+        fr.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(fr, text="Sincronizar visionado", font=self._cfg_font_title).grid(
+            row=0, column=0, pady=(8, 2))
+        ctk.CTkLabel(fr, text="Emparejamiento de usuarios y sincronización automática. El botón "
+                              "manual y la vista previa están en la pestaña \"🔄 Sincronizar "
+                              "visionado\".",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=460,
+                     justify="center").grid(row=1, column=0, pady=(0, 10))
+
+        if not (self.config_data.get("plex_enabled") and self.config_data.get("jellyfin_enabled")):
+            ctk.CTkLabel(fr, text="Activa Plex y Jellyfin en Ajustes → Servidor → \"Servidores de "
+                                  "medios\" para poder usar esta utilidad.",
+                         font=self._cfg_font_desc, text_color=WARNING_COLOR, justify="center").grid(
+                row=2, column=0, pady=(0, 16))
+            return
+
+        # ── Emparejamiento -- SIEMPRE visible, sin botón "editar" (se
+        # reveló como una interacción rara ocultar/mostrar todo el editor
+        # tras un botón). Cada añadir/quitar se aplica y guarda al
+        # instante, no hay paso "Guardar" aparte. Nunca se sugiere una
+        # pareja por nombre parecido -- los nombres no tienen por qué
+        # coincidir entre plataformas. La lista siempre lee directo de
+        # config_data (nunca una copia en memoria aparte), así que
+        # persiste entre reinicios y refleja el último estado guardado
+        # sin ningún paso extra.
+        self._watch_sync_plex_users = []
+        self._watch_sync_jellyfin_users = []
+        self._watch_sync_pending_pair = None   # (plex_user, jf_user) esperando confirmación
+
+        # fg_color="transparent": sin esto, este panel usa el gris por
+        # defecto de CTkFrame, que en modo oscuro es EL MISMO gris que las
+        # filas de la tabla (gray17) -- header, panel y filas se fundían
+        # en un bloque sin distinción. Igual que el "body" transparente
+        # que envuelve la tabla en Episodios que faltan.
+        mapping_fr = ctk.CTkFrame(fr, fg_color="transparent")
+        mapping_fr.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        mapping_fr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(mapping_fr, text="Usuarios emparejados -- se verifica la contraseña de Jellyfin "
+                                      "y se confirma antes de guardar cada pareja.",
+                     font=ctk.CTkFont(size=12, weight="bold"), wraplength=460, justify="center").grid(
+            row=0, column=0, pady=(10, 6), padx=10)
+        self._watch_sync_mapping_status_label = ctk.CTkLabel(
+            mapping_fr, text="Cargando usuarios...", text_color=WARNING_COLOR)
+        self._watch_sync_mapping_status_label.grid(row=1, column=0, pady=(0, 6))
+
+        # Mismo componente TableView que el resto de la app (Archivos/
+        # Episodios/Liberar espacio/Historial), pero scrollable=False --
+        # crece con cada fila añadida en vez de tener su propia barra de
+        # scroll, y se apoya en el scroll general de la pestaña.
+        self._watch_sync_mapping_table = TableView(mapping_fr, scrollable=False, columns=[
+            ColumnSpec("plex", "Usuario Plex", width=180),
+            ColumnSpec("jellyfin", "Usuario Jellyfin", width=180),
+            ColumnSpec("del", "", width=36),
+        ])
+        self._watch_sync_mapping_table.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
+
+        add_row_fr = ctk.CTkFrame(mapping_fr, fg_color="transparent")
+        add_row_fr.grid(row=4, column=0, pady=(0, 4))
+        self._watch_sync_plex_combo = ctk.CTkComboBox(add_row_fr, width=160, values=[], state="readonly")
+        self._watch_sync_plex_combo.pack(side="left", padx=(0, 6))
+        self._watch_sync_jellyfin_combo = ctk.CTkComboBox(add_row_fr, width=160, values=[], state="readonly")
+        self._watch_sync_jellyfin_combo.pack(side="left", padx=(0, 6))
+        self._watch_sync_jellyfin_password_entry = ctk.CTkEntry(
+            add_row_fr, width=140, show="*", placeholder_text="Contraseña Jellyfin")
+        self._watch_sync_jellyfin_password_entry.pack(side="left", padx=(0, 6))
+        self._watch_sync_add_mapping_btn = ctk.CTkButton(
+            add_row_fr, text="+ Añadir", width=90, state="disabled",
+            command=self._start_add_watch_sync_mapping)
+        self._watch_sync_add_mapping_btn.pack(side="left")
+
+        # Paso de confirmación -- oculto hasta que la contraseña de
+        # Jellyfin se verifica correctamente. Nunca se añade una pareja
+        # sin este paso explícito, aunque la contraseña sea correcta.
+        self._watch_sync_confirm_frame = ctk.CTkFrame(mapping_fr, fg_color="transparent")
+        self._watch_sync_confirm_frame.grid(row=5, column=0, pady=(0, 8))
+        self._watch_sync_confirm_frame.grid_remove()
+        self._watch_sync_confirm_label = ctk.CTkLabel(
+            self._watch_sync_confirm_frame, font=ctk.CTkFont(size=12, weight="bold"),
+            wraplength=420, justify="center")
+        self._watch_sync_confirm_label.pack(pady=(0, 6))
+        confirm_bf = ctk.CTkFrame(self._watch_sync_confirm_frame, fg_color="transparent")
+        confirm_bf.pack()
+        ctk.CTkButton(confirm_bf, text="Cancelar", width=110, fg_color="transparent", border_width=1,
+                      command=self._cancel_add_watch_sync_mapping).pack(side="left", padx=6)
+        ctk.CTkButton(confirm_bf, text="Sí, son la misma persona", width=210,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self._confirm_add_watch_sync_mapping).pack(side="left", padx=6)
+
+        self._watch_sync_mapping_add_status_label = ctk.CTkLabel(mapping_fr, text="", text_color=ERROR_COLOR)
+        self._watch_sync_mapping_add_status_label.grid(row=6, column=0, pady=(0, 10))
+
+        # ── Sincronización programada -- a diferencia del botón manual
+        # (pestaña principal), ESTA escribe sin pedir confirmación: es una
+        # decisión explícita del usuario al activarla, sabiendo que
+        # renuncia a la revisión previa (ver _run_scheduled_watch_sync).
+        schedule_fr = ctk.CTkFrame(fr)
+        schedule_fr.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 10))
+        schedule_fr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(schedule_fr, text="Sincronización automática diaria",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, pady=(10, 2))
+        ctk.CTkLabel(schedule_fr, text="A la hora indicada se sincroniza sola, SIN pedir "
+                                       "confirmación -- a diferencia del botón manual. Solo "
+                                       "funciona mientras aRenombrar esté abierto en ese "
+                                       "momento -- no es una tarea del sistema operativo.",
+                     font=ctk.CTkFont(size=11), text_color=WARNING_COLOR, wraplength=420,
+                     justify="center").grid(row=1, column=0, pady=(0, 8), padx=10)
+        self._watch_sync_schedule_switch = ctk.CTkSwitch(schedule_fr, text="Activar")
+        if self.config_data.get("watch_sync_schedule_enabled", False):
+            self._watch_sync_schedule_switch.select()
+        self._watch_sync_schedule_switch.grid(row=2, column=0, pady=(0, 8))
+        time_fr = ctk.CTkFrame(schedule_fr, fg_color="transparent")
+        time_fr.grid(row=3, column=0, pady=(0, 10))
+        ctk.CTkLabel(time_fr, text="Hora (HH:MM):").pack(side="left", padx=(0, 6))
+        self._watch_sync_schedule_time_entry = ctk.CTkEntry(time_fr, width=80, placeholder_text="03:00")
+        self._watch_sync_schedule_time_entry.insert(
+            0, self.config_data.get("watch_sync_schedule_time", ""))
+        self._watch_sync_schedule_time_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(time_fr, text="Guardar", width=90,
+                      command=self._save_watch_sync_schedule).pack(side="left")
+        self._watch_sync_schedule_status_label = ctk.CTkLabel(schedule_fr, text="", text_color=ERROR_COLOR)
+        self._watch_sync_schedule_status_label.grid(row=4, column=0, pady=(0, 10))
+
+        self._render_watch_sync_mapping_rows()
+        self._load_watch_sync_mapping_users_async()
+
+    def _save_watch_sync_schedule(self):
+        """Guarda la programación horaria -- se lee en caliente en cada
+        comprobación del programador (ver _check_watch_sync_schedule),
+        así que no hace falta reiniciar la app para que un cambio tenga
+        efecto."""
+        import re
+        time_str = self._watch_sync_schedule_time_entry.get().strip()
+        enabled = bool(self._watch_sync_schedule_switch.get())
+        if enabled and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", time_str):
+            self._watch_sync_schedule_status_label.configure(
+                text="Formato de hora no válido -- usa HH:MM (24h), p.ej. 03:00")
+            return
+        self.config_data.set("watch_sync_schedule_enabled", enabled)
+        self.config_data.set("watch_sync_schedule_time", time_str)
+        self.config_data.save()
+        self._watch_sync_schedule_status_label.configure(text="Guardado", text_color=SUCCESS_COLOR)
+
+    def _build_watch_sync_top_tab(self, parent):
+        """Pestaña principal "🔄 Sincronizar visionado" (ver _NAV_LABELS/
+        _show_view) -- botón manual, estado y vista previa. El
+        emparejamiento de usuarios y la programación horaria viven en
+        Configuración → Cliente (ver _build_watch_sync_config_tab).
+        Gana "visto": si cualquiera de las dos plataformas lo tiene
+        visto, la otra se marca también -- nunca se desmarca nada (ver
+        core/watch_sync.py). El botón manual SIEMPRE muestra la vista
+        previa y exige confirmación antes de escribir; la sincronización
+        programada (Configuración) es la única vía que escribe sin
+        pedirla, por decisión explícita del usuario al activarla."""
+        # Fuentes propias, no self._cfg_font_* -- esas solo existen tras
+        # construir el panel de Configuración (diferido a la primera
+        # visita real, ver _build_ui), y esta pestaña se construye
+        # SIEMPRE al arrancar, igual que Archivos/Episodios/etc.
+        desc_font = ctk.CTkFont(size=11)
+
+        parent.grid_columnconfigure(0, weight=1)
+
+        outer = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        outer.grid(row=0, column=0, sticky="nsew")
+        parent.grid_rowconfigure(0, weight=1)
+        fr = ctk.CTkFrame(outer, fg_color="transparent")
+        fr.pack(fill="both", expand=True)
+        fr.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(fr, text="Sincronizar visionado", font=ctk.CTkFont(size=20, weight="bold")).grid(
+            row=0, column=0, pady=(8, 2))
+        ctk.CTkLabel(fr, text="Marca como visto en una plataforma lo que ya está visto en la otra. "
+                              "Nunca desmarca nada y siempre pide confirmación antes de escribir.",
+                     font=desc_font, text_color=PENDING_COLOR, wraplength=460,
+                     justify="center").grid(row=1, column=0, pady=(0, 10))
+
+        if not (self.config_data.get("plex_enabled") and self.config_data.get("jellyfin_enabled")):
+            ctk.CTkLabel(fr, text="Activa Plex y Jellyfin en Configuración → Servidor → \"Servidores "
+                                  "de medios\" para poder usar esta utilidad.",
+                         font=desc_font, text_color=WARNING_COLOR, justify="center").grid(
+                row=2, column=0, pady=(0, 16))
+            return
+
+        # ── Sincronizar ──
+        run_fr = ctk.CTkFrame(fr, fg_color="transparent")
+        run_fr.grid(row=2, column=0, pady=(0, 10))
+        last_run = self.config_data.get("watch_sync_last_run_ts", 0)
+        last_run_txt = ("nunca" if not last_run
+                        else self._fmt_cleanup_scan_age(_time.time() - last_run))
+        self._watch_sync_last_run_label = ctk.CTkLabel(
+            run_fr, text=f"Última sincronización: {last_run_txt}",
+            font=desc_font, text_color=PENDING_COLOR)
+        self._watch_sync_last_run_label.pack(pady=(0, 6))
+        self._watch_sync_run_button = ctk.CTkButton(
+            run_fr, text="🔄 Sincronizar visionado ahora", width=240,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._run_watch_sync)
+        self._watch_sync_run_button.pack(pady=(0, 6))
+        self._watch_sync_status_label = ctk.CTkLabel(run_fr, text="", text_color=PENDING_COLOR)
+        self._watch_sync_status_label.pack()
+
+        # ── Vista previa -- tabla paginada (25 filas, igual que
+        # Episodios/Liberar espacio/Historial). Oculta hasta que hay algo
+        # que revisar. Una biblioteca grande puede generar miles de
+        # acciones, y construirlas todas de golpe sin paginar agota el
+        # límite de objetos GUI de Windows (10000 por proceso) y rompe el
+        # pintado de TODA la ventana, no solo de esta tabla.
+        self._watch_sync_preview_actions = []
+        self._watch_sync_preview_page = 0
+        self._WATCH_SYNC_PREVIEW_PAGE_SIZE = 25
+
+        self._watch_sync_preview_header_frame = ctk.CTkFrame(fr, fg_color="transparent")
+        self._watch_sync_preview_header_frame.grid(row=3, column=0, sticky="ew", padx=12)
+        ctk.CTkLabel(self._watch_sync_preview_header_frame, text="¿Aplicar estos cambios?",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(4, 4))
+        self._watch_sync_preview_summary_label = ctk.CTkLabel(
+            self._watch_sync_preview_header_frame, font=ctk.CTkFont(size=12), justify="left")
+        self._watch_sync_preview_summary_label.pack(pady=(0, 4))
+        self._watch_sync_preview_failed_label = ctk.CTkLabel(
+            self._watch_sync_preview_header_frame, font=ctk.CTkFont(size=11),
+            text_color=WARNING_COLOR, wraplength=460)
+        self._watch_sync_preview_failed_label.pack(pady=(0, 4))
+        self._watch_sync_preview_header_frame.grid_remove()
+
+        # scrollable=False: ya está paginada (25 filas por página, ver
+        # _render_watch_sync_preview_page), así que no necesita su propia
+        # barra de scroll -- crece con las filas de la página actual y se
+        # apoya en el scroll general de la pestaña. La paginación sigue
+        # siendo necesaria aunque no tenga scroll propio: sin ella, una
+        # biblioteca grande podría generar miles de filas de golpe y
+        # agotar el límite de objetos GUI de Windows (10000 por proceso),
+        # rompiendo el pintado de TODA la ventana.
+        self._watch_sync_preview_table = TableView(fr, scrollable=False, columns=[
+            ColumnSpec("title", "Título", width=200, expand=True),
+            ColumnSpec("season_ep", "T/E", width=60),
+            ColumnSpec("target", "Se marcará en", width=110),
+        ])
+        self._watch_sync_preview_table.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 4))
+        self._watch_sync_preview_table.grid_remove()
+
+        self._watch_sync_preview_footer_frame = ctk.CTkFrame(fr, fg_color="transparent")
+        self._watch_sync_preview_footer_frame.grid(row=5, column=0, pady=(0, 10))
+        nav_fr = ctk.CTkFrame(self._watch_sync_preview_footer_frame, fg_color="transparent")
+        nav_fr.pack(pady=(0, 8))
+        self._watch_sync_preview_prev_btn = ctk.CTkButton(
+            nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._watch_sync_change_preview_page(-1))
+        self._watch_sync_preview_prev_btn.pack(side="left")
+        self._watch_sync_preview_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
+        self._watch_sync_preview_page_lbl.pack(side="left", padx=12)
+        self._watch_sync_preview_next_btn = ctk.CTkButton(
+            nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._watch_sync_change_preview_page(1))
+        self._watch_sync_preview_next_btn.pack(side="left")
+        preview_bf = ctk.CTkFrame(self._watch_sync_preview_footer_frame, fg_color="transparent")
+        preview_bf.pack()
+        ctk.CTkButton(preview_bf, text="Cancelar", width=120, fg_color="transparent", border_width=1,
+                      command=self._cancel_watch_sync_preview).pack(side="left", padx=6)
+        ctk.CTkButton(preview_bf, text="Confirmar y sincronizar", width=190,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self._confirm_watch_sync_preview).pack(side="left", padx=6)
+        self._watch_sync_preview_footer_frame.grid_remove()
+
+        # ── Historial de sincronizaciones -- lista persistente (entre
+        # reinicios, siempre lee de disco) de todo lo que ya se ha marcado
+        # como visto por esta función, ok o fallido -- nunca desaparece en
+        # silencio. Mismo patrón que "Historial de subidas" (ver
+        # _build_history_tab): tabla paginada a 25 filas por página,
+        # límite de objetos GUI de Windows por medio (10000 por proceso).
+        hist_header = ctk.CTkFrame(fr, fg_color=("gray90", "gray20"), corner_radius=8)
+        hist_header.grid(row=6, column=0, sticky="ew", padx=12, pady=(16, 6))
+        self._watch_sync_history_title_lbl = ctk.CTkLabel(
+            hist_header, text="Historial de sincronizaciones", font=ctk.CTkFont(size=14, weight="bold"))
+        self._watch_sync_history_title_lbl.pack(side="left", padx=12, pady=8)
+        ctk.CTkButton(hist_header, text="🗑 Limpiar historial", width=150,
+                      fg_color="transparent", border_width=1,
+                      border_color=ERROR_COLOR, text_color=ERROR_COLOR,
+                      hover_color=("gray85", "#3d1010"),
+                      command=self._clear_watch_sync_history).pack(side="right", padx=(4, 12), pady=8)
+
+        self._WATCH_SYNC_HISTORY_PAGE_SIZE = 25
+        self._watch_sync_history_all = []
+        self._watch_sync_history_page = 0
+        self._watch_sync_history_col_order = ["fecha", "persona", "titulo", "season_ep", "destino", "estado"]
+        self._watch_sync_history_font = ctk.CTkFont(size=11)
+        self._watch_sync_history_empty_msg = None
+
+        self._watch_sync_history_table = TableView(fr, scrollable=False, columns=[
+            ColumnSpec("fecha", "Fecha", width=130),
+            ColumnSpec("persona", "Persona", width=110),
+            ColumnSpec("titulo", "Título", width=200, expand=True),
+            ColumnSpec("season_ep", "T/E", width=60),
+            ColumnSpec("destino", "Marcado en", width=100),
+            ColumnSpec("estado", "Estado", width=80),
+        ])
+        self._watch_sync_history_table.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 4))
+
+        hist_nav_fr = ctk.CTkFrame(fr, fg_color="transparent")
+        hist_nav_fr.grid(row=8, column=0, pady=(0, 10))
+        self._watch_sync_history_prev_btn = ctk.CTkButton(
+            hist_nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._watch_sync_history_change_page(-1))
+        self._watch_sync_history_prev_btn.pack(side="left")
+        self._watch_sync_history_page_lbl = ctk.CTkLabel(hist_nav_fr, text="", text_color=PENDING_COLOR)
+        self._watch_sync_history_page_lbl.pack(side="left", padx=12)
+        self._watch_sync_history_next_btn = ctk.CTkButton(
+            hist_nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._watch_sync_history_change_page(1))
+        self._watch_sync_history_next_btn.pack(side="left")
+
+        # Diferido -- igual motivo que _build_history_tab: esta pestaña se
+        # construye al arrancar aunque esté oculta, y el historial puede
+        # tener hasta 500 registros (varios widgets cada uno). _show_view()
+        # ya vuelve a llamar a esto cada vez que se entra de verdad en la
+        # pestaña, así que esto solo afecta al primer dibujado al arrancar.
+        self.after(120, self._refresh_watch_sync_history_view)
+
+    def _refresh_watch_sync_history_view(self):
+        """Recarga el historial desde disco y redibuja la página actual --
+        se llama al construir la pestaña y cada vez que se entra en ella
+        (_show_view), y también justo después de cada sincronización
+        (manual o programada) por si acaba de haber entradas nuevas.
+        No-op si Plex/Jellyfin no están activos: _build_watch_sync_top_tab
+        no llega a construir esta sección en ese caso (ver el "return"
+        temprano), así que no hay tabla que redibujar."""
+        if not hasattr(self, "_watch_sync_history_table"):
+            return
+        history = self._load_watch_sync_history()
+        self._watch_sync_history_all = list(reversed(history))   # más reciente primero
+        self._watch_sync_history_title_lbl.configure(
+            text=f"Historial de sincronizaciones  ({len(history)} registros)")
+        self._watch_sync_history_page = 0
+        self._watch_sync_history_render_page()
+
+    def _watch_sync_history_change_page(self, delta: int):
+        n_pages = max(1, -(-len(self._watch_sync_history_all) // self._WATCH_SYNC_HISTORY_PAGE_SIZE))
+        new_page = max(0, min(n_pages - 1, self._watch_sync_history_page + delta))
+        if new_page == self._watch_sync_history_page:
+            return
+        self._watch_sync_history_page = new_page
+        self._watch_sync_history_render_page()
+
+    def _watch_sync_history_render_page(self):
+        """Dibuja solo la página actual (self._watch_sync_history_page) de
+        self._watch_sync_history_all -- ver _WATCH_SYNC_HISTORY_PAGE_SIZE."""
+        import datetime
+
+        table = self._watch_sync_history_table
+        table.clear_rows()
+        self._watch_sync_history_empty_msg = None
+
+        total = len(self._watch_sync_history_all)
+        n_pages = max(1, -(-total // self._WATCH_SYNC_HISTORY_PAGE_SIZE))
+        start = self._watch_sync_history_page * self._WATCH_SYNC_HISTORY_PAGE_SIZE
+        page_items = self._watch_sync_history_all[start:start + self._WATCH_SYNC_HISTORY_PAGE_SIZE]
+
+        self._watch_sync_history_page_lbl.configure(
+            text=f"Página {self._watch_sync_history_page + 1} de {n_pages}" if total else "")
+        self._watch_sync_history_prev_btn.configure(
+            state="normal" if self._watch_sync_history_page > 0 else "disabled")
+        self._watch_sync_history_next_btn.configure(
+            state="normal" if self._watch_sync_history_page < n_pages - 1 else "disabled")
+        table.scroll_to_top()
+
+        if not page_items:
+            self._watch_sync_history_empty_msg = ctk.CTkLabel(
+                table.body, text="Sin sincronizaciones registradas todavía.", text_color=PENDING_COLOR)
+            self._watch_sync_history_empty_msg.pack(pady=30)
+            return
+
+        cw = {key: table.col_width(key) for key in self._watch_sync_history_col_order}
+        font = self._watch_sync_history_font
+        sc = {"ok": SUCCESS_COLOR, "error": ERROR_COLOR}
+        target_lbl = {"plex": "Plex", "jellyfin": "Jellyfin"}
+        for entry in page_items:
+            try:
+                ts = datetime.datetime.fromtimestamp(entry.get("ts", 0)).strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                ts = "—"
+            season, episode = entry.get("season"), entry.get("episode")
+            season_ep = f"{season}x{episode:02d}" if season is not None and episode is not None else "—"
+            status = entry.get("status", "ok")
+            row = ctk.CTkFrame(table.body, fg_color=("gray95", "gray17"), corner_radius=8)
+            row.pack(fill="x", pady=2, padx=2)
+            ctk.CTkLabel(row, text=ts, width=cw["fecha"], anchor="w", font=font).pack(side="left")
+            ctk.CTkLabel(row, text=entry.get("person", "?"), width=cw["persona"], anchor="w",
+                        font=font).pack(side="left")
+            ctk.CTkLabel(row, text=entry.get("name", ""), width=cw["titulo"], anchor="w",
+                        font=font).pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(row, text=season_ep, width=cw["season_ep"], anchor="w", font=font).pack(side="left")
+            ctk.CTkLabel(row, text=target_lbl.get(entry.get("target"), "?"), width=cw["destino"],
+                        anchor="w", font=font).pack(side="left")
+            ctk.CTkLabel(row, text="✓ Ok" if status == "ok" else "✕ Error", width=cw["estado"],
+                        anchor="w", font=font, text_color=sc.get(status, PENDING_COLOR)).pack(side="left")
+
+    def _clear_watch_sync_history(self):
+        try:
+            self._watch_sync_history_path().write_text("[]", encoding="utf-8")
+        except Exception:
+            pass
+        self._refresh_watch_sync_history_view()
+
+    def _load_watch_sync_mapping_users_async(self):
+        """Carga los usuarios de ambas plataformas al construir la
+        pestaña -- siempre visible, ya no hace falta un botón "Editar"
+        para desencadenarlo."""
+        host = self.config_data.get("plex_host", "")
+        owner_token = self.config_data.get("plex_token", "")
+        jf_host = self.config_data.get("jellyfin_host", "")
+        jf_key = self.config_data.get("jellyfin_api_key", "")
+
+        def worker():
+            from core.media_server_refresh import get_plex_home_users, get_jellyfin_users
+            plex_users = get_plex_home_users(host, owner_token) or []
+            jf_users = get_jellyfin_users(jf_host, jf_key) or []
+            self.after(0, lambda: self._on_watch_sync_mapping_users_loaded(plex_users, jf_users))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_watch_sync_mapping_users_loaded(self, plex_users, jf_users):
+        self._watch_sync_plex_users = plex_users
+        self._watch_sync_jellyfin_users = jf_users
+        if not plex_users or not jf_users:
+            self._watch_sync_mapping_status_label.configure(
+                text="No se pudieron cargar los usuarios -- comprueba la conexión", text_color=ERROR_COLOR)
+            return
+        self._watch_sync_mapping_status_label.configure(text="")
+        self._watch_sync_plex_combo.configure(values=[u["title"] for u in plex_users], state="readonly")
+        self._watch_sync_jellyfin_combo.configure(values=[u["name"] for u in jf_users], state="readonly")
+        self._watch_sync_plex_combo.set(plex_users[0]["title"])
+        self._watch_sync_jellyfin_combo.set(jf_users[0]["name"])
+        self._watch_sync_add_mapping_btn.configure(state="normal")
+
+    def _start_add_watch_sync_mapping(self):
+        """Paso 1: verificar la contraseña de Jellyfin de la persona
+        elegida -- Plex no tiene nada equivalente para usuarios de Plex
+        Home (no tienen contraseña propia), así que esto solo confirma
+        la mitad Jellyfin. El paso 2 (_confirm_add_watch_sync_mapping)
+        exige además una confirmación explícita de que ambas cuentas son
+        la misma persona antes de guardar nada."""
+        plex_title = self._watch_sync_plex_combo.get()
+        jf_name = self._watch_sync_jellyfin_combo.get()
+        password = self._watch_sync_jellyfin_password_entry.get()
+        plex_user = next((u for u in self._watch_sync_plex_users if u["title"] == plex_title), None)
+        jf_user = next((u for u in self._watch_sync_jellyfin_users if u["name"] == jf_name), None)
+        if plex_user is None or jf_user is None:
+            return
+        if not password:
+            self._watch_sync_mapping_add_status_label.configure(
+                text="Escribe la contraseña de Jellyfin de esa persona para continuar")
+            return
+
+        existing = self.config_data.get("watch_sync_user_mappings", [])
+        if any(m["plex_user_id"] == plex_user["id"] or m["jellyfin_user_id"] == jf_user["id"]
+               for m in existing):
+            self._watch_sync_mapping_add_status_label.configure(
+                text="Uno de los dos usuarios ya está emparejado con otra persona")
+            return
+
+        self._watch_sync_add_mapping_btn.configure(state="disabled")
+        self._watch_sync_mapping_add_status_label.configure(text="Verificando contraseña...",
+                                                             text_color=WARNING_COLOR)
+        jf_host = self.config_data.get("jellyfin_host", "")
+
+        def worker():
+            from core.media_server_refresh import verify_jellyfin_password
+            ok = verify_jellyfin_password(jf_host, jf_user["name"], password)
+            self.after(0, lambda: self._on_watch_sync_password_verified(ok, plex_user, jf_user))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_watch_sync_password_verified(self, ok: bool, plex_user: dict, jf_user: dict):
+        self._watch_sync_jellyfin_password_entry.delete(0, "end")
+        if not ok:
+            self._watch_sync_add_mapping_btn.configure(state="normal")
+            self._watch_sync_mapping_add_status_label.configure(
+                text=f"Contraseña incorrecta para '{jf_user['name']}' en Jellyfin", text_color=ERROR_COLOR)
+            return
+        self._watch_sync_mapping_add_status_label.configure(text="")
+        self._watch_sync_pending_pair = (plex_user, jf_user)
+        self._watch_sync_confirm_label.configure(
+            text=f"¿Confirmas que \"{plex_user['title']}\" (Plex) y \"{jf_user['name']}\" (Jellyfin) "
+                 f"son la misma persona?")
+        self._watch_sync_confirm_frame.grid()
+
+    def _cancel_add_watch_sync_mapping(self):
+        self._watch_sync_pending_pair = None
+        self._watch_sync_confirm_frame.grid_remove()
+        self._watch_sync_add_mapping_btn.configure(state="normal")
+
+    def _confirm_add_watch_sync_mapping(self):
+        if self._watch_sync_pending_pair is None:
+            return
+        plex_user, jf_user = self._watch_sync_pending_pair
+        mappings = list(self.config_data.get("watch_sync_user_mappings", []))
+        mappings.append({
+            "plex_user_id": plex_user["id"], "plex_user_name": plex_user["title"],
+            "jellyfin_user_id": jf_user["id"], "jellyfin_user_name": jf_user["name"],
+        })
+        self.config_data.set("watch_sync_user_mappings", mappings)
+        self.config_data.save()
+        self._watch_sync_pending_pair = None
+        self._watch_sync_confirm_frame.grid_remove()
+        self._watch_sync_add_mapping_btn.configure(state="normal")
+        self._render_watch_sync_mapping_rows()
+
+    def _remove_watch_sync_mapping(self, index):
+        mappings = list(self.config_data.get("watch_sync_user_mappings", []))
+        del mappings[index]
+        self.config_data.set("watch_sync_user_mappings", mappings)
+        self.config_data.save()
+        self._render_watch_sync_mapping_rows()
+
+    def _render_watch_sync_mapping_rows(self):
+        """Reconstruye la lista de emparejados -- TableView(scrollable=False):
+        crece con cada fila, sin scroll propio (ver _build_watch_sync_config_tab)."""
+        table = self._watch_sync_mapping_table
+        table.clear_rows()
+        for i, m in enumerate(self.config_data.get("watch_sync_user_mappings", [])):
+            row = ctk.CTkFrame(table.body, fg_color=("gray95", "gray17"), corner_radius=8)
+            row.pack(fill="x", pady=2, padx=2)
+            ctk.CTkLabel(row, text=m["plex_user_name"], width=table.col_width("plex"),
+                        anchor="w").pack(side="left")
+            ctk.CTkLabel(row, text=m["jellyfin_user_name"], width=table.col_width("jellyfin"),
+                        anchor="w").pack(side="left")
+            ctk.CTkButton(row, text="✕", width=table.col_width("del"), height=22,
+                         fg_color="transparent", border_width=1, text_color=ERROR_COLOR,
+                         command=lambda idx=i: self._remove_watch_sync_mapping(idx)).pack(side="left")
+
+    def _watch_sync_collect_actions(self, mappings, status_cb=None):
+        """Lee el estado de visionado de ambas plataformas para
+        *mappings* y calcula las acciones pendientes
+        (core.watch_sync.diff_watched_items). Pura I/O, pensada para
+        ejecutarse en CUALQUIER hilo (nunca toca widgets directamente) --
+        tanto el botón manual (_run_watch_sync) como la sincronización
+        programada (_run_scheduled_watch_sync) la comparten, para no
+        duplicar esta lógica en dos sitios que podrían acabar
+        divergiendo. status_cb(texto), opcional, se llama con
+        actualizaciones de progreso -- quien lo pase decide si lo
+        reenvía a la UI vía self.after() (el programador automático no
+        pasa ninguno, no hay UI que actualizar). Devuelve (actions,
+        failed_users)."""
+        from core.watch_sync import WatchedItem, diff_watched_items
+        from core.media_server_refresh import (
+            get_plex_user_token, get_plex_movie_watched, get_plex_episode_watched,
+            get_jellyfin_movie_watched, get_jellyfin_episode_watched,
+            get_plex_series, get_jellyfin_series,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+
+        plex_host = self.config_data.get("plex_host", "")
+        plex_owner_token = self.config_data.get("plex_token", "")
+        jellyfin_host = self.config_data.get("jellyfin_host", "")
+        jellyfin_key = self.config_data.get("jellyfin_api_key", "")
+
+        all_items = []
+        failed_users = []
+        # Peliculas + listado de series: rapido (un unico listado por
+        # plataforma, no una llamada por titulo) -- se hace por usuario,
+        # sin necesitar reparto especial.
+        per_mapping_shows = []   # [(mapping, plex_token, [(show, jf_show), ...]), ...]
+
+        for m in mappings:
+            plex_token = get_plex_user_token(plex_host, plex_owner_token, m["plex_user_id"])
+            if plex_token is None:
+                failed_users.append(m)
+                continue
+
+            plex_movies = get_plex_movie_watched(plex_host, plex_token) or {}
+            jf_movies = get_jellyfin_movie_watched(
+                jellyfin_host, jellyfin_key, m["jellyfin_user_id"]) or {}
+            for tmdb_id in set(plex_movies) | set(jf_movies):
+                p = plex_movies.get(tmdb_id, {})
+                j = jf_movies.get(tmdb_id, {})
+                name = p.get("name") or j.get("name") or f"(película {tmdb_id})"
+                all_items.append(WatchedItem(
+                    media_type="movie", tmdb_id=tmdb_id, name=name,
+                    plex_watched=p.get("watched", False), jellyfin_watched=j.get("watched", False),
+                    plex_ref=p.get("ref"), jellyfin_ref=j.get("ref"),
+                    plex_user_id=m["plex_user_id"], jellyfin_user_id=m["jellyfin_user_id"]))
+
+            plex_shows = get_plex_series(plex_host, plex_token) or []
+            jf_shows = get_jellyfin_series(jellyfin_host, jellyfin_key) or []
+            jf_shows_by_tmdb = {s["tmdb_id"]: s for s in jf_shows if s["tmdb_id"] is not None}
+            matched = [(show, jf_shows_by_tmdb[show["tmdb_id"]]) for show in plex_shows
+                      if show["tmdb_id"] is not None and show["tmdb_id"] in jf_shows_by_tmdb]
+            per_mapping_shows.append((m, plex_token, matched))
+
+        # Episodios: la parte lenta (una llamada por serie a cada
+        # plataforma) -- repartida entre hasta 8 hilos SIEMPRE, sin
+        # importar cuantos usuarios haya (antes solo se paralelizaba por
+        # usuario, así que con 1 solo usuario no paralelizaba nada en
+        # absoluto). Progreso visible cada pocas series para que no
+        # parezca colgada durante los varios minutos que puede tardar.
+        work_items = [(m, plex_token, show, jf_show)
+                     for m, plex_token, shows in per_mapping_shows
+                     for show, jf_show in shows]
+        total = len(work_items)
+        done = [0]
+
+        def _fetch_episodes(work_item):
+            m, plex_token, show, jf_show = work_item
+            plex_eps = get_plex_episode_watched(plex_host, plex_token, show["rating_key"]) or {}
+            jf_eps = get_jellyfin_episode_watched(
+                jellyfin_host, jellyfin_key, m["jellyfin_user_id"], jf_show["id"]) or {}
+            items = []
+            for se in set(plex_eps) | set(jf_eps):
+                p = plex_eps.get(se, {})
+                j = jf_eps.get(se, {})
+                items.append(WatchedItem(
+                    media_type="episode", tmdb_id=show["tmdb_id"], name=show["name"],
+                    season=se[0], episode=se[1],
+                    plex_watched=p.get("watched", False), jellyfin_watched=j.get("watched", False),
+                    plex_ref=p.get("ref"), jellyfin_ref=j.get("ref"),
+                    plex_user_id=m["plex_user_id"], jellyfin_user_id=m["jellyfin_user_id"]))
+            done[0] += 1
+            if status_cb and (done[0] % 10 == 0 or done[0] == total):
+                status_cb(f"Leyendo episodios: serie {done[0]}/{total}...")
+            return items
+
+        if work_items:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for items in pool.map(_fetch_episodes, work_items):
+                    all_items.extend(items)
+
+        return diff_watched_items(all_items), failed_users
+
+    def _run_watch_sync(self):
+        mappings = self.config_data.get("watch_sync_user_mappings", [])
+        if not mappings:
+            self._watch_sync_status_label.configure(
+                text="Empareja al menos un usuario primero, en Configuración → Cliente",
+                text_color=ERROR_COLOR)
+            return
+
+        self._watch_sync_run_button.configure(state="disabled")
+        self._watch_sync_status_label.configure(text="Leyendo estado de visionado...",
+                                                 text_color=WARNING_COLOR)
+
+        def worker():
+            actions, failed_users = self._watch_sync_collect_actions(
+                mappings,
+                status_cb=lambda t: self.after(0, lambda t=t: self._watch_sync_status_label.configure(
+                    text=t, text_color=WARNING_COLOR)))
+            self.after(0, lambda: self._show_watch_sync_preview(actions, failed_users))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_watch_sync_preview(self, actions, failed_users):
+        """Rellena y muestra la sección de vista previa integrada en la
+        pestaña (no un diálogo emergente) -- nada se escribe todavía,
+        solo al pulsar "Confirmar y sincronizar" (ver
+        _confirm_watch_sync_preview)."""
+        self._watch_sync_run_button.configure(state="normal")
+        self._watch_sync_status_label.configure(text="")
+        if not actions and not failed_users:
+            self._watch_sync_preview_header_frame.grid_remove()
+            self._watch_sync_preview_table.grid_remove()
+            self._watch_sync_preview_footer_frame.grid_remove()
+            self._watch_sync_status_label.configure(
+                text="Nada que sincronizar, ya está todo al día", text_color=SUCCESS_COLOR)
+            return
+
+        from core.watch_sync import summarize_actions
+        summary = summarize_actions(actions)
+        self._watch_sync_preview_summary_label.configure(
+            text=(f"Plex: {summary['plex']['movies']} película(s), "
+                  f"{summary['plex']['episodes']} episodio(s)\n"
+                  f"Jellyfin: {summary['jellyfin']['movies']} película(s), "
+                  f"{summary['jellyfin']['episodes']} episodio(s)"))
+        if failed_users:
+            names = ", ".join(m.get("plex_user_name", "?") for m in failed_users)
+            self._watch_sync_preview_failed_label.configure(text=f"No verificado (se omite): {names}")
+        else:
+            self._watch_sync_preview_failed_label.configure(text="")
+
+        self._watch_sync_preview_actions = sorted(
+            actions, key=lambda a: (a.item.name, a.item.season or 0, a.item.episode or 0))
+        self._watch_sync_preview_page = 0
+        self._render_watch_sync_preview_page()
+        self._watch_sync_preview_header_frame.grid()
+        self._watch_sync_preview_table.grid()
+        self._watch_sync_preview_footer_frame.grid()
+
+    def _watch_sync_change_preview_page(self, delta: int):
+        page_size = self._WATCH_SYNC_PREVIEW_PAGE_SIZE
+        n_pages = max(1, -(-len(self._watch_sync_preview_actions) // page_size))
+        new_page = max(0, min(n_pages - 1, self._watch_sync_preview_page + delta))
+        if new_page == self._watch_sync_preview_page:
+            return
+        self._watch_sync_preview_page = new_page
+        self._render_watch_sync_preview_page()
+
+    def _render_watch_sync_preview_page(self):
+        page_size = self._WATCH_SYNC_PREVIEW_PAGE_SIZE
+        actions = self._watch_sync_preview_actions
+        n_pages = max(1, -(-len(actions) // page_size))
+        start = self._watch_sync_preview_page * page_size
+        page_actions = actions[start:start + page_size]
+
+        table = self._watch_sync_preview_table
+        table.clear_rows()
+        for a in page_actions:
+            row = ctk.CTkFrame(table.body, fg_color=("gray95", "gray17"), corner_radius=8)
+            row.pack(fill="x", pady=1, padx=2)
+            se_txt = f"{a.item.season}x{a.item.episode:02d}" if a.item.media_type == "episode" else ""
+            ctk.CTkLabel(row, text=a.item.name, width=table.col_width("title"), anchor="w").pack(
+                side="left", fill="x", expand=True)
+            ctk.CTkLabel(row, text=se_txt, width=table.col_width("season_ep"), anchor="w").pack(side="left")
+            ctk.CTkLabel(row, text=a.target.capitalize(), width=table.col_width("target"), anchor="w").pack(
+                side="left")
+        table.scroll_to_top()
+
+        self._watch_sync_preview_page_lbl.configure(
+            text=f"Página {self._watch_sync_preview_page + 1} de {n_pages} ({len(actions)} en total)")
+        self._watch_sync_preview_prev_btn.configure(
+            state="normal" if self._watch_sync_preview_page > 0 else "disabled")
+        self._watch_sync_preview_next_btn.configure(
+            state="normal" if self._watch_sync_preview_page < n_pages - 1 else "disabled")
+
+    def _cancel_watch_sync_preview(self):
+        self._watch_sync_preview_actions = []
+        self._watch_sync_preview_header_frame.grid_remove()
+        self._watch_sync_preview_table.grid_remove()
+        self._watch_sync_preview_footer_frame.grid_remove()
+        self._watch_sync_status_label.configure(text="Cancelado, no se ha sincronizado nada",
+                                                 text_color=PENDING_COLOR)
+
+    def _watch_sync_apply(self, actions, status_cb=None):
+        """Escribe *actions* en Plex/Jellyfin y actualiza
+        watch_sync_last_run_ts. Pura I/O, pensada para ejecutarse en
+        CUALQUIER hilo -- compartida entre el botón manual
+        (_confirm_watch_sync_preview) y la sincronización programada
+        (_run_scheduled_watch_sync). status_cb(texto), opcional, mismo
+        contrato que en _watch_sync_collect_actions. Devuelve (ok, fail)."""
+        from core.media_server_refresh import get_plex_user_token, mark_plex_watched, mark_jellyfin_watched
+
+        plex_host = self.config_data.get("plex_host", "")
+        plex_owner_token = self.config_data.get("plex_token", "")
+        jellyfin_host = self.config_data.get("jellyfin_host", "")
+        jellyfin_key = self.config_data.get("jellyfin_api_key", "")
+
+        # Un token por CADA usuario de Plex que aparezca entre las
+        # acciones pendientes (no uno por accion) -- se re-deriva aqui,
+        # nunca se reutiliza el que se pidio durante la lectura (ver el
+        # plan: los tokens por usuario nunca se cachean).
+        plex_user_ids = {a.item.plex_user_id for a in actions
+                         if a.target == "plex" and a.item.plex_user_id}
+        plex_tokens = {uid: get_plex_user_token(plex_host, plex_owner_token, uid)
+                      for uid in plex_user_ids}
+
+        # Para el historial persistente (ver _save_watch_sync_history_entry):
+        # los WatchedItem solo llevan el id de usuario, no el nombre --
+        # se resuelve aquí una vez contra el emparejamiento actual, en vez
+        # de por cada acción.
+        mappings = self.config_data.get("watch_sync_user_mappings", [])
+        plex_name_by_id = {m["plex_user_id"]: m["plex_user_name"] for m in mappings}
+        jf_name_by_id = {m["jellyfin_user_id"]: m["jellyfin_user_name"] for m in mappings}
+
+        ok, fail = 0, 0
+        total = len(actions)
+        for i, action in enumerate(actions, 1):
+            item = action.item
+            if action.target == "jellyfin":
+                success = bool(item.jellyfin_user_id and item.jellyfin_ref) and mark_jellyfin_watched(
+                    jellyfin_host, jellyfin_key, item.jellyfin_user_id, item.jellyfin_ref)
+            else:
+                token = plex_tokens.get(item.plex_user_id)
+                success = bool(token and item.plex_ref) and mark_plex_watched(
+                    plex_host, token, item.plex_ref)
+            if success:
+                ok += 1
+            else:
+                fail += 1
+                _log.warning("Sincronizar visionado: fallo al marcar '%s' en %s (usuario plex=%s, jellyfin=%s)",
+                            item.name, action.target, item.plex_user_id, item.jellyfin_user_id)
+
+            person = (plex_name_by_id.get(item.plex_user_id)
+                     or jf_name_by_id.get(item.jellyfin_user_id) or "?")
+            self._save_watch_sync_history_entry(action.target, item, "ok" if success else "error", person)
+
+            if status_cb and (i % 10 == 0 or i == total):
+                status_cb(f"Sincronizando: {i}/{total} ({ok} aplicados, {fail} fallidos)...")
+
+        self.config_data.set("watch_sync_last_run_ts", _time.time())
+        self.config_data.save()
+        return ok, fail
+
+    # ── Historial de sincronizaciones -- lista persistente (entre
+    # reinicios) de cada ítem marcado como visto en Plex/Jellyfin por esta
+    # función, ok o fallido -- nunca desaparece en silencio, mismo patrón
+    # que el historial de subidas/borrados (ver _history_path/
+    # _deletion_history_path más abajo). Archivo aparte, no una clave de
+    # config: puede crecer hasta 500 registros, y config.json no es sitio
+    # para listas que crecen sin límite fijo.
+
+    def _watch_sync_history_path(self) -> Path:
+        return _appdata_dir() / "watch_sync_history.json"
+
+    def _load_watch_sync_history(self) -> list:
+        try:
+            p = self._watch_sync_history_path()
+            if p.exists():
+                return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return []
+
+    def _save_watch_sync_history_entry(self, target: str, item, status: str, person: str):
+        with self._history_lock:
+            history = self._load_watch_sync_history()
+            history.append({
+                "ts":         _time.time(),
+                "target":     target,       # "plex" | "jellyfin" -- dónde se escribió
+                "media_type": item.media_type,
+                "name":       item.name,
+                "season":     item.season,
+                "episode":    item.episode,
+                "person":     person,
+                "status":     status,       # "ok" | "error"
+            })
+            if len(history) > 500:
+                history = history[-500:]
+            try:
+                self._watch_sync_history_path().write_text(
+                    json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+    def _confirm_watch_sync_preview(self):
+        """Aplica EXACTAMENTE la lista de SyncAction ya mostrada en la
+        vista previa -- nunca se recalcula aquí, para que lo confirmado
+        sea siempre lo que se escribe."""
+        actions = self._watch_sync_preview_actions
+        self._watch_sync_preview_header_frame.grid_remove()
+        self._watch_sync_preview_table.grid_remove()
+        self._watch_sync_preview_footer_frame.grid_remove()
+        self._watch_sync_status_label.configure(text="Sincronizando...", text_color=WARNING_COLOR)
+
+        def worker():
+            ok, fail = self._watch_sync_apply(
+                actions,
+                status_cb=lambda t: self.after(0, lambda t=t: self._watch_sync_status_label.configure(
+                    text=t, text_color=WARNING_COLOR)))
+            self.after(0, lambda: self._watch_sync_status_label.configure(
+                text=f"Sincronización completada: {ok} aplicados, {fail} fallidos",
+                text_color=SUCCESS_COLOR if fail == 0 else WARNING_COLOR))
+            self.after(0, lambda: self._watch_sync_last_run_label.configure(
+                text="Última sincronización: hace un momento"))
+            self.after(0, self._refresh_watch_sync_history_view)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_scheduled_watch_sync(self):
+        """Sincronización automática programada (ver
+        _start_watch_sync_scheduler/_check_watch_sync_schedule) -- a
+        diferencia del botón manual, aplica DIRECTAMENTE sin mostrar
+        vista previa ni pedir confirmación: decisión explícita del
+        usuario al activar la programación en Configuración → Cliente,
+        sabiendo que renuncia a la revisión humana previa que tiene el
+        resto de esta función. Se ejecuta ya en el hilo del programador
+        (ver _watch_sync_scheduler_loop), no lanza otro hilo aparte."""
+        mappings = self.config_data.get("watch_sync_user_mappings", [])
+        if not mappings:
+            _log.info("Sincronización programada: omitida, no hay usuarios emparejados")
+            return
+        _log.info("Sincronización programada: iniciando (%d usuario(s) emparejado(s))", len(mappings))
+        try:
+            actions, failed_users = self._watch_sync_collect_actions(mappings)
+            ok, fail = self._watch_sync_apply(actions) if actions else (0, 0)
+        except Exception:
+            _log.exception("Sincronización programada: fallo inesperado")
+            return
+        _log.info("Sincronización programada: completada -- %d aplicado(s), %d fallido(s), "
+                  "%d usuario(s) no verificado(s)", ok, fail, len(failed_users))
+        if not actions:
+            # Nada que aplicar -- watch_sync_apply no se llamó, así que
+            # watch_sync_last_run_ts tampoco se actualizó; se hace aquí
+            # para que "ya se sincronizó hoy" siga siendo cierto y el
+            # programador no reintente en el siguiente minuto.
+            self.config_data.set("watch_sync_last_run_ts", _time.time())
+            self.config_data.save()
+        self.after(0, lambda: self._send_notification(
+            "aRenombrar — Sincronización de visionado",
+            f"{ok} cambio(s) aplicados" + (f", {fail} fallido(s)" if fail else "")))
+        self.after(0, lambda: self._watch_sync_last_run_label.configure(
+            text="Última sincronización: hace un momento"))
+        self.after(0, self._refresh_watch_sync_history_view)
+
+    def _start_watch_sync_scheduler(self):
+        """Hilo en segundo plano que comprueba cada minuto si toca la
+        sincronización programada (Configuración → Cliente →
+        Sincronizar visionado) -- mismo patrón que AutoWatcher (hilo
+        daemon + threading.Event().wait(), nunca time.sleep, para poder
+        pararlo al instante si hiciera falta). A diferencia de
+        AutoWatcher (que solo arranca si se inicia minimizado o al pulsar
+        "Auto"), este se arranca SIEMPRE al abrir la app -- una
+        sincronización programada tiene que poder saltar sin importar
+        cómo se abrió la ventana esta vez."""
+        stop_event = threading.Event()
+        self._watch_sync_scheduler_stop = stop_event
+
+        def loop():
+            while not stop_event.is_set():
+                try:
+                    self._check_watch_sync_schedule()
+                except Exception:
+                    _log.exception("Programador de sincronización: error inesperado")
+                stop_event.wait(60)
+
+        threading.Thread(target=loop, daemon=True, name="WatchSyncScheduler").start()
+
+    def _check_watch_sync_schedule(self):
+        """Se llama una vez por minuto desde _start_watch_sync_scheduler.
+        Todo se lee en caliente de config_data (nunca cacheado), así que
+        activar/editar la hora desde Configuración tiene efecto de
+        inmediato, sin reiniciar la app."""
+        if not self.config_data.get("watch_sync_schedule_enabled", False):
+            return
+        schedule_time = self.config_data.get("watch_sync_schedule_time", "")
+        if not schedule_time or _time.strftime("%H:%M") != schedule_time:
+            return
+        last_run = self.config_data.get("watch_sync_last_run_ts", 0)
+        if last_run and _time.strftime("%Y-%m-%d", _time.localtime(last_run)) == _time.strftime("%Y-%m-%d"):
+            return   # ya se sincronizó hoy (manual o programada) -- no repetir dentro del mismo minuto/día
+        self._run_scheduled_watch_sync()
 
     def _build_tmdb_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -3206,6 +4402,17 @@ class App(_AppBase):
             combo.set(str(self.config_data.get(key, PRESETS[key][0])))
             combo.grid(row=i, column=1, padx=10, pady=8, sticky="ew")
             self._tpl_entries[key] = combo
+
+        # Renombrar en destino/FTP -- junto a las plantillas porque decide
+        # si de verdad se aplican al subir (si está desactivado, se sube
+        # con el nombre original aunque la carpeta se organice igual por
+        # serie/temporada). Configuración de SERVIDOR: afecta al nombre
+        # que queda en el servidor compartido, no solo a este equipo (el
+        # renombrado en origen/local es de Cliente -> General).
+        self._rename_remote_switch = ctk.CTkSwitch(tpl, text="Renombrar archivos en destino (FTP)")
+        self._rename_remote_switch.grid(row=4, column=0, columnspan=2, pady=(4, 10))
+        if self.config_data.get("rename_remote", True):
+            self._rename_remote_switch.select()
 
         # ── Enlaces personalizables (detector de episodios que faltan) ──
         # Una lista independiente por nivel -- serie, temporada y episodio
@@ -3518,13 +4725,13 @@ class App(_AppBase):
         nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
         nav_fr.grid(row=3, column=0, pady=(6, 0))
         self._missing_ep_prev_btn = ctk.CTkButton(
-            nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._missing_ep_change_page(-1))
         self._missing_ep_prev_btn.pack(side="left")
         self._missing_ep_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
         self._missing_ep_page_lbl.pack(side="left", padx=12)
         self._missing_ep_next_btn = ctk.CTkButton(
-            nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._missing_ep_change_page(1))
         self._missing_ep_next_btn.pack(side="left")
 
@@ -3645,6 +4852,7 @@ class App(_AppBase):
                              if looks_like_season_split(expected.get(season, []), eps)}
             results.append({
                 "tmdb_id": int(key), "name": name, "source": entry.get("source", ""),
+                "server_id": entry.get("server_id"),
                 "missing": missing, "summary": format_missing_summary(name, missing),
                 "ignored": entry.get("ignored", False), "episode_titles": episode_titles,
                 "split_seasons": split_seasons, "unknown_seasons": unknown_seasons,
@@ -4099,12 +5307,20 @@ class App(_AppBase):
 
         # CTkLabel + bind (no CTkButton), sin marco -- mismo estilo que el
         # triángulo de "Temporada X" al expandir una serie (ver más abajo).
-        toggle_btn = ctk.CTkLabel(header_row, text=("▼" if expanded else "▶"), width=cw("toggle"), cursor="hand2")
+        # "v"/">" en vez de ▼/▶: esos caracteres Unicode (BLACK DOWN/RIGHT-
+        # POINTING TRIANGLE) se renderizan con un recuadro visible en este
+        # sistema -- confirmado por introspección directa del canvas (el
+        # relleno coincide exactamente con el de la fila, no es un fallo de
+        # color de customtkinter, es un artefacto de la fuente con ESE
+        # glifo concreto). Mismo motivo en los botones "Anterior"/"Siguiente".
+        toggle_btn = ctk.CTkLabel(header_row, text=("v" if expanded else ">"), width=cw("toggle"), cursor="hand2")
         toggle_btn.pack(side="left", padx=(6, 0), pady=6)
         toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id: self._toggle_missing_ep_expand(tid))
 
         source_img = self._plex_logo_img if r["source"] == "plex" else self._jellyfin_logo_img
-        ctk.CTkLabel(header_row, image=source_img, text="", width=cw("logo")).pack(side="left", pady=6)
+        logo_lbl = ctk.CTkLabel(header_row, image=source_img, text="", width=cw("logo"), cursor="hand2")
+        logo_lbl.pack(side="left", pady=6)
+        logo_lbl.bind("<Button-1>", lambda ev, row=r: self._open_source_server_link(row))
 
         # "Episodios que faltan" es siempre sobre series (huecos de
         # temporada/episodio) -- no aplica a películas.
@@ -4187,6 +5403,53 @@ class App(_AppBase):
                                           text_color=ACCENT if is_fav else PENDING_COLOR)
         self._toggle_favorite("tv", tmdb_id, name, on_done=_refresh)
 
+    def _open_source_server_link(self, r: dict):
+        """Al pulsar el logo de Plex/Jellyfin de una fila en Episodios que
+        faltan, abre esa serie en la web del servidor correspondiente --
+        solo informativo, no descarga ni cambia nada. server_id es el Id
+        de Jellyfin o el ratingKey de Plex (ver _scan_missing_episodes/
+        _load_missing_episodes_from_cache); si falta (series cacheadas
+        antes de que se empezara a guardar este campo), pide reanalizar."""
+        server_id = r.get("server_id")
+        if not server_id:
+            self._set_status(
+                "No se pudo abrir: vuelve a analizar para que esta serie tenga el enlace guardado",
+                WARNING_COLOR)
+            return
+
+        if r["source"] == "jellyfin":
+            host = self.config_data.get("jellyfin_host", "").rstrip("/")
+            if not host:
+                return
+            import webbrowser
+            webbrowser.open(f"{host}/web/#/details?id={server_id}")
+        elif r["source"] == "plex":
+            host = self.config_data.get("plex_host", "").rstrip("/")
+            token = self.config_data.get("plex_token", "")
+            if not host or not token:
+                return
+            self._set_status("Abriendo en Plex...", PENDING_COLOR)
+            threading.Thread(target=self._open_plex_link_worker,
+                             args=(host, token, server_id), daemon=True).start()
+
+    def _open_plex_link_worker(self, host: str, token: str, rating_key: str):
+        # A diferencia de Jellyfin, la URL de Plex necesita el identificador
+        # del servidor además del ítem -- de ahí la llamada de red extra
+        # antes de poder abrir el navegador (ver get_plex_machine_identifier).
+        from core.media_server_refresh import get_plex_machine_identifier
+        machine_id = get_plex_machine_identifier(host, token)
+        if not machine_id:
+            self.after(0, lambda: self._set_status(
+                "No se pudo conectar con Plex para abrir el enlace", ERROR_COLOR))
+            return
+        url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key=%2Flibrary%2Fmetadata%2F{rating_key}"
+
+        def _open():
+            import webbrowser
+            webbrowser.open(url)
+            self._set_status("", PENDING_COLOR)
+        self.after(0, _open)
+
     def _build_missing_ep_detail_frame(self, parent, r: dict):
         """Construye (una sola vez por fila, la primera vez que se expande)
         el bloque con la lista completa de episodios -- ver
@@ -4251,12 +5514,19 @@ class App(_AppBase):
             header_fr.grid(row=next_row, column=0, columnspan=10, sticky="w", pady=(8, 2))
             season_key = (tmdb_id, season)
             expanded = season_key in self._missing_ep_expanded_seasons
-            arrow = "▼" if expanded else "▶"
-            toggle_btn = ctk.CTkButton(
+            arrow = "v" if expanded else ">"
+            # CTkLabel + bind (no CTkButton), sin marco -- mismo motivo que
+            # el triángulo de cada serie (ver _build_missing_ep_row): un
+            # CTkButton, aunque fg_color="transparent", sigue dibujando su
+            # rectángulo redondeado en un canvas propio, y ese redondeado
+            # deja un halo/marco visible alrededor del texto. CTkLabel no
+            # dibuja ningún rectángulo, solo el texto.
+            toggle_btn = ctk.CTkLabel(
                 header_fr, text=f"{arrow} Temporada {season} ({len(lines)} episodios)",
-                font=season_font, fg_color="transparent", anchor="w", width=220,
-                command=lambda tid=tmdb_id, s=season: self._toggle_missing_ep_season_expand(tid, s))
+                font=season_font, anchor="w", width=220, cursor="hand2")
             toggle_btn.pack(side="left")
+            toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, s=season:
+                            self._toggle_missing_ep_season_expand(tid, s))
             season_vars = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season}
             for link in season_links:
                 template = link.get("url_template", "")
@@ -4317,7 +5587,7 @@ class App(_AppBase):
         widgets = self._missing_ep_season_widgets.get(season_key)
         if widgets is None:
             return   # la temporada no está visible ahora mismo (serie colapsada) -- nada que actualizar
-        arrow = "▼" if expand_now else "▶"
+        arrow = "v" if expand_now else ">"
         widgets["toggle_btn"].configure(text=f"{arrow} Temporada {season} ({widgets['n_eps']} episodios)")
         if expand_now:
             widgets["episodes_fr"].grid()
@@ -4340,7 +5610,7 @@ class App(_AppBase):
         widgets = self._missing_ep_row_widgets.get(tmdb_id)
         if widgets is None:
             return   # la fila no está visible ahora mismo (filtrada) -- nada que actualizar
-        widgets["toggle_btn"].configure(text="▼" if expand_now else "▶")
+        widgets["toggle_btn"].configure(text="v" if expand_now else ">")
         if expand_now:
             if widgets["detail_fr"] is None:
                 widgets["detail_fr"] = self._build_missing_ep_detail_frame(widgets["row_fr"], widgets["r"])
@@ -4764,7 +6034,7 @@ class App(_AppBase):
             del cache[stale_key]
 
         def _row(tmdb_id, name, source, missing, ignored, expected=None, unknown_seasons=None,
-                 present_season_counts=None):
+                 present_season_counts=None, server_id=None):
             split_seasons = {season for season, eps in missing.items()
                              if looks_like_season_split((expected or {}).get(season, []), eps)}
             # Para la puntuación de tendencia (ver core/trending.py) --
@@ -4774,7 +6044,7 @@ class App(_AppBase):
             # merge_usage_entries), así que se puede llamar siempre igual.
             usage = usage_by_tmdb_id.get(tmdb_id) or {}
             return {
-                "tmdb_id": tmdb_id, "name": name, "source": source,
+                "tmdb_id": tmdb_id, "name": name, "source": source, "server_id": server_id,
                 "missing": missing, "summary": format_missing_summary(name, missing),
                 "ignored": ignored, "episode_titles": {}, "split_seasons": split_seasons,
                 "unknown_seasons": unknown_seasons or set(),
@@ -4915,7 +6185,8 @@ class App(_AppBase):
             if missing or unknown_seasons:
                 row = _row(tmdb_id, show.get("name", ""), source, missing, ignored,
                           expected=expected, unknown_seasons=unknown_seasons,
-                          present_season_counts=present_season_counts)
+                          present_season_counts=present_season_counts,
+                          server_id=show.get("id") or show.get("rating_key"))
                 row["episode_titles"] = episode_titles
                 row["absolute_numbering"] = absolute_numbering
                 results.append(row)
@@ -5128,9 +6399,12 @@ class App(_AppBase):
         fr.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(fr, text="Copia de seguridad de la configuración",
                      font=self._cfg_font_title).grid(row=0, column=0, pady=(12, 4))
-        ctk.CTkLabel(fr, text="Exporta toda tu configuración (categorías FTP, plantillas, servidor...) a un "
-                              "archivo, o impórtala en otra instalación. La contraseña FTP nunca se exporta "
-                              "en texto plano — tendrás que volver a introducirla tras importar.",
+        ctk.CTkLabel(fr, text="Exporta tu configuración de CLIENTE (conexión FTP, carpeta vigilada, "
+                              "preferencias de este equipo...) a un archivo, o impórtala en otra "
+                              "instalación. No incluye la configuración de servidor -- categorías, "
+                              "plantillas, Plex/Jellyfin... esa se sincroniza/publica aparte, ver "
+                              "Servidor. La contraseña FTP nunca se exporta en texto plano — tendrás "
+                              "que volver a introducirla tras importar.",
                      font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=900).grid(
             row=1, column=0, pady=(0, 8))
         bf_transfer = ctk.CTkFrame(fr, fg_color="transparent")
@@ -5149,13 +6423,14 @@ class App(_AppBase):
         )
         if not path:
             return
-        from core.learned_terms import load_learned_terms
-        data = self.config_data.to_dict()
-        # Los términos aprendidos del fallback de IA no viven en config.json
-        # (fichero aparte, core/learned_terms.py) -- se incluyen aquí para
-        # que una copia de seguridad/migración a otra instalación no los
-        # pierda y tenga que volver a aprenderlos uno a uno.
-        data["learned_junk_terms"] = load_learned_terms()
+        from core.server_config import SHARED_CONFIG_KEYS
+        # Solo configuración de CLIENTE -- la de servidor (incluidos los
+        # términos aprendidos del fallback de IA, que tampoco viven en
+        # config.json) tiene su propio mecanismo de sincronizar/publicar
+        # (ver _sync_server_config_from_ftp/_publish_server_config);
+        # meterla también aquí sería redundante y confuso, dos caminos
+        # distintos para cambiar lo mismo.
+        data = {k: v for k, v in self.config_data.to_dict().items() if k not in SHARED_CONFIG_KEYS}
         # Metadatos de versión: permiten avisar al importar si el archivo
         # viene de una versión de aRenombrar más nueva que podría usar un
         # formato que esta versión no entiende del todo.
@@ -5201,16 +6476,27 @@ class App(_AppBase):
 
         if not messagebox.askyesno(
                 "Importar configuración",
-                "Esto sobrescribirá tu configuración actual (excepto la contraseña FTP, "
-                "que deberás volver a introducir). ¿Continuar?"):
+                "Esto sobrescribirá tu configuración de CLIENTE actual (conexión FTP, carpeta "
+                "vigilada, preferencias de este equipo... excepto la contraseña FTP, que deberás "
+                "volver a introducir). No toca la configuración de servidor. ¿Continuar?"):
             return
         data.pop("ftp_password", None)   # nunca importar contraseñas en texto plano
-        learned_terms = data.pop("learned_junk_terms", None)
+        # Solo configuración de CLIENTE -- un archivo exportado con una
+        # versión anterior de la app (antes de este cambio) podía traer
+        # claves de servidor mezcladas; se descartan aquí igual que si
+        # nunca hubieran estado en el archivo (ver _export_config).
+        from core.server_config import SHARED_CONFIG_KEYS
+        data.pop("learned_junk_terms", None)
+        data = {k: v for k, v in data.items() if k not in SHARED_CONFIG_KEYS}
+        # Mismo paso de validación que al guardar Ajustes a mano (ver
+        # _save_all_settings) -- sin esto, importar una configuración con
+        # un "Tu nombre" distinto cambiaba de identidad en silencio, sin
+        # comprobar que el nombre no estuviera ya en uso ni preguntar qué
+        # hacer con las reservas del nombre anterior.
+        if "app_user_name" in data:
+            data["app_user_name"] = self._resolve_app_user_name_change(data["app_user_name"])
         self.config_data.set_many(data)
         self.config_data.save()
-        if learned_terms is not None:
-            from core.learned_terms import set_learned_terms
-            set_learned_terms(learned_terms)
         self._reload_settings_widgets()
         self._set_status("Configuración importada", SUCCESS_COLOR)
 
@@ -5231,6 +6517,7 @@ class App(_AppBase):
         self._ftp_parallel_combo.set(str(self.config_data.get("ftp_parallel", 1)))
         _set_entry(self._ftp_speed_entry, self.config_data.get("ftp_speed_limit", 0))
         _set_entry(self._ftp_retries_entry, self.config_data.get("ftp_retries", 3))
+        _set_entry(self._reservation_quota_entry, self.config_data.get("reservation_quota_gb", 100))
 
         _set_entry(self._api_key_entry, self.config_data.get("tmdb_api_key", ""))
         self._lang_combo.set(self.config_data.get("language", "es-ES"))
@@ -6635,6 +7922,10 @@ class App(_AppBase):
             retries = max(0, min(10, int(self._ftp_retries_entry.get() or 3)))
         except ValueError:
             retries = 3
+        try:
+            quota_gb = max(1, int(self._reservation_quota_entry.get().strip() or 100))
+        except ValueError:
+            quota_gb = 100
 
         self._sync_category_widgets_to_data("tv")
         self._sync_category_widgets_to_data("movie")
@@ -6697,6 +7988,8 @@ class App(_AppBase):
                 if w["name"].get().strip() or w["url"].get().strip()
             ],
 
+            "reservation_quota_gb": quota_gb,
+
             "ftp_categories": {
                 "tv":    [self._category_to_plain_dict(c) for c in self._tv_categories],
                 "movie": [self._category_to_plain_dict(c) for c in self._movie_categories],
@@ -6732,7 +8025,7 @@ class App(_AppBase):
             messagebox.showerror(
                 "Nombre en uso",
                 f"Ya hay reservas hechas por alguien llamado \"{new_name}\" -- elige un nombre "
-                "distinto para no mezclar tu cuota de 100GB con la suya.")
+                "distinto para no mezclar tu cuota de reservas con la suya.")
             return old_name
 
         if old_name and used_bytes(self._reservations, old_name) > 0:
@@ -7158,7 +8451,8 @@ class App(_AppBase):
             pass
         return []
 
-    def _save_history_entry(self, filename: str, remote: str, status: str, size: int, error_msg: str = ""):
+    def _save_history_entry(self, filename: str, remote: str, status: str, size: int, error_msg: str = "",
+                             local_path: str = ""):
         with self._history_lock:
             history = self._load_history()
             history.append({
@@ -7168,6 +8462,12 @@ class App(_AppBase):
                 "status":    status,
                 "size":      size,
                 "error_msg": error_msg,
+                # Ruta local en el momento de la subida -- solo para poder
+                # reintentar directamente desde Historial sin tener que
+                # volver a Archivos (ver _retry_history_upload). Vacía en
+                # registros de antes de este campo; el botón "Reintentar"
+                # se deshabilita en ese caso.
+                "local_path": local_path,
             })
             # Mantener solo los últimos 500 registros
             if len(history) > 500:
@@ -7263,13 +8563,13 @@ class App(_AppBase):
         nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
         nav_fr.grid(row=2, column=0, pady=(6, 0))
         self._history_prev_btn = ctk.CTkButton(
-            nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._history_change_page(-1))
         self._history_prev_btn.pack(side="left")
         self._history_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
         self._history_page_lbl.pack(side="left", padx=12)
         self._history_next_btn = ctk.CTkButton(
-            nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._history_change_page(1))
         self._history_next_btn.pack(side="left")
 
@@ -7292,6 +8592,7 @@ class App(_AppBase):
             ColumnSpec("destino", "Destino FTP / motivo", width=sw0.get("destino", 200), min_width=50, resizable=True),
             ColumnSpec("tamano", "Tamaño", width=sw0.get("tamano", 70), min_width=50, resizable=True),
             ColumnSpec("estado", "Estado", width=sw0.get("estado", 80), min_width=50),
+            ColumnSpec("accion", "", width=110),
         ])
         self._history_table.grid(row=0, column=0, sticky="nsew")
         # Al arrastrar un separador, redibujar también las filas ya
@@ -7401,7 +8702,88 @@ class App(_AppBase):
                 # todas menos la primera columna, igual que en Archivos.
                 lbl.pack(side="left", padx=(4, 0) if idx > 0 else (0, 0), pady=2)
                 row_labels[key] = lbl
+
+            # Solo tiene sentido reintentar subidas que fallaron -- y solo
+            # si se guardó la ruta local en su momento (registros de antes
+            # de este campo, o si la ruta ya no existe, se avisa al pulsar
+            # en vez de deshabilitarlo aquí en silencio, ver
+            # _retry_history_upload).
+            retry_btn = ctk.CTkButton(
+                row_fr, text="🔄 Reintentar", width=self._history_table.col_width("accion"),
+                fg_color="transparent", border_width=1,
+                state="normal" if st == "error" else "disabled",
+                command=lambda e=entry: self._retry_history_upload(e))
+            retry_btn.pack(side="left", padx=(4, 4), pady=2)
+            row_labels["accion"] = retry_btn
+
             self._history_rows.append(row_labels)
+
+    def _retry_history_upload(self, entry: dict):
+        """Reintenta una subida fallida directamente desde Historial, sin
+        tener que volver a Archivos y añadir el archivo otra vez a mano.
+        No pasa por la detección/categoría de TMDB -- ya sabemos exacta-
+        mente adónde tenía que ir (entry["remote"]), así que solo repite
+        la transferencia en sí (con reanudación si quedó un archivo
+        parcial del intento anterior)."""
+        local_path = entry.get("local_path", "")
+        if not local_path or not os.path.exists(local_path):
+            messagebox.showwarning(
+                "No se puede reintentar",
+                "El archivo original ya no está en esa ubicación -- súbelo de nuevo desde Archivos.")
+            return
+        remote = entry.get("remote", "")
+        if not remote or "/" not in remote:
+            messagebox.showwarning("No se puede reintentar", "Falta la ruta de destino de este registro.")
+            return
+        remote_dir, remote_filename = remote.rsplit("/", 1)
+        remote_dir += "/"
+        self._set_status(f"Reintentando: {Path(local_path).name}", PENDING_COLOR)
+        threading.Thread(target=self._retry_history_upload_worker,
+                         args=(local_path, remote_dir, remote_filename), daemon=True).start()
+
+    def _retry_history_upload_worker(self, local_path: str, remote_dir: str, remote_filename: str):
+        # Mismo cupo de "Subidas simultáneas" que una subida normal (ver
+        # core/upload_slots.py) -- sin esto, un reintento desde Historial
+        # podría abrir una conexión FTP extra por encima del límite que el
+        # usuario configuró, a la vez que una subida manual o automática
+        # en curso.
+        if not self._upload_slots.acquire(cancel_event=self._upload_cancel):
+            self.after(0, lambda: self._set_status("Reintento cancelado", WARNING_COLOR))
+            return
+        try:
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            ok, msg = own_ftp.connect(
+                self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
+                self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
+                self.config_data.get("ftp_use_tls", False))
+            if not ok:
+                self.after(0, lambda: self._set_status(f"No se pudo conectar: {msg}", ERROR_COLOR))
+                return
+            try:
+                speed_kbs = float(self.config_data.get("ftp_speed_limit", 0)) * 1024
+                up_ok, up_msg = own_ftp.upload_file(
+                    local_path, remote_dir, speed_limit_kbs=speed_kbs,
+                    try_resume=True, remote_filename=remote_filename)
+            finally:
+                own_ftp.disconnect()
+        finally:
+            self._upload_slots.release()
+
+        try:
+            size = Path(local_path).stat().st_size
+        except OSError:
+            size = 0
+        status = "ok" if up_ok else "error"
+        self._save_history_entry(
+            Path(local_path).name, f"{remote_dir.rstrip('/')}/{remote_filename}",
+            status, size, error_msg="" if up_ok else up_msg, local_path=local_path)
+
+        if up_ok:
+            self.after(0, lambda: self._set_status(f"Reintento OK: {remote_filename}", SUCCESS_COLOR))
+        else:
+            self.after(0, lambda: self._set_status(f"Reintento fallido: {up_msg}", ERROR_COLOR))
+        self.after(0, self._refresh_history_view)
 
     def _clear_history(self):
         try:
@@ -7524,14 +8906,14 @@ class App(_AppBase):
         self._cleanup_search_entry.pack(anchor="w", fill="x", pady=(0, 12))
 
         self._cleanup_age_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(filters_fr, text="Añadida hace más de", variable=self._cleanup_age_var
-                        ).pack(anchor="w", pady=(4, 0))
         age_row = ctk.CTkFrame(filters_fr, fg_color="transparent")
-        age_row.pack(anchor="w", padx=(24, 0), pady=(0, 12))
-        self._cleanup_age_entry = ctk.CTkEntry(age_row, width=60)
+        age_row.pack(anchor="w", pady=(4, 12))
+        ctk.CTkCheckBox(age_row, text="Añadida +", variable=self._cleanup_age_var, width=0
+                        ).pack(side="left")
+        self._cleanup_age_entry = ctk.CTkEntry(age_row, width=40)
         self._cleanup_age_entry.insert(0, "12")
-        self._cleanup_age_entry.pack(side="left")
-        ctk.CTkLabel(age_row, text="meses").pack(side="left", padx=(6, 0))
+        self._cleanup_age_entry.pack(side="left", padx=(4, 4))
+        ctk.CTkLabel(age_row, text="meses").pack(side="left")
 
         ctk.CTkLabel(filters_fr, text="Visionado",
                      font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
@@ -7578,14 +8960,14 @@ class App(_AppBase):
         self._on_cleanup_watched_mode_changed(self._cleanup_watched_combo.get())
 
         self._cleanup_size_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(filters_fr, text="Más de", variable=self._cleanup_size_var
-                        ).pack(anchor="w", pady=(4, 0))
         size_row = ctk.CTkFrame(filters_fr, fg_color="transparent")
-        size_row.pack(anchor="w", padx=(24, 0), pady=(0, 12))
-        self._cleanup_size_entry = ctk.CTkEntry(size_row, width=60)
+        size_row.pack(anchor="w", pady=(4, 12))
+        ctk.CTkCheckBox(size_row, text="Más de", variable=self._cleanup_size_var, width=0
+                        ).pack(side="left")
+        self._cleanup_size_entry = ctk.CTkEntry(size_row, width=40)
         self._cleanup_size_entry.insert(0, "5")
-        self._cleanup_size_entry.pack(side="left")
-        ctk.CTkLabel(size_row, text="GB").pack(side="left", padx=(6, 0))
+        self._cleanup_size_entry.pack(side="left", padx=(4, 4))
+        ctk.CTkLabel(size_row, text="GB").pack(side="left")
 
         ctk.CTkLabel(filters_fr, text="Tipo",
                      font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(0, 4))
@@ -7680,13 +9062,13 @@ class App(_AppBase):
         cleanup_nav_fr = ctk.CTkFrame(bottom_bar, fg_color="transparent")
         cleanup_nav_fr.grid(row=0, column=1)
         self._cleanup_prev_btn = ctk.CTkButton(
-            cleanup_nav_fr, text="◀ Anterior", width=100, fg_color="transparent", border_width=1,
+            cleanup_nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._cleanup_change_page(-1))
         self._cleanup_prev_btn.pack(side="left")
         self._cleanup_page_lbl = ctk.CTkLabel(cleanup_nav_fr, text="", text_color=PENDING_COLOR)
         self._cleanup_page_lbl.pack(side="left", padx=12)
         self._cleanup_next_btn = ctk.CTkButton(
-            cleanup_nav_fr, text="Siguiente ▶", width=100, fg_color="transparent", border_width=1,
+            cleanup_nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
             command=lambda: self._cleanup_change_page(1))
         self._cleanup_next_btn.pack(side="left")
 
@@ -8278,7 +9660,7 @@ class App(_AppBase):
                       command=lambda it=item: self._toggle_cleanup_item_favorite(it)).pack(
             side="left", padx=(0, 4), pady=6)
 
-        # Igual que favoritos pero con cuota de 100GB por usuario (ver
+        # Igual que favoritos pero con cuota configurable por usuario (ver
         # core/reservations.py) -- "🔒" reservado (por cualquiera, no solo
         # el usuario actual), "🔓" libre.
         ctk.CTkButton(row, text="🔒" if is_res else "🔓", width=cw("reserve"), fg_color="transparent",
@@ -8407,16 +9789,36 @@ class App(_AppBase):
         self._toggle_reservation(item.media_type, item.tmdb_id, item.name, item.size_bytes,
                                   on_done=self._apply_cleanup_filters)
 
+    def _quota_status(self, user: str) -> tuple:
+        """(used_gb, quota_gb, color, aviso) para una etiqueta de cuota de
+        reservas -- aviso PROACTIVO en cuanto se supera el 90% del límite
+        configurado (ver _reservation_quota_bytes), no solo al fallar un
+        intento de reservar algo que ya no cabe (ver _toggle_reservation).
+        Calculado en un único sitio para que Liberar espacio y Protegidos
+        coincidan siempre en cuándo avisar."""
+        from core.reservations import used_bytes
+        quota_bytes = self._reservation_quota_bytes()
+        used = used_bytes(self._reservations, user)
+        quota_gb = quota_bytes / (1024 ** 3)
+        ratio = used / quota_bytes if quota_bytes else 0
+        if ratio >= 1.0:
+            color, aviso = ERROR_COLOR, " -- cuota agotada"
+        elif ratio >= 0.9:
+            color, aviso = WARNING_COLOR, " ⚠ cerca del límite"
+        else:
+            color, aviso = PENDING_COLOR, ""
+        return used / (1024 ** 3), quota_gb, color, aviso
+
     def _update_cleanup_quota_label(self):
-        from core.reservations import used_bytes, QUOTA_BYTES
         user = self.config_data.get("app_user_name", "").strip()
         if not user:
             self._cleanup_quota_lbl.configure(
-                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.")
+                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.",
+                text_color=PENDING_COLOR)
             return
-        used_gb = used_bytes(self._reservations, user) / (1024 ** 3)
-        quota_gb = QUOTA_BYTES / (1024 ** 3)
-        self._cleanup_quota_lbl.configure(text=f"Reservado por {user}: {used_gb:.1f} de {quota_gb:.0f}GB")
+        used_gb, quota_gb, color, aviso = self._quota_status(user)
+        self._cleanup_quota_lbl.configure(
+            text=f"Reservado por {user}: {used_gb:.1f} de {quota_gb:.0f}GB{aviso}", text_color=color)
 
     def _confirm_and_delete_cleanup_item(self, item):
         """Un solo elemento, con confirmación explícita -- nunca hay un
@@ -8557,15 +9959,15 @@ class App(_AppBase):
         user = self.config_data.get("app_user_name", "").strip()
         show_all = self._protected_show_all_var.get()
 
-        from core.reservations import used_bytes, QUOTA_BYTES
         if not user:
             self._protected_quota_lbl.configure(
-                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.")
+                text="Configura \"Tu nombre\" en Ajustes → Conexión FTP para poder reservar espacio.",
+                text_color=PENDING_COLOR)
         else:
-            used_gb = used_bytes(self._reservations, user) / (1024 ** 3)
-            quota_gb = QUOTA_BYTES / (1024 ** 3)
+            used_gb, quota_gb, color, aviso = self._quota_status(user)
             self._protected_quota_lbl.configure(
-                text=f"Tu cuota ({user}): {used_gb:.1f} de {quota_gb:.0f}GB reservados")
+                text=f"Tu cuota ({user}): {used_gb:.1f} de {quota_gb:.0f}GB reservados{aviso}",
+                text_color=color)
 
         if show_all:
             shown = list(self._reservations.items())

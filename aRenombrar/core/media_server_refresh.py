@@ -17,6 +17,8 @@ import time
 from typing import Optional
 
 import requests
+from plexapi.myplex import MyPlexAccount
+from plexapi.server import PlexServer
 
 from core.applog import get_logger
 
@@ -37,6 +39,21 @@ def parse_media_date(value):
         return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _plex_tmdb_id_from_guids(guids: list) -> Optional[int]:
+    """Extrae el tmdb_id de la lista "Guid" que trae Plex en cada item
+    (p.ej. [{"id": "tmdb://1396"}, {"id": "imdb://tt0903747"}, ...]) --
+    factorizado aquí porque get_plex_series/get_plex_usage_stats/las
+    funciones de visionado por usuario lo necesitan por igual."""
+    for g in guids or []:
+        gid = g.get("id", "")
+        if gid.startswith("tmdb://"):
+            try:
+                return int(gid.split("tmdb://", 1)[1])
+            except ValueError:
+                return None
+    return None
 
 
 _last_refresh_ts = 0.0
@@ -241,15 +258,7 @@ def get_plex_series(host: str, token: str, timeout: int = 15) -> Optional[list]:
             _log.warning("Plex: fallo al listar series de la sección %s: %s", sec_id, e)
             continue
         for item in items:
-            tmdb_id = None
-            for g in item.get("Guid", []) or []:
-                gid = g.get("id", "")
-                if gid.startswith("tmdb://"):
-                    try:
-                        tmdb_id = int(gid.split("tmdb://", 1)[1])
-                    except ValueError:
-                        pass
-                    break
+            tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
             shows.append({"rating_key": item.get("ratingKey"), "name": item.get("title", ""),
                           "tmdb_id": tmdb_id})
     return shows
@@ -279,6 +288,30 @@ def get_plex_episodes(host: str, token: str, rating_key: str, timeout: int = 15)
         if season is not None and episode is not None:
             present.add((season, episode))
     return present
+
+
+def get_plex_machine_identifier(host: str, token: str, timeout: int = 10) -> Optional[str]:
+    """Identificador único de ESTE servidor Plex -- a diferencia de Jellyfin,
+    un enlace a la app web de Plex (app.plex.tv) no basta con el ID del
+    ítem: la URL también codifica a qué servidor pertenece, porque la app
+    web es la misma para cualquier servidor Plex del mundo. Se usa para
+    construir el enlace "abrir en Plex" del logo de origen en Episodios que
+    faltan (ver gui/app.py::_open_source_server_link)."""
+    if not host or not token:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/",
+            params={"X-Plex-Token": token},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json().get("MediaContainer", {}).get("machineIdentifier") or None
+    except Exception as e:
+        _log.warning("Plex: fallo al obtener el identificador del servidor: %s", e)
+        return None
 
 
 def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
@@ -500,15 +533,7 @@ def get_plex_usage_stats(host: str, token: str, timeout: int = 20) -> Optional[d
             _log.warning("Plex: fallo al consultar datos de uso de la sección %s: %s", sec_id, e)
             continue
         for item in items:
-            tmdb_id = None
-            for g in item.get("Guid", []) or []:
-                gid = g.get("id", "")
-                if gid.startswith("tmdb://"):
-                    try:
-                        tmdb_id = int(gid.split("tmdb://", 1)[1])
-                    except ValueError:
-                        pass
-                    break
+            tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
             media_type = "tv" if sec_type == "show" else "movie"
             if media_type == "movie":
                 fully_watched = (item.get("viewCount") or 0) > 0
@@ -561,6 +586,251 @@ def get_plex_usage_stats(host: str, token: str, timeout: int = 20) -> Optional[d
 
     _log.info("Plex: %d elemento(s) con datos de uso obtenidos", len(stats))
     return stats
+
+
+# ── Sincronizar visionado por usuario entre Plex y Jellyfin ─────────────────
+#
+# A diferencia de get_plex_usage_stats/get_jellyfin_usage_stats (que
+# AGREGAN el visionado de todos los usuarios en un único resultado, para
+# "liberar espacio", donde solo importa si ALGUIEN vio algo), aquí hace
+# falta el estado POR USUARIO por separado, para poder sincronizarlo entre
+# las dos plataformas persona a persona.
+#
+# El lado de Plex usa la librería plexapi en vez de requests a mano (a
+# diferencia del resto de este archivo) -- el propio token de servidor NO
+# basta para listar usuarios ni conseguir un token por usuario (eso vive
+# en la API de cuenta de plex.tv, no en el servidor local), y reimplementar
+# a mano el cambio de usuario es la parte más delicada de esta función.
+# Confirmado en vivo (ver plan): 27/27 usuarios reales sin bloqueo de PIN,
+# y tanto la lectura como la escritura (markWatched/markUnwatched)
+# funcionan de forma fiable a través del token por usuario.
+
+def get_plex_home_users(host: str, owner_token: str, timeout: int = 15) -> Optional[list]:
+    """[{"id": str, "title": str}, ...] -- todos los usuarios (Home/
+    gestionados o compartidos) con acceso al servidor Plex del propietario
+    de *owner_token*, SIN el propio propietario (igual que
+    MyPlexAccount.users()). None si falla o no está configurado."""
+    if not host or not owner_token:
+        return None
+    try:
+        account = MyPlexAccount(token=owner_token)
+        users = account.users()
+    except Exception as e:
+        _log.warning("Plex: fallo al listar usuarios de la cuenta: %s", e)
+        return None
+    return [{"id": str(u.id), "title": u.title} for u in users]
+
+
+def get_plex_user_token(host: str, owner_token: str, plex_user_id: str,
+                        timeout: int = 15) -> Optional[str]:
+    """Token de acceso al servidor Plex de *host*, pero autenticado COMO
+    el usuario *plex_user_id* (no el propietario) -- necesario para leer/
+    escribir el visionado de ese usuario en concreto. Nunca se cachea por
+    el llamador (ver el porqué en el plan: vida corta, más seguro
+    re-derivarlo cada vez que guardarlo). None si el usuario no existe o
+    la llamada falla (p.ej. una cuenta restringida con PIN -- no
+    confirmado como bloqueante en la práctica, pero se trata igual como
+    "no disponible" si ocurre)."""
+    if not host or not owner_token or not plex_user_id:
+        return None
+    try:
+        account = MyPlexAccount(token=owner_token)
+        plex = PlexServer(host, owner_token)
+        user = next((u for u in account.users() if str(u.id) == str(plex_user_id)), None)
+        if user is None:
+            _log.warning("Plex: usuario id=%s no encontrado", plex_user_id)
+            return None
+        return user.get_token(plex.machineIdentifier)
+    except Exception as e:
+        _log.warning("Plex: fallo al obtener token del usuario id=%s: %s", plex_user_id, e)
+        return None
+
+
+def get_jellyfin_users(host: str, api_key: str, timeout: int = 10) -> Optional[list]:
+    """[{"id": str, "name": str}, ...] -- todos los usuarios de Jellyfin.
+    Mismo GET /Users que ya hace get_jellyfin_usage_stats internamente,
+    factorizado aquí como función propia para no duplicarlo."""
+    if not host or not api_key:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(f"{base}/Users", headers={"X-Emby-Token": api_key}, timeout=timeout)
+        resp.raise_for_status()
+        users = resp.json() or []
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al listar usuarios: %s", e)
+        return None
+    return [{"id": u.get("Id"), "name": u.get("Name", "")} for u in users]
+
+
+def get_plex_episode_watched(host: str, user_token: str, rating_key: str,
+                             timeout: int = 15) -> Optional[dict]:
+    """{(temporada, episodio): {"watched": bool, "ref": ratingKey_episodio}, ...}
+    para la serie *rating_key*, para el usuario dueño de *user_token* -- a
+    diferencia de get_plex_episodes() (que solo confirma que el episodio
+    existe), aquí importa si ESE usuario en concreto lo ha visto, y se
+    guarda el ratingKey de CADA episodio (no el de la serie) para poder
+    escribir en él después."""
+    if not host or not user_token or not rating_key:
+        return None
+    try:
+        plex = PlexServer(host, user_token)
+        show = plex.fetchItem(int(rating_key))
+        result = {}
+        for ep in show.episodes():
+            if ep.parentIndex is not None and ep.index is not None:
+                result[(ep.parentIndex, ep.index)] = {
+                    "watched": bool(ep.isWatched), "ref": str(ep.ratingKey)}
+        return result
+    except Exception as e:
+        _log.warning("Plex: fallo al leer visionado de episodios de %s: %s", rating_key, e)
+        return None
+
+
+def get_jellyfin_episode_watched(host: str, api_key: str, user_id: str, series_id: str,
+                                 timeout: int = 15) -> Optional[dict]:
+    """{(temporada, episodio): {"watched": bool, "ref": itemId_episodio}, ...}
+    para la serie *series_id*, para el usuario *user_id* -- consulta
+    SIEMPRE a través de /Users/{user_id}/Items (no del endpoint genérico
+    sin usuario, que puede omitir UserData -- ver issue
+    jellyfin/jellyfin#11408)."""
+    if not host or not api_key or not user_id or not series_id:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/Users/{user_id}/Items",
+            headers={"X-Emby-Token": api_key},
+            params={"ParentId": series_id, "IncludeItemTypes": "Episode",
+                   "Fields": "UserData", "Recursive": "true"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items", []) or []
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al leer visionado de episodios de %s (usuario %s): %s",
+                     series_id, user_id, e)
+        return None
+    result = {}
+    for ep in items:
+        season, episode = ep.get("ParentIndexNumber"), ep.get("IndexNumber")
+        if season is not None and episode is not None:
+            result[(season, episode)] = {
+                "watched": bool((ep.get("UserData") or {}).get("Played")), "ref": ep.get("Id")}
+    return result
+
+
+def get_plex_movie_watched(host: str, user_token: str, timeout: int = 20) -> Optional[dict]:
+    """{tmdb_id: {"watched": bool, "ref": ratingKey, "name": título}, ...}
+    para todas las películas del servidor, para el usuario dueño de
+    *user_token*."""
+    if not host or not user_token:
+        return None
+    try:
+        plex = PlexServer(host, user_token)
+        result = {}
+        for sec in plex.library.sections():
+            if sec.type != "movie":
+                continue
+            for movie in sec.all():
+                tmdb_id = _plex_tmdb_id_from_guids([{"id": g.id} for g in getattr(movie, "guids", [])])
+                if tmdb_id is not None:
+                    result[tmdb_id] = {"watched": bool(movie.isWatched), "ref": str(movie.ratingKey),
+                                       "name": movie.title}
+        return result
+    except Exception as e:
+        _log.warning("Plex: fallo al leer visionado de películas: %s", e)
+        return None
+
+
+def get_jellyfin_movie_watched(host: str, api_key: str, user_id: str,
+                               timeout: int = 20) -> Optional[dict]:
+    """{tmdb_id: {"watched": bool, "ref": itemId, "name": título}, ...}
+    para todas las películas de Jellyfin, para el usuario *user_id*."""
+    if not host or not api_key or not user_id:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/Users/{user_id}/Items",
+            headers={"X-Emby-Token": api_key},
+            params={"IncludeItemTypes": "Movie", "Recursive": "true",
+                   "Fields": "UserData,ProviderIds"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items", []) or []
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al leer visionado de películas (usuario %s): %s", user_id, e)
+        return None
+    result = {}
+    for item in items:
+        tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
+        try:
+            tmdb_id = int(tmdb_raw) if tmdb_raw else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        if tmdb_id is not None:
+            result[tmdb_id] = {"watched": bool((item.get("UserData") or {}).get("Played")),
+                               "ref": item.get("Id"), "name": item.get("Name", "")}
+    return result
+
+
+def mark_plex_watched(host: str, user_token: str, rating_key: str, timeout: int = 10) -> bool:
+    """Marca como vista (para el usuario dueño de *user_token*) la
+    película/episodio *rating_key*. Sin equivalente "desmarcar" -- la
+    sincronización nunca necesita quitar el visto, ver el plan."""
+    if not host or not user_token or not rating_key:
+        return False
+    try:
+        plex = PlexServer(host, user_token)
+        plex.fetchItem(int(rating_key)).markWatched()
+        return True
+    except Exception as e:
+        _log.warning("Plex: fallo al marcar como vista %s: %s", rating_key, e)
+        return False
+
+
+def mark_jellyfin_watched(host: str, api_key: str, user_id: str, item_id: str,
+                          timeout: int = 10) -> bool:
+    """Marca como vista (para *user_id*) la película/episodio *item_id*."""
+    if not host or not api_key or not user_id or not item_id:
+        return False
+    base = host.rstrip("/")
+    try:
+        resp = requests.post(f"{base}/Users/{user_id}/PlayedItems/{item_id}",
+                             headers={"X-Emby-Token": api_key}, timeout=timeout)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al marcar como vista %s (usuario %s): %s", item_id, user_id, e)
+        return False
+
+
+def verify_jellyfin_password(host: str, username: str, password: str, timeout: int = 10) -> bool:
+    """True si *password* es de verdad la contraseña de *username* en
+    Jellyfin -- POST /Users/AuthenticateByName. Usado al emparejar
+    usuarios en "Sincronizar visionado" (ver core/watch_sync.py): Plex no
+    tiene equivalente para usuarios gestionados de Plex Home (no tienen
+    contraseña propia, confirmado contra la documentación oficial de
+    Plex), así que esto solo puede confirmar la mitad Jellyfin del
+    emparejamiento -- no sustituye la confirmación humana de que ambas
+    cuentas son la misma persona."""
+    if not host or not username or not password:
+        return False
+    base = host.rstrip("/")
+    try:
+        resp = requests.post(
+            f"{base}/Users/AuthenticateByName",
+            headers={"Authorization": 'MediaBrowser Client="aRenombrar", Device="aRenombrar", '
+                                      'DeviceId="arenombrar-watch-sync", Version="1.0.0"'},
+            json={"Username": username, "Pw": password},
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al verificar contraseña de '%s': %s", username, e)
+        return False
 
 
 def get_jellyfin_storage_folders(host: str, api_key: str, timeout: int = 10) -> Optional[list]:

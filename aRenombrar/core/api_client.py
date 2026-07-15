@@ -228,8 +228,11 @@ EPISODE_PATTERNS = [
     (r"[Ee][Pp][\s.\-]*(\d{2,4})", "anime"),
     # Cap.01 / Capitulo 01
     (r"[Cc]ap(?:itulo)?[\s.\-]*(\d{1,3})", "anime"),
-    # - 01 - (anime, número aislado)
-    (r"[\s\-](\d{2,4})[\s\-]", "anime"),
+    # - 01 - / - 01 (al final del nombre, ya sin extensión -- visto de
+    # verdad en release groups que nombran "Serie - 320.mp4" sin nada
+    # después del número: exigir separador también a la derecha dejaba
+    # esos episodios sin temporada/episodio reconocido)
+    (r"[\s\-](\d{2,4})(?:[\s\-]|$)", "anime"),
 ]
 
 # Términos que delatan "a partir de aquí ya no es el título, es basura

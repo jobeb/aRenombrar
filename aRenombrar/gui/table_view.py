@@ -70,22 +70,80 @@ class TableView(ctk.CTkFrame):
     _PADX_BETWEEN = 4   # separación horizontal entre columnas consecutivas
     _HEADER_TEXT_PADDING = 16   # margen que se añade al medir el texto de cabecera
 
-    def __init__(self, master, columns, **kwargs):
-        super().__init__(master, fg_color="transparent", **kwargs)
+    def __init__(self, master, columns, scrollable: bool = True, **kwargs):
+        """scrollable=False: self.body es un CTkFrame normal (crece con
+        cada fila añadida, sin barra de scroll propia) en vez de un
+        CTkScrollableFrame -- para listas pequeñas/ya acotadas (p.ej. ya
+        paginadas) que deben apoyarse en el scroll de la pantalla que las
+        contiene, no tener una segunda barra de scroll anidada e inútil
+        (ver "Sincronizar visionado"). Por defecto True: mismo
+        comportamiento de siempre, el que necesitan Archivos/Episodios/
+        Liberar espacio/Historial con listas sin acotar."""
+        # border_width en el propio TableView (aunque fg_color siga
+        # "transparent"): sin esto, el "contenedor" de la tabla no tiene
+        # ningún límite visible propio -- depende por completo de que el
+        # color de fondo heredado del padre contraste con el de las filas,
+        # lo cual varía según dónde se monte la tabla (CTkTabview resuelve
+        # su propio fg_color de forma distinta según el color del SUYO,
+        # ver ctk_tabview.py) y llevó a que la tabla de "Usuarios
+        # emparejados" (Sincronizar visionado) se fundiera con el fondo
+        # pese a que las filas ya tenían su color de la convención
+        # establecida. Un borde explícito garantiza el límite sin
+        # depender de esa cadena de colores heredados.
+        super().__init__(master, fg_color="transparent",
+                          border_width=1, border_color=("gray70", "gray30"), **kwargs)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
         self.columns = columns
+        self.scrollable = scrollable
         self._widths = {}
         self._header_min = {}   # ancho mínimo para que quepa el texto de cabecera -- ver _init_widths
         self._sash_state = None
         self._header_labels = {}
         self._bold_font = ctk.CTkFont(weight="bold")
 
-        self.header_frame = ctk.CTkFrame(self, corner_radius=0)
+        # fg_color explícito: sin esto la cabecera usa el gris por defecto
+        # de CTkFrame (gray17 en modo oscuro), que es EXACTAMENTE el mismo
+        # gris que las filas (ver fg_color=("gray95","gray17") en las
+        # filas de cada pestaña) -- cabecera y filas se fundían en un solo
+        # bloque sin ninguna línea de separación entre ambas.
+        self.header_frame = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray80", "gray23"))
         self.header_frame.grid(row=0, column=0, sticky="ew")
 
-        self.body = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        if scrollable:
+            # fg_color explícito, mismo motivo que en la rama scrollable=False
+            # de abajo: CTkScrollableFrame, con fg_color="transparent", delega
+            # su color real de fondo a un CTkFrame interno (self._parent_frame)
+            # que a su vez recorre la cadena de padres "transparent" hacia
+            # arriba (customtkinter._detect_color_of_master) para adivinarlo.
+            # Cuantos más niveles de frames "transparent" haya de por medio
+            # (Archivos/Episodios/etc. anidan varios: pestaña → body → este
+            # TableView → CTkScrollableFrame), más falla esa adivinanza --
+            # se notó como un recuadro mal coloreado justo en las esquinas
+            # redondeadas de la primera fila, pegado al triángulo de
+            # expandir/colapsar de Episodios que faltan (que vive ahí
+            # pegado al borde izquierdo). Un color fijo aquí corta esa
+            # cadena de raíz, igual que ya se hizo abajo para scrollable=False.
+            self.body = ctk.CTkScrollableFrame(self, fg_color=("gray92", "gray14"))
+        else:
+            # fg_color explícito (NO "transparent"): con scrollable=False,
+            # self.body es un CTkFrame normal colgado de una cadena de
+            # frames "transparent" (mapping_fr → fr → outer CTkScrollableFrame
+            # → tab de CTkTabview) -- customtkinter recorre esa cadena para
+            # calcular su color real de fondo, y con esa cadena tan larga
+            # (y un CTkTabview de por medio, que decide su propio fg_color
+            # de forma dinámica según el de SU padre) el cálculo salía
+            # inconsistente entre pasadas de dibujado: las filas (encima
+            # de este frame) se fundían con el fondo, y además el redondeado
+            # de esquinas de la primera fila usaba un color de esquina
+            # distinto arriba que abajo (el propio bg_color detectado
+            # había cambiado entre un redibujado y otro). Un color propio y
+            # fijo aquí corta esa cadena: cada fila detecta SIEMPRE el
+            # mismo padre real, así que su redondeado es consistente y
+            # contrasta de forma predecible con fg_color=("gray95","gray17")
+            # de las filas.
+            self.body = ctk.CTkFrame(self, fg_color=("gray92", "gray14"))
         self.body.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
 
         self._init_widths()
@@ -229,4 +287,8 @@ class TableView(ctk.CTkFrame):
             w.destroy()
 
     def scroll_to_top(self):
-        self.body._parent_canvas.yview_moveto(0)
+        """No-op si scrollable=False -- self.body es un CTkFrame normal,
+        sin canvas de scroll que mover (el scroll, si hace falta, lo da
+        la pantalla que contiene esta tabla)."""
+        if self.scrollable:
+            self.body._parent_canvas.yview_moveto(0)

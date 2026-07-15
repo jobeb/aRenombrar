@@ -1,0 +1,34 @@
+name: Tests
+
+# En cada push a main y en cada PR -- solo instala lo que core/ y config.py
+# necesitan de verdad (requests, keyring, pytest), no las dependencias de
+# interfaz gráfica de requirements.txt (customtkinter, tkinterdnd2,
+# pystray, Pillow): los tests solo cubren la lógica pura de core/ (sin
+# tkinter, ver CLAUDE.md), así que instalar menos hace el workflow más
+# rápido y evita depender de que esos paquetes de GUI instalen limpio en
+# un runner Linux sin entorno gráfico.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aRenombrar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests keyring pytest
+
+      - name: Ejecutar tests
+        run: pytest tests/ -v
