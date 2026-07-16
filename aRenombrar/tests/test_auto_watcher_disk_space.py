@@ -48,6 +48,7 @@ def _make_watcher(folder, free_space, upload_calls):
 
     ftp = MagicMock()
     ftp.is_connected.return_value = True
+    ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/peliculas/Mi Pelicula/"
     ftp.get_free_space.return_value = free_space
     ftp.list_files.return_value = []   # carpeta vacia -- sin duplicados
@@ -59,7 +60,8 @@ def _make_watcher(folder, free_space, upload_calls):
 
     watcher = AutoWatcher(str(folder), config, tmdb, ftp,
                            on_event=lambda *a, **k: None,
-                           on_file_event=lambda *a, **k: None)
+                           on_file_event=lambda *a, **k: None,
+                           ftp_factory=lambda: ftp)
     watcher._is_stable = lambda path: True
     return watcher, ftp
 

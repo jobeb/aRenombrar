@@ -43,7 +43,8 @@ def _make_watcher(folder, tmdb, ftp):
     })
     return AutoWatcher(str(folder), config, tmdb, ftp,
                         on_event=lambda *a, **k: None,
-                        on_file_event=lambda *a, **k: None)
+                        on_file_event=lambda *a, **k: None,
+                        ftp_factory=lambda: ftp)
 
 
 def _make_tmdb(slow_query_substring=None, slow_seconds=0.4):
@@ -64,6 +65,7 @@ def _make_tmdb(slow_query_substring=None, slow_seconds=0.4):
 def _make_ftp(upload_order: list):
     ftp = MagicMock()
     ftp.is_connected.return_value = True
+    ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/peliculas/X/"
     ftp.get_free_space.return_value = None
     ftp.list_files.return_value = []
@@ -177,7 +179,8 @@ def test_ticket_not_consumed_does_not_block_the_queue(tmp_path):
     ftp = _make_ftp(upload_order)
     watcher = AutoWatcher(str(tmp_path), config, tmdb, ftp,
                            on_event=lambda *a, **k: None,
-                           on_file_event=lambda *a, **k: None)
+                           on_file_event=lambda *a, **k: None,
+                           ftp_factory=lambda: ftp)
     watcher._is_stable = lambda path: True
 
     watcher._scan()

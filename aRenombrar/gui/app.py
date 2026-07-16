@@ -2470,7 +2470,22 @@ class App(_AppBase):
             if root not in self._ftp_dir_cache or force_refresh:
                 if use_cache_only:
                     continue
-                self._ftp_dir_cache[root] = ftp_conn.list_dirs(root)
+                # Dos listados, no uno -- visto de verdad con "(Des)encanto":
+                # ya tenía carpeta en "Series" desde antes, pero un ÚNICO
+                # NLST a esa raíz (360 carpetas) a veces vuelve incompleto
+                # sin dar ningún error (mismo servidor donde LIST -R se
+                # corta sistemáticamente, ver _build_ftp_episode_index) --
+                # eso hacía que ESE episodio (y todos los de la misma tanda,
+                # que reutilizan esta misma caché) acabaran mal clasificados
+                # por género en vez de en la carpeta que ya tenían. La unión
+                # de dos intentos independientes es mucho menos probable que
+                # pierda la misma carpeta en los dos a la vez.
+                first = set(ftp_conn.list_dirs(root))
+                second = set(ftp_conn.list_dirs(root))
+                if first != second:
+                    _log.warning("Listado de '%s' inconsistente entre dos intentos seguidos "
+                                "(%d vs %d carpetas) -- usando la unión de ambos", root, len(first), len(second))
+                self._ftp_dir_cache[root] = list(first | second)
             existing = self._ftp_dir_cache[root]
             # Nombre real de carpeta ya conocido (ver get_jellyfin_series::
             # folder_name) -- comprobado ANTES del parecido difuso: el
@@ -2584,7 +2599,25 @@ class App(_AppBase):
                 # la clasificación automática -- ver _find_category_with_existing_folder.
                 existing_category, _existing_name = self._find_category_with_existing_folder(ftp_conn, info)
                 if existing_category:
+                    if category and existing_category.get("root") != category.get("root"):
+                        _log.info(
+                            "Subida: '%s' (tmdb_id=%s) -- categoría por género sería '%s', "
+                            "pero ya existe carpeta en '%s' -- se usa esta última",
+                            info.title, info.tmdb_id, category.get("name"), existing_category.get("name"))
                     category = existing_category
+                else:
+                    # Sin coincidencia de alta confianza en NINGUNA categoría
+                    # -- normal en una serie nueva, pero también el síntoma
+                    # visto de verdad con "(Des)encanto": ya tenía carpeta en
+                    # "Series", pero esta comprobación no la encontró esa vez
+                    # (coincidiendo con un reescaneo pesado a la vez) y acabó
+                    # en "SeriesPeques" solo por género (Animación). Con esto
+                    # en el log, la próxima vez que pase se ve al momento en
+                    # vez de por casualidad al revisar el FTP a mano.
+                    _log.info(
+                        "Subida: '%s' (tmdb_id=%s) -- sin carpeta existente encontrada en ninguna "
+                        "categoría, se usa la de género: '%s'",
+                        info.title, info.tmdb_id, category.get("name") if category else None)
             if not category:
                 entry.status    = "error"
                 entry.error_msg = "Sin categoría FTP configurada"
@@ -2912,6 +2945,18 @@ class App(_AppBase):
             self._upload_running = False
             return
 
+        if len(pool) < parallel:
+            # Diagnóstico: "conexiones en paralelo" pedía "parallel", pero
+            # si alguna conexión de más falla a mitad del bucle de arriba,
+            # este queda con MENOS -- y como pool no está vacío, seguía
+            # adelante en silencio con ese cupo reducido, sin avisar de que
+            # las subidas iban a ir con menos paralelismo del configurado.
+            _log.warning("Subida: se pidieron %d conexiones en paralelo pero solo se consiguieron %d "
+                        "(%s) -- las subidas de esta tanda irán con menos paralelismo del configurado",
+                        parallel, len(pool), connect_error or "sin más detalle")
+        else:
+            _log.info("Subida: %d conexión(es) en paralelo listas para esta tanda", len(pool))
+
         import queue as _queue
         conn_q = _queue.Queue()
         for c in pool:
@@ -2975,6 +3020,7 @@ class App(_AppBase):
         with ThreadPoolExecutor(max_workers=len(pool)) as executor:
             idx     = 0
             pending = {}   # future → entry
+            _logged_fill = False
             while not self._upload_cancel.is_set():
                 # Enviar trabajos disponibles hasta llenar el pool
                 while idx < len(self._upload_queue) and len(pending) < len(pool):
@@ -2982,6 +3028,17 @@ class App(_AppBase):
                     idx += 1
                     f = executor.submit(process, e)
                     pending[f] = e
+                if not _logged_fill and len(self._upload_queue) > 1:
+                    # Diagnóstico una sola vez, al primer llenado -- cuántos
+                    # archivos se enviaron a la vez de golpe frente a los
+                    # que había en cola y cuántas conexiones había
+                    # disponibles. Si esto muestra 1 en vez de len(pool),
+                    # el paralelismo se está perdiendo ANTES de llegar
+                    # siquiera a _upload_slots (que se comprobó aparte y sí
+                    # permite varias a la vez), no dentro de él.
+                    _logged_fill = True
+                    _log.info("Subida: %d archivo(s) enviados a la vez al arrancar (de %d en cola, "
+                              "%d conexión(es) disponibles)", len(pending), len(self._upload_queue), len(pool))
                 if pending:
                     done, _ = _fut_wait(list(pending), timeout=0.3, return_when=_FIRST)
                     for f in done:

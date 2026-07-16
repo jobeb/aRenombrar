@@ -59,6 +59,7 @@ def _make_watcher(existing_remote_files, upload_calls, media_type="movie",
 
     ftp = MagicMock()
     ftp.is_connected.return_value = True
+    ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/destino/"
     ftp.get_free_space.return_value = None
     ftp.list_files.return_value = existing_remote_files
@@ -70,7 +71,8 @@ def _make_watcher(existing_remote_files, upload_calls, media_type="movie",
 
     watcher = AutoWatcher("/carpeta", config, tmdb, ftp,
                            on_event=lambda *a, **k: None,
-                           on_file_event=lambda *a, **k: None)
+                           on_file_event=lambda *a, **k: None,
+                           ftp_factory=lambda: ftp)
     watcher._is_stable = lambda path: True
     return watcher, ftp
 

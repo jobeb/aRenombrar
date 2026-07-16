@@ -20,7 +20,7 @@ from pathlib import Path
 
 from core.api_client import detect_episode
 from core.renamer import build_new_name, rename_file, is_video_file
-from core.ftp_client import _ftp_safe
+from core.ftp_client import FTPClient, _ftp_safe
 from core.series_match import best_match
 from core.ftp_categories import choose_category
 from core.upload_slots import UploadSlotManager
@@ -59,7 +59,7 @@ _LOCKED_FILE_HINTS = (
 
 class AutoWatcher:
     def __init__(self, folder: str, config, tmdb_client, ftp_client, on_event, on_file_event=None,
-                 upload_slots=None, ftp_lock=None):
+                 upload_slots=None, ftp_lock=None, ftp_factory=None):
         """
         on_event(tipo, mensaje)
           tipo: "info" | "ok" | "skip" | "error"
@@ -75,6 +75,11 @@ class AutoWatcher:
           se pasa (uso standalone/tests), se crea uno propio -- pero entonces
           solo protege a AutoWatcher de sí mismo, no de otros usuarios
           concurrentes de la misma conexión.
+        ftp_factory: fábrica sin argumentos para crear la conexión FTP
+          DEDICADA de cada transferencia real (ver _upload_to_ftp) -- nunca
+          self.ftp, que es solo para comandos ligeros de control. Por
+          defecto crea una FTPClient() nueva de verdad; los tests pasan un
+          MagicMock aquí para no abrir conexiones reales.
         """
         self.folder         = Path(folder)
         self.config         = config
@@ -83,6 +88,7 @@ class AutoWatcher:
         self.on_event       = on_event
         self.on_file_event  = on_file_event or (lambda *a, **kw: None)
         self.upload_slots   = upload_slots or UploadSlotManager(config)
+        self._ftp_factory   = ftp_factory or FTPClient
         self.poll_interval  = int(config.get("poll_interval", DEFAULT_POLL))
         self._stop          = threading.Event()
         self._thread        = None
@@ -473,12 +479,16 @@ class AutoWatcher:
 
     def _upload_to_ftp(self, key, new_name, media_info, season, new_path, _mark_both, _discard_both, ticket=None):
         """Construye la ruta remota y sube el archivo ya renombrado.
-        Todo el bloque que usa self.ftp va bajo self._ftp_lock: es una única
-        conexión de control compartida entre hilos, y FTP es un protocolo
-        secuencial sobre un socket — usarlo desde varios hilos a la vez
-        desincroniza peticiones/respuestas (se ven errores como "200 NOOP ok"
-        o "331 Please specify the password" tratados como fallo) aunque el
-        archivo acabe subiendo en un reintento posterior."""
+        Los pasos previos (comprobar/abrir conexión, resolver categoría,
+        listar duplicados, espacio libre) van bajo self._ftp_lock: usan
+        self.ftp, la única conexión de control compartida entre hilos, y FTP
+        es un protocolo secuencial sobre un socket — usarlo desde varios
+        hilos a la vez desincroniza peticiones/respuestas (se ven errores
+        como "200 NOOP ok" o "331 Please specify the password" tratados como
+        fallo) aunque el archivo acabe subiendo en un reintento posterior.
+        La transferencia real, en cambio, usa una conexión FTP PROPIA por
+        hilo (ver más abajo) en vez de self.ftp, para que varios archivos
+        puedan subir de verdad en paralelo cuando "Subidas simultáneas" > 1."""
         host = self.config.get("ftp_host", "")
         if not host:
             _log.info("FTP no configurado, archivo guardado como: %s", new_name)
@@ -633,14 +643,38 @@ class AutoWatcher:
         self.on_event("info", f"Subiendo: {new_name}")
         self.on_file_event(key, "uploading", new_name=new_name, progress=0.0, speed=0.0)
         try:
-            with self._ftp_lock:
-                ok3, msg3 = self.ftp.upload_file(
-                    new_path, remote_path,
-                    progress_cb=_progress_cb,
-                    cancel_event=self._stop,
-                    speed_limit_kbs=self._get_speed_limit_kbs,
-                    remote_filename=remote_filename,
-                )
+            # Conexión PROPIA para la transferencia real, NO self.ftp: ese es
+            # el canal de control compartido (correcto para las operaciones
+            # rápidas de arriba, bajo self._ftp_lock), pero reutilizarlo
+            # también aquí serializaba TODAS las subidas detrás de ese mismo
+            # candado -- upload_slots ya podía conceder varios turnos a la
+            # vez, pero todos esperaban el mismo socket para transferir de
+            # verdad (varios archivos en "Subiendo" a la vez, solo uno
+            # avanzando). upload_slots.acquire() ya limita cuántas
+            # conexiones de este tipo se abren a la vez (mismo cupo que la
+            # subida manual), así que abrir una por transferencia es seguro.
+            own_ftp = self._ftp_factory()
+            ok_conn, msg_conn = own_ftp.connect(
+                host,
+                int(self.config.get("ftp_port", 21)),
+                self.config.get("ftp_user", ""),
+                self.config.get("ftp_password", ""),
+                bool(self.config.get("ftp_use_tls", False)),
+            )
+            if not ok_conn:
+                _log.error("FTP conexion fallida (subida): %s", msg_conn)
+                ok3, msg3 = False, msg_conn
+            else:
+                try:
+                    ok3, msg3 = own_ftp.upload_file(
+                        new_path, remote_path,
+                        progress_cb=_progress_cb,
+                        cancel_event=self._stop,
+                        speed_limit_kbs=self._get_speed_limit_kbs,
+                        remote_filename=remote_filename,
+                    )
+                finally:
+                    own_ftp.disconnect()
         finally:
             self.upload_slots.release()
         if ok3:
