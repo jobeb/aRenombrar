@@ -15,6 +15,32 @@ def test_reservation_quota_gb_default_is_100():
     assert DEFAULTS["reservation_quota_gb"] == 100
 
 
+def test_missing_ep_switches_and_auto_watcher_off_by_default():
+    """Interruptores de "Episodios que faltan" y el botón "⚡ Auto"
+    persistentes entre reinicios (ver gui/app.py) -- todos apagados por
+    defecto, igual que antes de tener esto."""
+    assert DEFAULTS["missing_ep_show_ignored"] is False
+    assert DEFAULTS["missing_ep_hide_ai_dismissed"] is False
+    assert DEFAULTS["missing_ep_hide_no_dub"] is False
+    assert DEFAULTS["auto_watcher_running"] is False
+
+
+def test_missing_ep_switches_and_auto_watcher_persist_across_reload(tmp_path, monkeypatch):
+    _isolated_config(tmp_path, monkeypatch)
+    cfg1 = Config()
+    cfg1.set("missing_ep_show_ignored", True)
+    cfg1.set("missing_ep_hide_ai_dismissed", True)
+    cfg1.set("missing_ep_hide_no_dub", True)
+    cfg1.set("auto_watcher_running", True)
+    cfg1.save()
+
+    cfg2 = Config()   # simula reabrir la app
+    assert cfg2.get("missing_ep_show_ignored") is True
+    assert cfg2.get("missing_ep_hide_ai_dismissed") is True
+    assert cfg2.get("missing_ep_hide_no_dub") is True
+    assert cfg2.get("auto_watcher_running") is True
+
+
 class _FakeKeyring:
     """Backend de keyring en memoria: evita tocar el almacén de credenciales
     real del sistema operativo durante los tests."""

@@ -6,7 +6,6 @@ Variables disponibles en la plantilla de ruta:
 
 import ftplib
 import io
-import os
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -448,7 +447,6 @@ class FTPClient:
         t_window = [time.monotonic()]
         sent_window = [0]
         speed_last = [0.0]
-        chunk_start = [time.monotonic()]
 
         # speed_limit_kbs puede ser int o callable que devuelve KB/s
         def _get_speed_limit() -> int:

@@ -22,7 +22,6 @@ except ImportError:
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Optional
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -501,6 +500,8 @@ class FileEntry:
         self.ftp_status   = ""
         self.confidence   = 0   # 0-100 porcentaje de confianza en la detección TMDB
         self.remote_dir_override = None   # carpeta remota elegida a mano, sustituye a la calculada por categoría/género
+        self._last_known_size_text = ""   # ver App._file_size_text -- último tamaño leído con éxito
+        self._last_known_size_bytes = None   # ver App._update_status_bar -- caché para no re-stat()ear todo self.files en cada fila actualizada
 
     def to_dict(self) -> dict:
         status = self.status
@@ -801,10 +802,13 @@ class App(_AppBase):
         # al día cuando el usuario abra el diálogo a mano -- ver
         # _maybe_background_missing_scan.
         self.after(60_000, self._maybe_background_missing_scan)
+        # Reanudar el modo automático si estaba en marcha al cerrar la app
+        # la última vez (ver _restore_auto_watcher_state) -- siempre, no
+        # solo con --minimized: el botón "⚡ Auto" debe recordar su estado
+        # tanto si la app se abre a mano como por el autoarranque.
+        self.after(400, self._restore_auto_watcher_state)
         if "--minimized" in sys.argv:
             self.after(200, self._minimize_to_tray)
-            # Arrancar modo automático si hay carpeta configurada
-            self.after(400, self._auto_start_if_configured)
 
     def _apply_icon(self, window):
         """Aplica el icono de la app a *window* (ventana principal o cualquier
@@ -986,10 +990,25 @@ class App(_AppBase):
             counts = {}
             for e in self.files:
                 counts[e.status] = counts.get(e.status, 0) + 1
-                try:
-                    total_size += Path(e.path).stat().st_size
-                except OSError:
-                    pass
+                # Cacheado tras el primer stat() con éxito (ver
+                # FileEntry._last_known_size_bytes) -- esta función se llama
+                # tras CADA actualización de fila (subida, renombrado,
+                # AutoWatcher...), y antes volvía a leer el tamaño en disco
+                # de TODOS los archivos de la lista en cada llamada: con una
+                # cola de cientos de archivos, cada actualización de fila
+                # disparaba un barrido O(n) completo -- O(n²) stat() en
+                # total para un lote grande. El tamaño de un vídeo ya en
+                # disco no cambia bajo esta app (AutoWatcher espera a que se
+                # estabilice antes de procesarlo), así que reutilizarlo es
+                # seguro; mismo criterio ya aceptado para
+                # _last_known_size_text.
+                if e._last_known_size_bytes is None:
+                    try:
+                        e._last_known_size_bytes = Path(e.path).stat().st_size
+                    except OSError:
+                        pass
+                if e._last_known_size_bytes is not None:
+                    total_size += e._last_known_size_bytes
             labels = {
                 "pendiente": "pendientes", "buscando": "buscando", "listo": "listos",
                 "renombrado": "renombrados", "en_cola": "en cola para subir",
@@ -1078,10 +1097,20 @@ class App(_AppBase):
 
     # ---------------------------------------------------------------- Files tab
 
-    def _auto_start_if_configured(self):
-        """Arranca el modo automático al iniciar con Windows si hay carpeta configurada."""
+    def _restore_auto_watcher_state(self):
+        """Reanuda el modo automático al arrancar SI ya estaba en marcha la
+        última vez que se cerró la app (ver "auto_watcher_running" en
+        DEFAULTS, config.py) -- sustituye a la lógica anterior, que
+        arrancaba siempre que hubiera una carpeta configurada (con
+        --minimized, para el autoarranque con Windows/macOS): eso podía
+        volver a encender el modo automático solo porque alguna vez se
+        configuró una carpeta, aunque el usuario lo hubiera parado a mano
+        antes de cerrar. Ahora se llama SIEMPRE al arrancar (no solo con
+        --minimized), para que el botón "⚡ Auto" recuerde su estado entre
+        reinicios igual que cualquier otro ajuste persistente."""
+        was_running = self.config_data.get("auto_watcher_running", False)
         folder = self.config_data.get("watch_folder", "").strip()
-        if folder and not (self._watcher and self._watcher.running):
+        if was_running and folder and not (self._watcher and self._watcher.running):
             self._toggle_auto()
 
     def _toggle_auto(self):
@@ -1091,6 +1120,8 @@ class App(_AppBase):
             self._auto_btn.configure(
                 text="⚡ Auto", width=90, fg_color="transparent", border_width=1)
             self._set_status("Modo automático detenido", PENDING_COLOR)
+            self.config_data.set("auto_watcher_running", False)
+            self.config_data.save()
         else:
             folder = self.config_data.get("watch_folder", "").strip()
             if not folder:
@@ -1106,6 +1137,8 @@ class App(_AppBase):
                 text="⏹ Detener", width=90, fg_color="#c0392b", hover_color="#96281b",
                 border_width=0)
             self._set_status(f"Vigilando: {folder}", SUCCESS_COLOR)
+            self.config_data.set("auto_watcher_running", True)
+            self.config_data.save()
 
     def _on_auto_event(self, tipo, msg):
         colors = {"info": ACCENT, "ok": SUCCESS_COLOR,
@@ -1455,7 +1488,30 @@ class App(_AppBase):
         self._file_list_frame._parent_canvas.bind(
             "<Configure>", self._on_table_resize, add="+")
         self._file_rows = []
+        self._files_page = 0
         self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
+
+        # Paginado (ver _FILES_PAGE_SIZE) -- mismo motivo y mismo patrón que
+        # Episodios/Liberar espacio/Historial: con muchos archivos en cola
+        # (auto-watcher llevando un rato, o una carpeta grande arrastrada de
+        # golpe) dibujar todas las filas a la vez obliga a hacer scroll
+        # dentro de la ventana en vez de solo dentro de la tabla, y con
+        # cientos de filas se acerca al límite de objetos GUI de Windows
+        # (ver [[project_pagination_user_object_limit]]). Debajo de la
+        # tabla, centrada (sin sticky="ew", la columna 0 de "body" ya tiene
+        # weight=1).
+        files_nav_fr = ctk.CTkFrame(body, fg_color="transparent")
+        files_nav_fr.grid(row=2, column=0, pady=(6, 0))
+        self._files_prev_btn = ctk.CTkButton(
+            files_nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._files_change_page(-1))
+        self._files_prev_btn.pack(side="left")
+        self._files_page_lbl = ctk.CTkLabel(files_nav_fr, text="", text_color=PENDING_COLOR)
+        self._files_page_lbl.pack(side="left", padx=12)
+        self._files_next_btn = ctk.CTkButton(
+            files_nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._files_change_page(1))
+        self._files_next_btn.pack(side="left")
 
         self._drop_zone = ctk.CTkLabel(self._file_list_frame,
                                         text="Arrastra archivos aquí\no usa + Archivos",
@@ -2337,6 +2393,13 @@ class App(_AppBase):
             return
         if self._upload_running:
             return
+        if self._missing_ep_scanning:
+            # Un escaneo manual ("Comprobar"/"Reescaneo completo") ya está
+            # en marcha -- sin este guard, los dos escaneos cargarían su
+            # propia instantánea de missing_episodes_cache.json y cada uno
+            # la sobrescribiría entera al terminar, perdiendo en silencio
+            # el resultado del que acabase antes (last-write-wins).
+            return
         from core.missing_episodes_cache import load_cache
         import time as _time
         last_ts = (load_cache().get("_meta") or {}).get("last_scan_ts", 0)
@@ -2897,7 +2960,7 @@ class App(_AppBase):
         return ok or msg in ("omitido", "saltado", "sin_info"), msg
 
     def _queue_worker(self):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
         from core.ftp_client import FTPClient as _FTPClient
 
         parallel   = max(1, min(5, int(self.config_data.get("ftp_parallel", 1))))
@@ -3103,17 +3166,6 @@ class App(_AppBase):
         entry.ftp_progress = pct
         entry.ftp_speed    = speed_bps
         entry.ftp_status   = status_text
-        color_map = {
-            "Subido":        SUCCESS_COLOR,
-            "Cancelado":     WARNING_COLOR,
-            "Saltado":       WARNING_COLOR,
-            "Omitido":       WARNING_COLOR,
-            "Error":         ERROR_COLOR,
-            "Disco lleno":   ERROR_COLOR,
-            "Sin espacio":   ERROR_COLOR,
-            "Sin info TMDB": PENDING_COLOR,
-        }
-        clr = color_map.get(status_text, PENDING_COLOR)
         def _do():
             for row in self._file_rows:
                 if row["entry"] is entry:
@@ -4746,15 +4798,27 @@ class App(_AppBase):
 
         right_fr = ctk.CTkFrame(header, fg_color="transparent")
         right_fr.grid(row=0, column=2, sticky="e")
-        self._missing_ep_show_ignored_var = ctk.BooleanVar(value=False)
+        # Los 3 interruptores recuerdan su estado entre reinicios (ver
+        # DEFAULTS en config.py) -- cada uno persiste al cambiar de estado
+        # (ver _on_toggle_missing_ep_switch), no solo al cerrar la app.
+        self._missing_ep_show_ignored_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_ep_show_ignored", False))
         ctk.CTkSwitch(right_fr, text="Mostrar ignoradas", variable=self._missing_ep_show_ignored_var,
-                      command=self._render_missing_episodes_table).pack(side="right", padx=(4, 12), pady=8)
-        self._missing_ep_hide_ai_var = ctk.BooleanVar(value=False)
+                      command=lambda: self._on_toggle_missing_ep_switch(
+                          "missing_ep_show_ignored", self._missing_ep_show_ignored_var,
+                          self._render_missing_episodes_table)).pack(side="right", padx=(4, 12), pady=8)
+        self._missing_ep_hide_ai_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_ep_hide_ai_dismissed", False))
         ctk.CTkSwitch(right_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
-                      command=self._render_missing_episodes_table).pack(side="right", padx=4, pady=8)
-        self._missing_ep_hide_no_dub_var = ctk.BooleanVar(value=False)
+                      command=lambda: self._on_toggle_missing_ep_switch(
+                          "missing_ep_hide_ai_dismissed", self._missing_ep_hide_ai_var,
+                          self._render_missing_episodes_table)).pack(side="right", padx=4, pady=8)
+        self._missing_ep_hide_no_dub_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_ep_hide_no_dub", False))
         ctk.CTkSwitch(right_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
-                      command=self._on_toggle_hide_no_dub).pack(side="right", padx=4, pady=8)
+                      command=lambda: self._on_toggle_missing_ep_switch(
+                          "missing_ep_hide_no_dub", self._missing_ep_hide_no_dub_var,
+                          self._on_toggle_hide_no_dub)).pack(side="right", padx=4, pady=8)
         self._missing_ep_search_entry = ctk.CTkEntry(right_fr, width=180, placeholder_text="Filtrar por nombre...")
         self._missing_ep_search_entry.pack(side="right", padx=4, pady=8)
         self._missing_ep_search_entry.bind("<KeyRelease>", lambda e: self._render_missing_episodes_table())
@@ -4799,6 +4863,7 @@ class App(_AppBase):
             ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100),
             ColumnSpec("trending", "Tendencia", width=70),
             ColumnSpec("ignore", "", width=90),
+            ColumnSpec("rescan", "", width=36),
             ColumnSpec("delete", "", width=36),
         ])
         self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
@@ -4923,11 +4988,27 @@ class App(_AppBase):
         self._missing_ep_current_row = None
         return panel
 
+    @staticmethod
+    def _ai_verdict_from_cache_entry(entry: dict):
+        """Reconstruye el "ai_verdict" persistido de una entrada cruda de
+        missing_episodes_cache.json (ver _persist_ai_verdicts) -- None si
+        nunca se preguntó. "doblaje_castellano" se guarda con claves de
+        texto (JSON no permite claves int), aquí se reconvierten a int
+        para que encajen con "missing"/"expected_episodes" (también int)
+        al filtrar (ver filter_missing_by_dub_cutoff)."""
+        ai_verdict = entry.get("ai_verdict")
+        if not ai_verdict:
+            return None
+        if "doblaje_castellano" in ai_verdict:
+            ai_verdict = dict(ai_verdict)
+            ai_verdict["doblaje_castellano"] = {int(s): ep for s, ep in ai_verdict["doblaje_castellano"].items()}
+        return ai_verdict
+
     def _load_missing_episodes_from_cache(self) -> list:
         """Al abrir la vista, mostrar lo que ya se sabía del último
         escaneo (persistido en disco) en vez de una tabla vacía hasta que
         el usuario pulse "Comprobar" a mano."""
-        from core.missing_episodes import format_missing_summary, looks_like_season_split
+        from core.missing_episodes import format_missing_summary, apply_season_split_filter
         from core.missing_episodes_cache import load_cache
         cache = load_cache()
         results = []
@@ -4943,8 +5024,15 @@ class App(_AppBase):
                               for s, eps in (entry.get("episode_titles") or {}).items()}
             expected = {int(k): v for k, v in (entry.get("expected") or {}).items()}
             present_season_counts = {int(k): v for k, v in (entry.get("present_season_counts") or {}).items()}
-            split_seasons = {season for season, eps in missing.items()
-                             if looks_like_season_split(expected.get(season, []), eps)}
+            # La caché en disco guarda el hueco SIN filtrar (ver
+            # apply_season_split_filter) -- el filtro se aplica aquí, al
+            # reconstruir la fila para mostrar, igual que en el resto de
+            # sitios donde se calcula "missing" para pantalla.
+            missing, split_seasons = apply_season_split_filter(missing, expected)
+            # Veredicto de la IA persistido (ver _persist_ai_verdicts) --
+            # antes se perdía al cerrar la app y había que volver a
+            # preguntarle a la IA en cada sesión.
+            ai_verdict = self._ai_verdict_from_cache_entry(entry)
             results.append({
                 "tmdb_id": int(key), "name": name, "source": entry.get("source", ""),
                 "server_id": entry.get("server_id"),
@@ -4954,7 +5042,7 @@ class App(_AppBase):
                 "expected_episodes": expected,
                 "tmdb_season_counts": {s: len(eps) for s, eps in expected.items()},
                 "server_season_counts": present_season_counts,
-                "ai_verdict": None,
+                "ai_verdict": ai_verdict,
                 "absolute_numbering": entry.get("absolute_numbering", False),
                 "play_count": entry.get("play_count", 0),
                 "last_played_ts": entry.get("last_played_ts"),
@@ -5134,12 +5222,28 @@ class App(_AppBase):
         if self.config_data.get("ai_fallback_enabled") and self.config_data.get("ai_api_key"):
             self._ask_ai_for_missing_ep_verdicts()
 
+    def _on_toggle_missing_ep_switch(self, config_key: str, var: "ctk.BooleanVar", then):
+        """Persiste el nuevo estado de uno de los 3 interruptores de
+        "Episodios que faltan" (Mostrar ignoradas/Ocultar descartados por
+        IA/Ocultar sin doblaje ES) y ejecuta *then*, su comportamiento
+        normal al cambiar -- así la próxima vez que se abra la app se
+        recuerda cómo se dejó, en vez de resetear siempre a apagado."""
+        self.config_data.set(config_key, var.get())
+        self.config_data.save()
+        then()
+
     def _on_toggle_hide_no_dub(self):
         """Al activar "Ocultar sin doblaje ES": si hay episodios pendientes
         de comprobar, lanza el chequeo en segundo plano (con barra de
         progreso, ver _start_spanish_dub_check) antes de redibujar -- al
         desactivarlo, basta con redibujar (no hay nada que comprobar para
-        volver a MOSTRAR episodios)."""
+        volver a MOSTRAR episodios). Este chequeo automático (TMDB) es el
+        comportamiento por defecto -- tiene un fallo conocido (falso
+        positivo en series con doblaje parcial, ver el docstring de
+        core.missing_episodes.episode_has_spanish_text), que el usuario
+        puede corregir serie a serie pulsando "🤖 Preguntar a la IA" en el
+        panel lateral (ver _ask_ai_about_current_missing_ep_show) -- nunca
+        al revés, y nunca automáticamente."""
         if self._missing_ep_hide_no_dub_var.get():
             self._start_spanish_dub_check()
         else:
@@ -5241,7 +5345,12 @@ class App(_AppBase):
         publicadas por partes, ID de TMDB con menos temporadas de las
         reales...). Nunca oculta nada por su cuenta -- solo añade una
         anotación; el interruptor "Ocultar descartados por IA" es cosa del
-        usuario."""
+        usuario. Se llama automáticamente tras cada escaneo completo (ver
+        _finish_missing_episodes_scan) -- a propósito NUNCA pregunta por
+        doblaje castellano aquí (check_spanish_dub=False, por defecto): esa
+        pregunta solo se hace cuando el usuario pulsa "🤖 Preguntar a la IA"
+        a mano para una serie concreta (ver
+        _ask_ai_about_current_missing_ep_show), nunca de forma automática."""
         api_key = self.config_data.get("ai_api_key", "")
         if not api_key or not self._missing_ep_results:
             return
@@ -5262,9 +5371,33 @@ class App(_AppBase):
         for r in self._missing_ep_results:
             if r["tmdb_id"] in verdicts:
                 r["ai_verdict"] = verdicts[r["tmdb_id"]]
+        self._persist_ai_verdicts(verdicts)
         if self._missing_ep_current_row is not None:
             self._update_missing_ep_ai_verdict_label(self._missing_ep_current_row)
         self._render_missing_episodes_table(reset_page=False)
+
+    def _persist_ai_verdicts(self, verdicts: dict):
+        """Guarda el veredicto de la IA (incluido "doblaje_castellano", si
+        se preguntó) en missing_episodes_cache.json -- antes solo vivía en
+        self._missing_ep_results (memoria), así que se perdía al cerrar la
+        app o al hacer un "Comprobar" nuevo, y había que volver a
+        preguntarle a la IA cada vez. Solo se actualizan series que YA
+        tienen entrada en la caché (si no la tienen, no hay dónde
+        guardarlo -- no debería pasar, ya que el veredicto siempre se pide
+        sobre series que salieron de un escaneo previo)."""
+        if not verdicts:
+            return
+        from core.missing_episodes_cache import load_cache, save_cache
+        cache = dict(load_cache())
+        changed = False
+        for tmdb_id, verdict in verdicts.items():
+            key = str(tmdb_id)
+            if key not in cache:
+                continue
+            cache[key]["ai_verdict"] = verdict
+            changed = True
+        if changed:
+            save_cache(cache)
 
     def _update_missing_ep_status_text(self):
         from core.missing_episodes_cache import load_cache
@@ -5415,8 +5548,13 @@ class App(_AppBase):
         IA y doblaje ES) -- devuelve la fila a pintar, o None si no debe
         verse ahora mismo. Con "Ocultar sin doblaje ES" activo, devuelve
         una COPIA con "missing" recortado a solo los episodios con doblaje
-        confirmado (ver core.missing_episodes.filter_missing_by_spanish_dub)
-        -- si tras recortar no queda ningún hueco (ni unknown_seasons), la
+        confirmado -- por defecto según el chequeo automático de TMDB
+        (self._spanish_dub_cache, ver _start_spanish_dub_check), SALVO que
+        el usuario haya pulsado "🤖 Preguntar a la IA" para esta serie
+        concreta (ver _ask_ai_about_current_missing_ep_show): en ese caso
+        el veredicto de la IA (r["ai_verdict"]["doblaje_castellano"])
+        sustituye por completo al de TMDB para esta serie, nunca al revés.
+        Si tras recortar no queda ningún hueco (ni unknown_seasons), la
         fila entera se oculta. Usado tanto por _render_missing_episodes_table
         como por _append_missing_ep_result_live, para que ambos apliquen
         exactamente el mismo criterio."""
@@ -5434,9 +5572,13 @@ class App(_AppBase):
         if not self._missing_ep_hide_no_dub_var.get():
             return r
 
-        from core.missing_episodes import filter_missing_by_spanish_dub, format_missing_summary
-        dub_episodes = self._spanish_dub_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
-        filtered_missing = filter_missing_by_spanish_dub(r["missing"], dub_episodes)
+        if ai_verdict and "doblaje_castellano" in ai_verdict:
+            from core.missing_episodes import filter_missing_by_dub_cutoff, format_missing_summary
+            filtered_missing = filter_missing_by_dub_cutoff(r["missing"], ai_verdict["doblaje_castellano"])
+        else:
+            from core.missing_episodes import filter_missing_by_spanish_dub, format_missing_summary
+            dub_episodes = self._spanish_dub_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
+            filtered_missing = filter_missing_by_spanish_dub(r["missing"], dub_episodes)
         if not filtered_missing and not r.get("unknown_seasons"):
             return None
         if filtered_missing == r["missing"]:
@@ -5550,6 +5692,11 @@ class App(_AppBase):
                       command=lambda tid=tmdb_id, ig=not r.get("ignored"):
                       self._toggle_missing_ep_ignore(tid, ig)).pack(side="left", padx=(4, 4), pady=6)
 
+        rescan_btn = ctk.CTkButton(header_row, text="🔄", width=cw("rescan"), height=24,
+                      fg_color="transparent", border_width=1,
+                      command=lambda row=r: self._rescan_single_missing_ep_series(row))
+        rescan_btn.pack(side="left", padx=(0, 4), pady=6)
+
         ctk.CTkButton(header_row, text="🗑", width=cw("delete"), height=24,
                       fg_color="transparent", border_width=1,
                       text_color=ERROR_COLOR, hover_color=("gray85", "#3d1010"),
@@ -5564,6 +5711,7 @@ class App(_AppBase):
         self._missing_ep_row_widgets[tmdb_id] = {
             "row_fr": row_fr, "toggle_btn": toggle_btn, "detail_fr": detail_fr, "r": r,
             "summary_lbl": summary_lbl, "trending_lbl": trending_lbl, "fav_btn": fav_btn,
+            "rescan_btn": rescan_btn,
         }
 
     def _toggle_missing_ep_favorite(self, tmdb_id: int, name: str):
@@ -5669,10 +5817,8 @@ class App(_AppBase):
         # _update_missing_ep_ai_verdict_label -- no aquí, para no duplicarlo.
 
         import itertools
-        detail_font = self._missing_ep_detail_font
         season_font = self._missing_ep_season_font
         season_links = self.config_data.get("custom_links_season", [])
-        episode_links = self.config_data.get("custom_links_episode", [])
         tmdb_id = r["tmdb_id"]
         lines_by_season = itertools.groupby(self._missing_episode_lines(r), key=lambda t: t[0])
 
@@ -5872,7 +6018,13 @@ class App(_AppBase):
         """Muestra debajo de la sinopsis el veredicto de la IA para esta
         serie, si ya se conoce (de un escaneo con el fallback de IA
         activado, o de haber pulsado antes "Preguntar a la IA" para ella).
-        Vacío si no hay ningún veredicto todavía."""
+        Vacío si no hay ningún veredicto todavía. Si se preguntó por el
+        doblaje castellano (check_spanish_dub, ver
+        _ask_ai_about_current_missing_ep_show), también se muestra ese
+        resultado -- antes solo se veía el veredicto de hueco_real/
+        numeracion_distinta y el recorte de doblaje quedaba invisible
+        (aplicado en silencio a la tabla, sin que el usuario supiera qué
+        había decidido la IA al respecto)."""
         verdict = r.get("ai_verdict")
         if not verdict:
             self._missing_ep_ai_verdict_lbl.configure(text="")
@@ -5881,6 +6033,13 @@ class App(_AppBase):
         veredicto_txt = "probablemente NO falta nada real" if dismissed else "probablemente sí falta de verdad"
         motivo = verdict.get("motivo", "")
         text = f"🤖 Según la IA, {veredicto_txt}" + (f": {motivo}" if motivo else "")
+        dub_cutoff = verdict.get("doblaje_castellano")
+        if dub_cutoff is not None:
+            if dub_cutoff:
+                partes = ", ".join(f"T{s} hasta el {s}x{ep:02d}" for s, ep in sorted(dub_cutoff.items()))
+                text += f"\n🎙 Doblaje castellano: {partes}"
+            else:
+                text += "\n🎙 Doblaje castellano: sin recorte encontrado (parece completo, o sin datos fiables)"
         self._missing_ep_ai_verdict_lbl.configure(text=text)
 
     def _missing_ep_series_path(self, r: dict, use_cache_only: bool = True, ftp_conn=None) -> str:
@@ -6067,7 +6226,12 @@ class App(_AppBase):
             resp = requests.get(url, timeout=10)
             ok = resp.status_code < 400
         except Exception as e:
-            self.after(0, lambda: self._set_status(f"Enlace en segundo plano falló: {e}", ERROR_COLOR))
+            # Python borra "e" al salir del except -- sin capturarlo en un
+            # argumento por defecto, la lambda diferida (self.after) lo
+            # referenciaría ya borrado y lanzaría NameError al dispararse,
+            # en vez de mostrar el error real.
+            msg = str(e)
+            self.after(0, lambda m=msg: self._set_status(f"Enlace en segundo plano falló: {m}", ERROR_COLOR))
             return
         if ok:
             self.after(0, lambda: self._set_status("✓ Enlace en segundo plano completado", SUCCESS_COLOR))
@@ -6077,27 +6241,75 @@ class App(_AppBase):
 
     def _ask_ai_about_current_missing_ep_show(self):
         """Botón por serie (no uno general): pregunta a Groq solo por la
-        serie que se está viendo ahora mismo en el panel lateral."""
+        serie que se está viendo ahora mismo en el panel lateral. Si
+        "Ocultar sin doblaje ES" está activo, esta consulta manual TAMBIÉN
+        le pregunta por el doblaje castellano (check_spanish_dub) -- es el
+        ÚNICO sitio de toda la app donde se le pregunta esto a la IA (nunca
+        automáticamente, ver _ask_ai_for_missing_ep_verdicts); su veredicto
+        sustituye al chequeo de TMDB para esta serie en
+        _visible_missing_ep_row.
+
+        A diferencia de la consulta por lotes (_ask_ai_for_missing_ep_verdicts,
+        que solo manda recuentos de episodios para mantener el coste bajo con
+        muchas series a la vez), aquí se pide primero get_tv_details() --
+        una sola llamada extra, aceptable porque esto es un botón manual
+        para UNA serie -- para mandarle también el año de emisión y el
+        título original: sin esto, la IA solo tenía el nombre en español
+        para identificar la serie y su época, que es justo el tipo de dato
+        que más ayuda a acertar con el doblaje castellano (series antiguas
+        o con doblaje interrumpido)."""
         r = self._missing_ep_current_row
         api_key = self.config_data.get("ai_api_key", "")
         if not r or not api_key:
             return
         self._missing_ep_ai_verdict_lbl.configure(text="🤖 Preguntando a la IA...")
-        show_payload = [{
-            "tmdb_id": r["tmdb_id"], "name": r["name"],
-            "tmdb_seasons": {str(k): v for k, v in r.get("tmdb_season_counts", {}).items()},
-            "server_seasons": {str(k): v for k, v in r.get("server_season_counts", {}).items()},
-        }]
+        check_spanish_dub = self._missing_ep_hide_no_dub_var.get()
+        tmdb_id = r["tmdb_id"]
 
         def worker():
+            try:
+                details = self.tmdb.get_tv_details(tmdb_id)
+            except Exception:
+                details = {}
+            # present_episodes = expected - missing, calculado aquí sin
+            # ninguna llamada extra (ambas listas ya están en la fila desde
+            # el escaneo) -- con missing_episodes solo se ve el hueco;
+            # con esto también se ve la forma de lo que SÍ hay (p.ej. si lo
+            # presente empieza en el episodio 51 en vez de en el 1, eso es
+            # justo la pista de un desajuste de numeración con TMDB que un
+            # simple recuento no deja ver).
+            present_episodes = {}
+            for season, expected_eps in r.get("expected_episodes", {}).items():
+                missing_eps = set(r.get("missing", {}).get(season, []))
+                present = [ep for ep in expected_eps if ep not in missing_eps]
+                if present:
+                    present_episodes[season] = present
+            show_payload = [{
+                "tmdb_id": tmdb_id, "name": r["name"],
+                "original_name": details.get("original_name") or "",
+                "first_air_date": details.get("first_air_date") or "",
+                "origin_country": details.get("origin_country") or [],
+                "genres": [g.get("name") for g in details.get("genres", []) if g.get("name")],
+                "tmdb_seasons": {str(k): v for k, v in r.get("tmdb_season_counts", {}).items()},
+                "server_seasons": {str(k): v for k, v in r.get("server_season_counts", {}).items()},
+                # Números concretos de episodios que faltan/que hay (no solo
+                # el recuento) -- deja ver patrones que un simple recuento
+                # no distingue (p.ej. "faltan los últimos 20" vs "faltan 20
+                # sueltos por en medio"), útil tanto para el veredicto de
+                # hueco_real/numeracion_distinta como para acotar mejor el
+                # corte de doblaje.
+                "missing_episodes": {str(k): v for k, v in r.get("missing", {}).items()},
+                "present_episodes": {str(k): v for k, v in present_episodes.items()},
+            }]
             from core.missing_episodes_ai import analyze_missing_episodes
-            verdicts = analyze_missing_episodes(show_payload, api_key)
-            self.after(0, lambda: self._apply_single_missing_ep_ai_verdict(r, verdicts.get(r["tmdb_id"])))
+            verdicts = analyze_missing_episodes(show_payload, api_key, check_spanish_dub=check_spanish_dub)
+            self.after(0, lambda: self._apply_single_missing_ep_ai_verdict(r, verdicts.get(tmdb_id)))
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_single_missing_ep_ai_verdict(self, r: dict, verdict):
         if verdict:
             r["ai_verdict"] = verdict
+            self._persist_ai_verdicts({r["tmdb_id"]: verdict})
         elif not r.get("ai_verdict"):
             self._missing_ep_ai_verdict_lbl.configure(
                 text="🤖 No se pudo obtener un veredicto (revisa la API Key de Groq o la conexión).")
@@ -6160,6 +6372,209 @@ class App(_AppBase):
     # emparejamiento por nombre que ya usa la subida, ver
     # _find_category_with_existing_folder) antes de poder mostrar el
     # diálogo con una ruta de verdad.
+
+    def _rescan_single_missing_ep_series(self, r: dict):
+        """Reescanea una sola serie contra TMDB/servidor -- para cuando el
+        usuario quiere forzar una recomprobación puntual (p.ej. tras
+        rellenar un hueco a mano en el FTP) sin lanzar un reescaneo
+        completo de todo el catálogo.
+
+        A propósito NO usa _scan_missing_episodes: su bucle principal se
+        puede limitar a una sola serie, pero antes de llegar a él esa
+        función siempre pide la lista completa de series Y las
+        estadísticas de uso (play_count/last_played, para la puntuación de
+        "Tendencia") de TODO el catálogo de Jellyfin/Plex -- visto de
+        verdad: get_jellyfin_usage_stats tardó 66s y get_plex_usage_stats
+        26s con la biblioteca real del usuario, sobre datos que ni
+        siquiera hacían falta para el hueco de UNA serie. Con
+        r["source"]/r["server_id"] (ya conocidos de cuando se generó esta
+        fila) se puede ir directo a por esa única serie sin ninguna de las
+        dos llamadas -- el resto (r["play_count"]/r["last_played_ts"]) se
+        conserva tal cual de la fila anterior en vez de re-consultarlo."""
+        tmdb_id = r["tmdb_id"]
+        name = r["name"]
+        if self._missing_ep_scanning:
+            self._set_status("Espera a que termine el escaneo en curso", WARNING_COLOR)
+            return
+        if self._upload_running:
+            self._set_status("Espera a que termine la subida en curso antes de comprobar huecos", WARNING_COLOR)
+            return
+        widgets = self._missing_ep_row_widgets.get(tmdb_id)
+        if widgets and widgets.get("rescan_btn"):
+            widgets["rescan_btn"].configure(state="disabled", text="…")
+        self._set_status(f"Reescaneando \"{name}\"...", PENDING_COLOR)
+
+        def worker():
+            try:
+                results = self._rescan_single_series_worker(r)
+            except Exception:
+                _log.exception("Reescaneo de '%s' (tmdb_id=%s): fallo inesperado", name, tmdb_id)
+                self.after(0, lambda: self._set_status(
+                    f"Error al reescanear \"{name}\" -- revisa app.log", ERROR_COLOR))
+                self.after(0, lambda: self._finish_single_missing_ep_rescan(tmdb_id, name, None))
+                return
+            self.after(0, lambda: self._finish_single_missing_ep_rescan(tmdb_id, name, results))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _rescan_single_series_worker(self, r: dict) -> list:
+        """Hilo de fondo de _rescan_single_missing_ep_series -- misma
+        lógica que el bucle principal de _scan_missing_episodes para UNA
+        serie (recomprobación siempre forzada, como un hueco visto antes),
+        más el cruce con el FTP acotado a su propia carpeta (ver
+        _cross_check_single_result_with_ftp). Devuelve una lista con 0 o 1
+        filas, mismo contrato que espera _finish_single_missing_ep_rescan."""
+        from core.media_server_refresh import (get_jellyfin_episodes, get_plex_episodes,
+                                               get_jellyfin_series_item, get_plex_series_item)
+        from core.missing_episodes import (find_missing_episodes, format_missing_summary,
+                                           apply_season_split_filter, find_unknown_seasons,
+                                           looks_like_absolute_numbering, remap_absolute_episodes)
+        from core.missing_episodes_cache import load_cache, save_cache
+
+        old_tmdb_id = r["tmdb_id"]
+        tmdb_id = old_tmdb_id
+        name = r["name"]
+        source = r.get("source")
+        server_id = r.get("server_id")
+        folder_name = r.get("folder_name")
+        if not source or not server_id:
+            # Fila de antes de que estos campos se guardaran en caché --
+            # sin ellos no hay atajo posible, hace falta un reescaneo
+            # completo (que sí vuelve a traer server_id) para poder
+            # reescanear esta serie sola la próxima vez.
+            self.after(0, lambda: self._set_status(
+                f"\"{name}\" necesita un reescaneo completo antes de poder reescanearse sola", WARNING_COLOR))
+            return [r]
+
+        # Releer la ficha ACTUAL de esta serie en el servidor (no solo sus
+        # episodios) -- si el usuario corrigió a mano la identificación en
+        # Jellyfin/Plex (cambió a qué ficha de TMDB apunta), la fila
+        # todavía tenía el tmdb_id VIEJO guardado en caché de la última
+        # vez que se pidió la biblioteca entera, y "reescanear esta serie"
+        # seguiría comparando huecos contra la ficha equivocada aunque el
+        # servidor ya estuviera corregido.
+        if source == "jellyfin":
+            item = get_jellyfin_series_item(self.config_data.get("jellyfin_host", ""),
+                                            self.config_data.get("jellyfin_api_key", ""), server_id)
+        else:
+            item = get_plex_series_item(self.config_data.get("plex_host", ""),
+                                        self.config_data.get("plex_token", ""), server_id)
+        if item and item.get("tmdb_id"):
+            if item["tmdb_id"] != old_tmdb_id:
+                _log.info("Reescaneo individual: '%s' cambió de tmdb_id %s -> %s (identificación "
+                          "corregida en el servidor)", item.get("name") or name, old_tmdb_id, item["tmdb_id"])
+            tmdb_id = item["tmdb_id"]
+            name = item.get("name") or name
+            folder_name = item.get("folder_name", folder_name)   # Plex no lo trae, se conserva el de antes
+
+        details = self.tmdb.get_tv_details(tmdb_id)
+        if source == "jellyfin":
+            present = get_jellyfin_episodes(self.config_data.get("jellyfin_host", ""),
+                                            self.config_data.get("jellyfin_api_key", ""), server_id)
+        else:
+            present = get_plex_episodes(self.config_data.get("plex_host", ""),
+                                        self.config_data.get("plex_token", ""), server_id)
+        if present is None:
+            return [r]   # sin dato fiable ahora mismo -- se deja la fila tal cual
+
+        expected = {}
+        episode_titles = {}
+        for season in details.get("seasons", []):
+            n = season.get("season_number", 0)
+            if n <= 0:   # temporada 0 = especiales, no cuenta como hueco
+                continue
+            try:
+                eps = self.tmdb.get_season_episodes(tmdb_id, n)
+            except Exception:
+                continue
+            nums = [e["episode_number"] for e in eps if e.get("episode_number")]
+            if nums:
+                expected[n] = nums
+                episode_titles[n] = {e["episode_number"]: e.get("name", "") for e in eps
+                                     if e.get("episode_number")}
+
+        season_episode_counts = {s: len(eps) for s, eps in expected.items()}
+        absolute_numbering = looks_like_absolute_numbering(season_episode_counts, present)
+        present_for_compare = remap_absolute_episodes(season_episode_counts, present) \
+            if absolute_numbering else present
+
+        missing = find_missing_episodes(expected, present_for_compare)
+        unknown_seasons = find_unknown_seasons(present_for_compare, expected.keys())
+        present_season_counts = {}
+        for season, _ep in present_for_compare:
+            present_season_counts[season] = present_season_counts.get(season, 0) + 1
+
+        cache = dict(load_cache())
+        if tmdb_id != old_tmdb_id:
+            cache.pop(str(old_tmdb_id), None)   # identificación corregida -- no dejar la entrada vieja huérfana
+        cache[str(tmdb_id)] = {
+            "name": name, "source": source, "server_id": server_id,
+            "folder_name": folder_name,
+            "last_episode_id": (details.get("last_episode_to_air") or {}).get("id"),
+            "expected": {str(k): v for k, v in expected.items()},
+            "episode_titles": {str(s): {str(e): t for e, t in eps.items()}
+                               for s, eps in episode_titles.items()},
+            "missing": {str(k): v for k, v in missing.items()},
+            "unknown_seasons": sorted(unknown_seasons),
+            "present_season_counts": {str(k): v for k, v in present_season_counts.items()},
+            "absolute_numbering": absolute_numbering,
+            "ignored": r.get("ignored", False),
+            "play_count": r.get("play_count", 0),
+            "last_played_ts": r.get("last_played_ts"),
+            # Se conserva el veredicto de la IA que ya tenía esta fila --
+            # salvo que la identificación se acabara de corregir (tmdb_id
+            # distinto), en cuyo caso el veredicto viejo era sobre OTRA
+            # ficha y no debe arrastrarse.
+            "ai_verdict": r.get("ai_verdict") if tmdb_id == old_tmdb_id else None,
+        }
+        save_cache(cache)
+
+        if not (missing or unknown_seasons):
+            return []   # ya no le falta nada -- se quita de la lista
+
+        # missing aquí es SOLO para mostrar -- la caché en disco (arriba,
+        # cache[str(tmdb_id)] = {...}) ya guardó el hueco SIN filtrar.
+        missing, split_seasons = apply_season_split_filter(missing, expected)
+        new_row = {
+            "tmdb_id": tmdb_id, "name": name, "source": source, "server_id": server_id,
+            "missing": missing, "summary": format_missing_summary(name, missing),
+            "ignored": r.get("ignored", False), "episode_titles": episode_titles,
+            "split_seasons": split_seasons,
+            "unknown_seasons": unknown_seasons,
+            "play_count": r.get("play_count", 0), "last_played_ts": r.get("last_played_ts"),
+            "expected_episodes": {s: sorted(eps) for s, eps in expected.items()},
+            "tmdb_season_counts": {s: len(eps) for s, eps in expected.items()},
+            "server_season_counts": present_season_counts,
+            "ai_verdict": r.get("ai_verdict") if tmdb_id == old_tmdb_id else None,
+            "absolute_numbering": absolute_numbering,
+            "folder_name": folder_name,
+        }
+        new_row = self._cross_check_single_result_with_ftp(new_row)
+        if not (new_row["missing"] or new_row["unknown_seasons"]):
+            return []
+        return [new_row]
+
+    def _finish_single_missing_ep_rescan(self, tmdb_id: int, name: str, results):
+        """results es None si el reescaneo falló (se deja la fila tal cual
+        estaba); si no, 0 o 1 filas -- se sustituye la fila vieja de esta
+        serie (si había) por el resultado nuevo, o se quita de la lista si
+        ya no le falta nada. El tmdb_id del resultado puede ser DISTINTO
+        al que se pasó aquí -- ver _rescan_single_series_worker, releer
+        la ficha corrige una identificación equivocada -- así que también
+        se quita cualquier fila que ya hubiera con el tmdb_id nuevo, para
+        no acabar con dos filas de la misma serie."""
+        if results is not None:
+            new_ids = {row["tmdb_id"] for row in results} | {tmdb_id}
+            self._missing_ep_results = [r for r in self._missing_ep_results if r["tmdb_id"] not in new_ids]
+            self._missing_ep_results.extend(results)
+            if results:
+                self._set_status(f"\"{name}\" actualizada", SUCCESS_COLOR)
+            else:
+                self._set_status(f"\"{name}\" ya no tiene huecos -- se quitó de la lista", SUCCESS_COLOR)
+            self._render_missing_episodes_table(reset_page=False)
+        else:
+            widgets = self._missing_ep_row_widgets.get(tmdb_id)
+            if widgets and widgets.get("rescan_btn"):
+                widgets["rescan_btn"].configure(state="normal", text="🔄")
 
     def _confirm_delete_missing_ep_series(self, r: dict):
         if not self.config_data.get("ftp_host", ""):
@@ -6264,13 +6679,21 @@ class App(_AppBase):
         on_result_cb(row), si se pasa, se llama cada vez que se añade una
         fila a resultados (según se van encontrando, no al final) -- lo
         usa "Reescaneo completo" para que la tabla se vaya rellenando en
-        vivo en vez de esperar a tener todo el resultado."""
+        vivo en vez de esperar a tener todo el resultado.
+
+        Para reescanear UNA sola serie (botón por fila) esta función NO se
+        usa -- ver _rescan_single_series_worker: incluso limitando el
+        bucle principal a una sola serie, esta función sigue pidiendo
+        ANTES la lista completa de shows y las estadísticas de uso de todo
+        el catálogo (get_jellyfin_usage_stats/get_plex_usage_stats), que
+        con una biblioteca real tardaron 66s/26s por sí solas -- inútil
+        para el hueco de una sola serie."""
         from core.media_server_refresh import (get_jellyfin_series, get_jellyfin_episodes,
                                                 get_plex_series, get_plex_episodes,
                                                 get_jellyfin_usage_stats, get_plex_usage_stats,
                                                 parse_media_date)
         from core.missing_episodes import (find_missing_episodes, format_missing_summary,
-                                           looks_like_season_split, find_unknown_seasons,
+                                           apply_season_split_filter, find_unknown_seasons,
                                            looks_like_absolute_numbering, remap_absolute_episodes)
         from core.missing_episodes_cache import load_cache, save_cache
         from core.cleanup_candidates import merge_usage_entries
@@ -6335,9 +6758,11 @@ class App(_AppBase):
             del cache[stale_key]
 
         def _row(tmdb_id, name, source, missing, ignored, expected=None, unknown_seasons=None,
-                 present_season_counts=None, server_id=None, folder_name=None):
-            split_seasons = {season for season, eps in missing.items()
-                             if looks_like_season_split((expected or {}).get(season, []), eps)}
+                 present_season_counts=None, server_id=None, folder_name=None, ai_verdict=None):
+            # missing aquí es SOLO para mostrar -- la caché en disco (más
+            # abajo, cache[key] = {...}) guarda el hueco SIN filtrar, ver
+            # apply_season_split_filter.
+            missing, split_seasons = apply_season_split_filter(missing, expected or {})
             # Para la puntuación de tendencia (ver core/trending.py) --
             # parse_media_date() ya es idempotente tanto si la entrada viene
             # de una sola fuente (fecha cruda, string ISO8601 o epoch de
@@ -6361,7 +6786,7 @@ class App(_AppBase):
                 # core/missing_episodes_ai.py.
                 "tmdb_season_counts": {s: len(eps) for s, eps in (expected or {}).items()},
                 "server_season_counts": dict(present_season_counts or {}),
-                "ai_verdict": None,   # {"veredicto", "motivo"} tras preguntar a la IA
+                "ai_verdict": ai_verdict,   # {"veredicto", "motivo"} tras preguntar a la IA (persistido, ver _persist_ai_verdicts)
                 "absolute_numbering": False,   # se sobreescribe fuera si se detecta (ver looks_like_absolute_numbering)
                 # Nombre REAL de la carpeta en el servidor de medios (ver
                 # get_jellyfin_series) -- puede no parecerse al nombre
@@ -6401,7 +6826,8 @@ class App(_AppBase):
                               expected=cached_expected,
                               unknown_seasons=set(cached.get("unknown_seasons", [])),
                               present_season_counts=cached_counts,
-                              folder_name=show.get("folder_name"))
+                              folder_name=show.get("folder_name"),
+                              ai_verdict=self._ai_verdict_from_cache_entry(cached))
                     row["episode_titles"] = {int(s): {int(e): t for e, t in eps.items()}
                                              for s, eps in cached.get("episode_titles", {}).items()}
                     row["absolute_numbering"] = cached.get("absolute_numbering", False)
@@ -6412,7 +6838,8 @@ class App(_AppBase):
 
             last_episode_id = (details.get("last_episode_to_air") or {}).get("id")
             had_gaps_before = bool(cached and cached.get("missing"))
-            needs_full_recheck = force_full or not cached or cached.get("last_episode_id") != last_episode_id
+            needs_full_recheck = (force_full or not cached
+                                  or cached.get("last_episode_id") != last_episode_id)
 
             if not needs_full_recheck and not had_gaps_before:
                 continue   # sin episodios nuevos en TMDB y ya estaba completa -- nada que comprobar
@@ -6488,6 +6915,15 @@ class App(_AppBase):
                 "ignored": ignored,
                 "play_count": usage.get("play_count", 0),
                 "last_played_ts": parse_media_date(usage.get("last_played")),
+                # Se conserva el veredicto de la IA de la entrada anterior
+                # (si había) -- series con un hueco permanente (p.ej.
+                # Bleach, sin doblaje castellano más allá del 1x109) pasan
+                # needs_full_recheck=False pero had_gaps_before=True en
+                # CASI todos los escaneos normales, así que sin esto el
+                # veredicto se perdía en el primer "Comprobar" después de
+                # preguntarle a la IA, no solo en un "Reescaneo completo"
+                # -- justo lo contrario de "tiene que ser persistente".
+                "ai_verdict": (cached or {}).get("ai_verdict"),
             }
             # Se muestra la fila si faltan episodios O si hay temporadas en
             # el servidor que TMDB no conoce -- esto último puede pasar
@@ -6498,7 +6934,8 @@ class App(_AppBase):
                           expected=expected, unknown_seasons=unknown_seasons,
                           present_season_counts=present_season_counts,
                           server_id=show.get("id") or show.get("rating_key"),
-                          folder_name=show.get("folder_name"))
+                          folder_name=show.get("folder_name"),
+                          ai_verdict=self._ai_verdict_from_cache_entry(cached) if cached else None)
                 row["episode_titles"] = episode_titles
                 row["absolute_numbering"] = absolute_numbering
                 results.append(row)
@@ -6751,6 +7188,71 @@ class App(_AppBase):
                 present_counts[season] = present_counts.get(season, 0) + 1
             r["server_season_counts"] = present_counts
         return [r for r in results if r["missing"] or r["unknown_seasons"]]
+
+    def _cross_check_single_result_with_ftp(self, result: dict) -> dict:
+        """Igual que _cross_check_results_with_ftp, pero para UNA sola
+        serie -- usado por el reescaneo individual (ver
+        _rescan_single_missing_ep_series). _build_ftp_episode_index lista
+        TODAS las carpetas de TODAS las categorías configuradas (necesario
+        para un reescaneo completo, pero es la fase más lenta de todo el
+        escaneo, y pagarla entera por una sola serie la hacía tardar igual
+        que un reescaneo completo). Aquí se localiza directamente la
+        carpeta de ESTA serie (_find_category_with_existing_folder, mismo
+        método que ya usa el botón de borrar) y solo se lista esa."""
+        import types
+        from core.missing_episodes import find_missing_episodes, find_unknown_seasons, format_missing_summary
+
+        if not self.config_data.get("ftp_host", ""):
+            return result
+        new_expected = result.get("expected_episodes")
+        if not new_expected:
+            return result
+
+        from core.ftp_client import FTPClient as _FTPClient
+        own_ftp = _FTPClient()
+        try:
+            own_ftp.connect(
+                self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
+                self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
+                self.config_data.get("ftp_use_tls", False))
+            if not own_ftp.is_connected():
+                _log.warning("Cruce FTP (individual): omitido, no se pudo conectar al servidor")
+                return result
+            info = types.SimpleNamespace(title=result["name"], media_type="tv",
+                                         folder_name=result.get("folder_name"))
+            category, folder_name = self._find_category_with_existing_folder(own_ftp, info, force_refresh=True)
+            if not folder_name:
+                _log.info("Cruce FTP (individual): '%s' no se encontró en ninguna categoría del FTP",
+                          result["name"])
+                return result
+            root = category.get("root", "")
+            files = own_ftp.list_files_recursive(f"{root.rstrip('/')}/{folder_name}", max_depth=2)
+        except Exception as e:
+            _log.warning("Cruce FTP (individual): fallo inesperado para '%s': %s", result["name"], e)
+            return result
+        finally:
+            own_ftp.disconnect()
+
+        ftp_present = set()
+        for fname in files:
+            det = detect_episode(fname)
+            if det.get("season") is not None and det.get("episode") is not None:
+                ftp_present.add((det["season"], det["episode"]))
+        _log.info("Cruce FTP (individual): '%s' -> %d episodio(s) encontrados en '%s/%s' (hueco antes: %s)",
+                  result["name"], len(ftp_present), root, folder_name, result["missing"])
+
+        already_present = {(season, ep) for season, eps in new_expected.items()
+                           for ep in eps if ep not in set(result["missing"].get(season, []))}
+        combined_present = already_present | ftp_present
+        new_missing = find_missing_episodes(new_expected, combined_present)
+        result["missing"] = new_missing
+        result["summary"] = format_missing_summary(result["name"], new_missing)
+        result["unknown_seasons"] = find_unknown_seasons(combined_present, new_expected.keys())
+        present_counts = {}
+        for season, _ep in combined_present:
+            present_counts[season] = present_counts.get(season, 0) + 1
+        result["server_season_counts"] = present_counts
+        return result
 
     @staticmethod
     def _match_ftp_present(ftp_index: dict, show_name: str, known_folder_name: str = None):
@@ -7287,14 +7789,22 @@ class App(_AppBase):
             self.after(50, self._search_new_entries, added)
 
     def _clear_files(self):
-        if self._upload_running:
+        # self._upload_running solo indica una subida MANUAL en marcha -- el
+        # modo automático nunca lo toca, aunque añade sus propias filas a
+        # esta misma lista (self.files, vía _on_auto_file_event) con
+        # estados "en_cola"/"subiendo" igual que la manual. Sin
+        # self._watcher aquí, "Limpiar" con el modo automático subiendo
+        # borraba esas filas sin preguntar nada -- el diálogo nunca llegaba
+        # a aparecer aunque hubiera subidas de verdad en curso.
+        if self._upload_running or self._watcher is not None:
             pendientes = [e for e in self.files if e.status != "subido"]
             if pendientes:
                 dlg = _ClearDialog(self, len(pendientes))
                 if dlg.result == "solo_subidos":
                     self.files = [e for e in self.files if e.status == "subido"]
                 elif dlg.result == "todo":
-                    self._upload_cancel.set()
+                    if self._upload_running:
+                        self._upload_cancel.set()
                     self.files.clear()
                 else:
                     return   # diálogo cerrado sin elegir -> no tocar la lista
@@ -7304,6 +7814,16 @@ class App(_AppBase):
         self.files.clear()
         self._refresh_table()   # destruye widgets usando _file_rows antes de vaciarlo
         self._clear_detail()
+
+    _FILES_PAGE_SIZE = 25   # filas por página -- ver el comentario junto a files_nav_fr
+
+    def _files_change_page(self, delta: int):
+        n_pages = max(1, -(-len(self.files) // self._FILES_PAGE_SIZE))
+        new_page = max(0, min(n_pages - 1, self._files_page + delta))
+        if new_page == self._files_page:
+            return
+        self._files_page = new_page
+        self._refresh_table()
 
     def _refresh_table(self):
         for row_widgets in self._file_rows:
@@ -7316,12 +7836,36 @@ class App(_AppBase):
         self._file_rows.clear()
         if not self.files:
             self._drop_zone.pack(pady=40)
+            self._files_page_lbl.configure(text="")
+            self._files_prev_btn.configure(state="disabled")
+            self._files_next_btn.configure(state="disabled")
             self._update_status_bar()
             return
         self._drop_zone.pack_forget()
 
+        total = len(self.files)
+        n_pages = max(1, -(-total // self._FILES_PAGE_SIZE))
+        # No se resetea a la página 0 en cada refresco (a diferencia de
+        # Episodios en un reescaneo completo): aquí _refresh_table() se
+        # llama constantemente por cambios normales de la cola (añadir/
+        # quitar un archivo, AutoWatcher detectando uno nuevo...), y
+        # devolver siempre a la primera página interrumpiría a quien esté
+        # mirando otra -- solo se corrige (clamp) si la página actual ya no
+        # existe (p.ej. tras borrar los últimos archivos de la última página).
+        self._files_page = max(0, min(n_pages - 1, self._files_page))
+        start = self._files_page * self._FILES_PAGE_SIZE
+        page_files = self.files[start:start + self._FILES_PAGE_SIZE]
+
+        self._files_page_lbl.configure(text=f"Página {self._files_page + 1} de {n_pages}")
+        self._files_prev_btn.configure(state="normal" if self._files_page > 0 else "disabled")
+        self._files_next_btn.configure(state="normal" if self._files_page < n_pages - 1 else "disabled")
+        # Subir el scroll interno de la tabla -- si no, tras cambiar de
+        # página con el scroll bajado quedaba viendo un hueco en blanco
+        # (mismo arreglo que Episodios, ver [[project_pagination_user_object_limit]]).
+        self._file_list_frame._parent_canvas.yview_moveto(0)
+
         cw = self._col_widths
-        for i, entry in enumerate(self.files):
+        for i, entry in enumerate(page_files):
             rf = ctk.CTkFrame(
                 self._file_list_frame,
                 fg_color=SELECTED_ROW_COLOR if entry is self._selected_entry else "transparent")
@@ -7440,14 +7984,22 @@ class App(_AppBase):
 
     def _file_size_text(self, entry) -> str:
         """Peso del archivo en disco (columna "Peso", junto a "Vel.") --
-        directamente del filesystem, no hay que guardarlo en FileEntry ni
-        persistirlo: es una propiedad del archivo, siempre derivable de su
-        ruta. Vacío si el archivo no existe todavía o ya no existe (p.ej.
-        justo tras subir y moverlo/borrarlo), en vez de fallar."""
+        leído del filesystem, no de un dato guardado al identificar el
+        archivo. El modo automático puede mover el archivo a "procesados/"
+        o borrarlo justo después de subirlo (según "Acción tras subir" en
+        Ajustes) sin avisar a esta fila -- entry.path se queda apuntando a
+        una ruta que ya no existe, y sin este caché la columna se quedaba
+        en blanco justo cuando la subida terminaba bien, como si algo
+        hubiera fallado. Se guarda el último tamaño leído con éxito en la
+        propia entrada y se reutiliza mientras el archivo no esté
+        disponible -- solo vacío si nunca se pudo leer ni una vez."""
         try:
-            return _fmt_size(Path(entry.path).stat().st_size)
+            size = Path(entry.path).stat().st_size
+            entry._last_known_size_text = _fmt_size(size)
+            entry._last_known_size_bytes = size
         except OSError:
-            return ""
+            pass
+        return entry._last_known_size_text
 
     def _update_row(self, entry):
         sc = {"pendiente": PENDING_COLOR, "buscando": WARNING_COLOR, "listo": SUCCESS_COLOR,
@@ -7755,7 +8307,11 @@ class App(_AppBase):
                 labels.append(f"{name} ({year}) [{r.get('media_type', '')}]")
             self.after(0, lambda: self._apply_search_results(labels))
         except Exception as e:
-            self.after(0, lambda: self._set_status(f"Error: {e}", ERROR_COLOR))
+            # Ver _fire_background_link: "e" se borra al salir del except,
+            # hay que capturarlo en un argumento por defecto antes de que
+            # la lambda diferida lo referencie ya inexistente.
+            msg = str(e)
+            self.after(0, lambda m=msg: self._set_status(f"Error: {m}", ERROR_COLOR))
 
     def _apply_search_results(self, labels):
         # Recortar las etiquetas al ancho real del combobox: el desplegable
@@ -9541,9 +10097,21 @@ class App(_AppBase):
         self._cleanup_progress.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
         def worker():
-            items = self._scan_cleanup_candidates(
-                progress_cb=lambda c, t, n: self.after(
-                    0, lambda c=c, t=t, n=n: self._update_cleanup_progress(c, t, n)))
+            # Sin este try/except, cualquier fallo dentro de
+            # _scan_cleanup_candidates (un hueco de red, un dato inesperado
+            # de Jellyfin/Plex/FTP...) mataba el hilo en silencio antes de
+            # llegar a _finish_cleanup_scan -- el botón se quedaba
+            # deshabilitado y la barra de progreso llena para siempre.
+            try:
+                items = self._scan_cleanup_candidates(
+                    progress_cb=lambda c, t, n: self.after(
+                        0, lambda c=c, t=t, n=n: self._update_cleanup_progress(c, t, n)))
+            except Exception:
+                _log.exception("Liberar espacio: fallo inesperado durante el análisis")
+                self.after(0, lambda: self._set_status(
+                    "El análisis terminó con un error -- revisa app.log", ERROR_COLOR))
+                self.after(0, lambda: self._finish_cleanup_scan(self._cleanup_raw_items))
+                return
             self.after(0, lambda: self._finish_cleanup_scan(items))
         threading.Thread(target=worker, daemon=True).start()
 

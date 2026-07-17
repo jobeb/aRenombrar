@@ -3,7 +3,6 @@ Lógica de renombrado de archivos.
 Variables: {serie}, {titulo}, {temporada}, {episodio}, {año}, {ext}
 """
 
-import os
 import re
 from pathlib import Path
 from core.api_client import MediaInfo

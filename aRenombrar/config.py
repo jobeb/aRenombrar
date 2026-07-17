@@ -144,6 +144,19 @@ DEFAULTS = {
     # sin programar. Ver App._start_watch_sync_scheduler.
     "watch_sync_schedule_enabled": False,
     "watch_sync_schedule_time": "",
+    # Persistencia entre reinicios de los interruptores de "Episodios que
+    # faltan" y del botón "⚡ Auto" -- por defecto todos apagados/ocultando
+    # nada, igual que antes de tener esto, pero si el usuario los deja
+    # activados se recuerda la próxima vez en vez de resetear siempre a lo
+    # de fábrica. auto_watcher_running es el estado real del botón (se
+    # actualiza en cada arranque/parada, no solo al cerrar) -- al arrancar
+    # la app, si estaba a True, se reanuda el modo automático solo (ver
+    # App._restore_auto_watcher_state), sustituyendo a la lógica anterior
+    # que solo miraba si había una carpeta configurada.
+    "missing_ep_show_ignored": False,
+    "missing_ep_hide_ai_dismissed": False,
+    "missing_ep_hide_no_dub": False,
+    "auto_watcher_running": False,
 }
 
 

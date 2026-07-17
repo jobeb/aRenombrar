@@ -10,8 +10,6 @@ la conversación: aRenombrar organiza y sube contenido que el usuario ya
 tiene, nunca lo adquiere por su cuenta.
 """
 
-from typing import Optional
-
 
 def find_missing_episodes(expected: dict, present: set) -> dict:
     """expected: {temporada: [numero_episodio, ...]} -- lo que debería haber
@@ -43,6 +41,24 @@ def looks_like_season_split(season_episode_numbers: list, missing_in_season: lis
     half = total // 2
     second_half = set(sorted(season_episode_numbers)[half:])
     return set(missing_in_season) == second_half
+
+
+def apply_season_split_filter(missing: dict, expected: dict) -> tuple[dict, set]:
+    """Quita de *missing* las temporadas que looks_like_season_split
+    identifica con alta confianza como desajuste de numeración con TMDB
+    (ver su docstring, caso real de Disenchantment) -- el patrón exacto de
+    "falta justo la segunda mitad" es lo bastante específico como para no
+    ser una coincidencia, así que esos episodios dejan de contar como
+    "que faltan" en vez de solo mostrarse con un aviso. Devuelve
+    (missing_filtrado, temporadas_quitadas) -- el segundo se sigue
+    guardando en la fila como "split_seasons" para el aviso ⚠ junto al
+    resumen, aunque ya no sume al recuento principal."""
+    split_seasons = {season for season, eps in missing.items()
+                     if looks_like_season_split(expected.get(season, []), eps)}
+    if not split_seasons:
+        return missing, split_seasons
+    filtered = {season: eps for season, eps in missing.items() if season not in split_seasons}
+    return filtered, split_seasons
 
 
 def looks_like_absolute_numbering(tmdb_season_counts: dict, present: set) -> bool:
@@ -152,7 +168,17 @@ def episode_has_spanish_text(episode_info: dict) -> bool:
     """True si /tv/{id}/season/{s}/episode/{e}?language=es-ES devuelve texto
     localizado real -- TMDB, cuando no tiene traducción, suele devolver
     'overview'/'name' vacíos en vez de dar error, así que hay que mirar el
-    contenido, no solo si la llamada tuvo éxito."""
+    contenido, no solo si la llamada tuvo éxito.
+
+    OJO: esto es una aproximación con un fallo conocido -- TMDB traduce el
+    texto (título/sinopsis) de un episodio con independencia de si tiene
+    audio doblado de verdad. Caso real: Bleach tiene texto en español para
+    casi todos sus 366 episodios, pero el doblaje CASTELLANO (España) solo
+    llegó hasta el 109 -- esta función devuelve True para episodios muy
+    posteriores igualmente. Es el comportamiento por defecto del
+    interruptor (gratis, automático); el veredicto de la IA (ver
+    core/missing_episodes_ai.py, filter_missing_by_dub_cutoff) lo corrige
+    cuando el usuario pulsa "Preguntar a la IA" para esa serie."""
     return bool((episode_info.get("overview") or "").strip()) or bool((episode_info.get("name") or "").strip())
 
 
@@ -166,6 +192,24 @@ def filter_missing_by_spanish_dub(missing: dict, dub_by_episode: dict) -> dict:
     result = {}
     for season, episodes in missing.items():
         kept = [ep for ep in episodes if dub_by_episode.get(f"{season}x{ep:02d}", True)]
+        if kept:
+            result[season] = kept
+    return result
+
+
+def filter_missing_by_dub_cutoff(missing: dict, dub_cutoff: dict) -> dict:
+    """Igual que filter_missing_by_spanish_dub, pero a partir del veredicto
+    de la IA (ver core/missing_episodes_ai.py) -- dub_cutoff:
+    {temporada: último_episodio_doblado}. Se usa SOLO para series para las
+    que el usuario pulsó "Preguntar a la IA" (ver
+    gui/app.py::_visible_missing_ep_row): su veredicto sustituye al chequeo
+    automático de TMDB para esa serie, nunca al revés. Una temporada que no
+    aparece en dub_cutoff (la IA no dio veredicto para ella, o el doblaje
+    está completo) se deja tal cual, visible por defecto."""
+    result = {}
+    for season, episodes in missing.items():
+        cutoff = dub_cutoff.get(season)
+        kept = [ep for ep in episodes if cutoff is None or ep <= cutoff]
         if kept:
             result[season] = kept
     return result

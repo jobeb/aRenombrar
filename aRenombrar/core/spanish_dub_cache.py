@@ -10,6 +10,14 @@ Formato: {tmdb_id_como_texto: {"spanish_available": bool|None,
 "spanish_available" es el resultado (cacheado, una vez por serie) de
 /tv/{id}/watch/providers para la región "ES" -- evita repetir esa consulta
 por cada episodio de la misma serie.
+
+Este chequeo basado en TMDB es el comportamiento POR DEFECTO del
+interruptor -- se sabe que puede dar falsos positivos (TMDB traduce el
+texto de episodios sin relación con si hay audio doblado, ver el caso real
+de Bleach en gui/app.py::_visible_missing_ep_row), pero es gratis y
+automático. Si el usuario pulsa "🤖 Preguntar a la IA" para una serie
+concreta, el veredicto de la IA (ver core/missing_episodes_ai.py) SUSTITUYE
+a este para esa serie -- nunca al revés.
 """
 
 import json

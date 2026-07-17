@@ -7,8 +7,17 @@ comprobar qué ha cambiado de verdad, en vez de repetir todo el trabajo cada
 vez.
 
 Formato: {tmdb_id_como_texto: {"name", "source", "server_id",
-"last_episode_id", "expected", "missing"}, "_meta": {"last_scan_ts": float}}
-"""
+"last_episode_id", "expected", "missing", "ai_verdict"}, "_meta":
+{"last_scan_ts": float}}
+
+"ai_verdict" ({"veredicto", "motivo", "doblaje_castellano"?}, ver
+core/missing_episodes_ai.py) se guarda aparte, en gui/app.py::
+_persist_ai_verdicts -- justo al recibir la respuesta de la IA, no como
+parte del escaneo normal: un reescaneo completo reconstruye la entrada
+entera de cada serie (sin ai_verdict, para no arrastrar un veredicto que
+podría haber quedado desactualizado si el hueco real cambió), así que
+solo sobrevive entre sesiones si nadie ha vuelto a escanear esa serie a
+fondo desde que se preguntó."""
 
 import json
 

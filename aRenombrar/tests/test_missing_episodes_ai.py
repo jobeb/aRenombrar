@@ -1,4 +1,5 @@
 import json
+import json as _json
 
 import core.missing_episodes_ai as mea
 
@@ -80,3 +81,87 @@ def test_ignores_entries_missing_tmdb_id(monkeypatch):
     monkeypatch.setattr(mea.requests, "post", lambda *a, **kw: _FakeResponse(_groq_payload(content)))
     shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
     assert mea.analyze_missing_episodes(shows, api_key="fake-key") == {}
+
+
+def test_optional_context_fields_included_when_present(monkeypatch):
+    sent_payloads = []
+    def _fake_post(url, headers, json, timeout):
+        sent_payloads.append(json["messages"][1]["content"])
+        content = _json.dumps({"veredictos": [{"tmdb_id": 30984, "veredicto": "hueco_real", "motivo": "x"}]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+
+    shows = [{"tmdb_id": 30984, "name": "Bleach", "original_name": "BLEACH",
+              "first_air_date": "2004-10-05", "origin_country": ["JP"],
+              "genres": ["Animation"], "tmdb_seasons": {"1": 366}, "server_seasons": {"1": 109},
+              "missing_episodes": {"1": [110, 111, 112]},
+              "present_episodes": {"1": list(range(1, 110))}}]
+    mea.analyze_missing_episodes(shows, api_key="fake-key")
+
+    sent = _json.loads(sent_payloads[0])[0]
+    assert sent["original_name"] == "BLEACH"
+    assert sent["first_air_date"] == "2004-10-05"
+    assert sent["origin_country"] == ["JP"]
+    assert sent["genres"] == ["Animation"]
+    assert sent["missing_episodes"] == {"1": [110, 111, 112]}
+    assert sent["present_episodes"] == {"1": list(range(1, 110))}
+
+
+def test_optional_context_fields_omitted_when_absent(monkeypatch):
+    sent_payloads = []
+    def _fake_post(url, headers, json, timeout):
+        sent_payloads.append(json["messages"][1]["content"])
+        content = _json.dumps({"veredictos": [{"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "x"}]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+
+    shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
+    mea.analyze_missing_episodes(shows, api_key="fake-key")
+
+    sent = _json.loads(sent_payloads[0])[0]
+    for key in ("original_name", "first_air_date", "origin_country", "genres",
+                "missing_episodes", "present_episodes"):
+        assert key not in sent
+
+
+def test_check_spanish_dub_false_never_includes_dub_field(monkeypatch):
+    # Aunque Groq devuelva "doblaje_castellano" por su cuenta, si no se pidió
+    # (check_spanish_dub=False) no debe colarse en el resultado -- ni
+    # siquiera debe pedirse el campo en el prompt.
+    sent_prompts = []
+    def _fake_post(url, headers, json, timeout):
+        sent_prompts.append(json["messages"][0]["content"])
+        content = _json.dumps({"veredictos": [
+            {"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "ok",
+             "doblaje_castellano": {"1": 109}},
+        ]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+    shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
+    result = mea.analyze_missing_episodes(shows, api_key="fake-key", check_spanish_dub=False)
+    assert result == {1: {"veredicto": "hueco_real", "motivo": "ok"}}
+    assert "doblaje_castellano" not in sent_prompts[0]
+
+
+def test_check_spanish_dub_true_parses_dub_cutoff(monkeypatch):
+    content = json.dumps({"veredictos": [
+        {"tmdb_id": 30984, "veredicto": "hueco_real", "motivo": "Bleach",
+         "doblaje_castellano": {"1": 109}},
+        {"tmdb_id": 1396, "veredicto": "hueco_real", "motivo": "sin recorte"},
+    ]})
+    monkeypatch.setattr(mea.requests, "post", lambda *a, **kw: _FakeResponse(_groq_payload(content)))
+    shows = [{"tmdb_id": 30984, "name": "Bleach", "tmdb_seasons": {"1": 366}, "server_seasons": {"1": 109}},
+             {"tmdb_id": 1396, "name": "Breaking Bad", "tmdb_seasons": {}, "server_seasons": {}}]
+    result = mea.analyze_missing_episodes(shows, api_key="fake-key", check_spanish_dub=True)
+    assert result[30984]["doblaje_castellano"] == {1: 109}
+    assert result[1396]["doblaje_castellano"] == {}
+
+
+def test_check_spanish_dub_true_ignores_malformed_dub_field(monkeypatch):
+    content = json.dumps({"veredictos": [
+        {"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "x", "doblaje_castellano": "no es un objeto"},
+    ]})
+    monkeypatch.setattr(mea.requests, "post", lambda *a, **kw: _FakeResponse(_groq_payload(content)))
+    shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
+    result = mea.analyze_missing_episodes(shows, api_key="fake-key", check_spanish_dub=True)
+    assert result == {1: {"veredicto": "hueco_real", "motivo": "x", "doblaje_castellano": {}}}

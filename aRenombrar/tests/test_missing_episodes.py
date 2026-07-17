@@ -1,10 +1,11 @@
 from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                     format_missing_ranges, looks_like_season_split,
+                                    apply_season_split_filter,
                                     find_unknown_seasons, looks_like_absolute_numbering,
                                     remap_absolute_episodes, remove_missing_episode, remove_series,
                                     _season_ranges,
                                     has_spanish_availability, episode_has_spanish_text,
-                                    filter_missing_by_spanish_dub)
+                                    filter_missing_by_spanish_dub, filter_missing_by_dub_cutoff)
 
 
 def test_find_missing_episodes_finds_gaps():
@@ -94,6 +95,35 @@ def test_looks_like_season_split_false_when_first_half_incomplete():
     season_episodes = list(range(1, 21))
     missing = [5] + list(range(11, 21))
     assert looks_like_season_split(season_episodes, missing) is False
+
+
+def test_apply_season_split_filter_removes_high_confidence_split_seasons():
+    # Caso real: (Des)encanto -- TMDB cuenta 20 episodios en la temporada 1
+    # y 20 en la 2, pero el servidor los tiene organizados como Netflix los
+    # lanzó (5 "Partes" de 10 episodios cada una) -- los 50 episodios están
+    # completos, pero antes de este filtro se reportaban 20 como "que
+    # faltan" (la segunda mitad de cada una de las dos primeras temporadas).
+    expected = {1: list(range(1, 21)), 2: list(range(1, 21)), 3: list(range(1, 11))}
+    missing = {1: list(range(11, 21)), 2: list(range(11, 21))}
+    filtered, split_seasons = apply_season_split_filter(missing, expected)
+    assert filtered == {}
+    assert split_seasons == {1, 2}
+
+
+def test_apply_season_split_filter_keeps_real_gaps_untouched():
+    expected = {1: list(range(1, 21))}
+    missing = {1: [5, 8]}   # huecos sueltos, no un patron de "partes"
+    filtered, split_seasons = apply_season_split_filter(missing, expected)
+    assert filtered == missing
+    assert split_seasons == set()
+
+
+def test_apply_season_split_filter_only_removes_the_matching_season():
+    expected = {1: list(range(1, 21)), 2: list(range(1, 11))}
+    missing = {1: list(range(11, 21)), 2: [3]}   # T1 es split, T2 es un hueco real
+    filtered, split_seasons = apply_season_split_filter(missing, expected)
+    assert filtered == {2: [3]}
+    assert split_seasons == {1}
 
 
 def test_find_unknown_seasons_detects_seasons_tmdb_does_not_know():
@@ -266,3 +296,27 @@ def test_filter_missing_by_spanish_dub_drops_season_if_all_hidden():
     missing = {1: [1], 2: [1]}
     dub = {"1x01": False, "2x01": True}
     assert filter_missing_by_spanish_dub(missing, dub) == {2: [1]}
+
+
+def test_filter_missing_by_dub_cutoff_hides_episodes_past_cutoff():
+    # Caso real: Bleach, doblado al castellano solo hasta el 1x109 de 366.
+    missing = {1: [108, 109, 110, 111]}
+    dub_cutoff = {1: 109}
+    assert filter_missing_by_dub_cutoff(missing, dub_cutoff) == {1: [108, 109]}
+
+
+def test_filter_missing_by_dub_cutoff_keeps_season_visible_without_verdict():
+    missing = {1: [1, 2], 2: [1]}
+    dub_cutoff = {1: 109}   # sin veredicto para la temporada 2
+    assert filter_missing_by_dub_cutoff(missing, dub_cutoff) == {1: [1, 2], 2: [1]}
+
+
+def test_filter_missing_by_dub_cutoff_drops_season_if_all_past_cutoff():
+    missing = {1: [200], 2: [1]}
+    dub_cutoff = {1: 109}
+    assert filter_missing_by_dub_cutoff(missing, dub_cutoff) == {2: [1]}
+
+
+def test_filter_missing_by_dub_cutoff_empty_cutoff_keeps_everything():
+    missing = {1: [1, 2, 3]}
+    assert filter_missing_by_dub_cutoff(missing, {}) == missing

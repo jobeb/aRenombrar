@@ -203,6 +203,49 @@ def get_jellyfin_series(host: str, api_key: str, timeout: int = 15) -> Optional[
     return shows
 
 
+def get_jellyfin_series_item(host: str, api_key: str, item_id: str, timeout: int = 15) -> Optional[dict]:
+    """Igual que get_jellyfin_series, pero para UN solo item ya conocido
+    (por su id) -- usado al reescanear una sola serie (ver
+    App._rescan_single_series_worker) para releer su tmdb_id/folder_name
+    ACTUALES sin pedir la biblioteca entera. Necesario porque si el
+    usuario corrige a mano la identificación de esa serie en Jellyfin
+    (cambia a qué ficha de TMDB apunta), la fila de "Episodios que faltan"
+    seguía usando el tmdb_id viejo -- guardado en caché de la última vez
+    que SÍ se pidió la biblioteca completa -- y "reescanear esta serie"
+    comprobaba huecos contra la ficha de TMDB equivocada de todas formas.
+    Devuelve {"id", "name", "tmdb_id", "folder_name"} o None si falla."""
+    if not host or not api_key or not item_id:
+        return None
+    base = host.rstrip("/")
+    try:
+        # /Items/{id} (sin usuario) responde 400 en algunos servidores --
+        # /Items?Ids= es el mismo endpoint que ya usa get_jellyfin_series,
+        # solo que acotado a un id concreto, y sí funciona sin usuario.
+        resp = requests.get(
+            f"{base}/Items",
+            headers={"X-Emby-Token": api_key},
+            params={"Ids": item_id, "Fields": "ProviderIds,Path"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items", []) or []
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al releer la serie %s: %s", item_id, e)
+        return None
+    if not items:
+        return None
+    item = items[0]
+    tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
+    try:
+        tmdb_id = int(tmdb_raw) if tmdb_raw else None
+    except (TypeError, ValueError):
+        tmdb_id = None
+    path = item.get("Path") or ""
+    folder_name = path.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else None
+    return {"id": item.get("Id"), "name": item.get("Name", ""), "tmdb_id": tmdb_id,
+            "folder_name": folder_name}
+
+
 def get_jellyfin_episodes(host: str, api_key: str, series_id: str, timeout: int = 15) -> Optional[set]:
     """{(temporada, episodio), ...} presentes de verdad en Jellyfin para esa
     serie, o None si falla."""
@@ -273,6 +316,33 @@ def get_plex_series(host: str, token: str, timeout: int = 15) -> Optional[list]:
             shows.append({"rating_key": item.get("ratingKey"), "name": item.get("title", ""),
                           "tmdb_id": tmdb_id})
     return shows
+
+
+def get_plex_series_item(host: str, token: str, rating_key: str, timeout: int = 15) -> Optional[dict]:
+    """Igual que get_jellyfin_series_item pero para Plex -- ver ese
+    docstring para el motivo (releer el tmdb_id ACTUAL de una sola serie
+    tras una re-identificación manual, sin pedir toda la biblioteca).
+    Devuelve {"rating_key", "name", "tmdb_id"} o None si falla."""
+    if not host or not token or not rating_key:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/library/metadata/{rating_key}",
+            params={"X-Plex-Token": token, "includeGuids": "1"},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("MediaContainer", {}).get("Metadata", []) or []
+    except Exception as e:
+        _log.warning("Plex: fallo al releer la serie %s: %s", rating_key, e)
+        return None
+    if not items:
+        return None
+    item = items[0]
+    tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
+    return {"rating_key": item.get("ratingKey"), "name": item.get("title", ""), "tmdb_id": tmdb_id}
 
 
 def get_plex_episodes(host: str, token: str, rating_key: str, timeout: int = 15) -> Optional[set]:
@@ -882,7 +952,6 @@ def get_jellyfin_free_space_for_root(category_root: str, host: str, api_key: str
     core/jellyfin_storage_match.py. None si Jellyfin no está configurado,
     el endpoint no existe en esa versión, o no hay ninguna carpeta
     coincidente."""
-    global _storage_cache
     now = time.monotonic()
     if _storage_cache["folders"] is None or now - _storage_cache["ts"] > _STORAGE_CACHE_TTL:
         _storage_cache["folders"] = get_jellyfin_storage_folders(host, api_key)
