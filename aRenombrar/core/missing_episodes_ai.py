@@ -47,7 +47,15 @@ SYSTEM_PROMPT = (
     "de los episodios que faltan y que SÍ hay por temporada, no solo el "
     "recuento -- compáralos: si present_episodes no empieza en 1, o tiene "
     "una numeración que no encaja con tmdb_seasons, es una pista fuerte de "
-    "artefacto de numeración, no de hueco real). Responde SOLO con un JSON "
+    "artefacto de numeración, no de hueco real). Si viene missing_episodes, "
+    "es la lista EXACTA (por número de temporada) de episodios que de "
+    "verdad faltan -- tu \"motivo\" tiene que ser coherente con esas "
+    "temporadas concretas, nunca generalizar a \"todas las temporadas\" ni "
+    "a temporadas que no aparezcan como clave en missing_episodes, aunque "
+    "tmdb_seasons/server_seasons de otras temporadas no coincidan exacto "
+    "(esa diferencia puede deberse a episodios dobles fusionados en un solo "
+    "archivo u otras razones que ya están resueltas si esa temporada no "
+    "aparece en missing_episodes). Responde SOLO con un JSON "
     "de una línea, sin texto adicional, con este formato exacto:\n"
     '{"veredictos": [{"tmdb_id": <id>, '
     '"veredicto": "hueco_real"|"numeracion_distinta", '

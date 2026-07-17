@@ -165,3 +165,26 @@ def test_check_spanish_dub_true_ignores_malformed_dub_field(monkeypatch):
     shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
     result = mea.analyze_missing_episodes(shows, api_key="fake-key", check_spanish_dub=True)
     assert result == {1: {"veredicto": "hueco_real", "motivo": "x", "doblaje_castellano": {}}}
+
+
+def test_prompt_instructs_motivo_consistent_with_missing_episodes(monkeypatch):
+    # Caso real reportado: una serie con episodios dobles fusionados en un
+    # solo archivo en las temporadas 1-3 (server_seasons no encaja con
+    # tmdb_seasons ahí, pero missing_episodes no las incluye porque no
+    # falta nada de verdad) y un hueco real solo en la temporada 4 -- la IA
+    # respondió con un "motivo" que generalizaba a "todas las temporadas",
+    # contradiciendo la lista (ya correcta). El prompt debe dejar claro que
+    # el motivo tiene que ceñirse a las temporadas que sí aparecen en
+    # missing_episodes.
+    sent_prompts = []
+    def _fake_post(url, headers, json, timeout):
+        sent_prompts.append(json["messages"][0]["content"])
+        content = _json.dumps({"veredictos": [{"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "T4"}]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+    shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {},
+              "missing_episodes": {"4": [1, 2, 3]}}]
+    mea.analyze_missing_episodes(shows, api_key="fake-key")
+    assert "missing_episodes" in sent_prompts[0]
+    assert "coherente" in sent_prompts[0]
+    assert "todas las temporadas" in sent_prompts[0]

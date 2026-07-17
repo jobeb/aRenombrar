@@ -124,7 +124,17 @@ class AutoWatcher:
 
     def _loop(self):
         _log.info("=== AutoWatcher iniciado | carpeta: %s | poll: %ss ===", self.folder, self.poll_interval)
-        self.on_event("info", f"Modo automático activo — vigilando: {self.folder}")
+        try:
+            self.on_event("info", f"Modo automático activo — vigilando: {self.folder}")
+        except Exception:
+            # Sin este try/except, un fallo aquí (antes incluso de entrar
+            # en el bucle) mataba el hilo en silencio: el botón ya se había
+            # puesto en "Detener" (ver App._toggle_auto, que lo actualiza
+            # justo después de start(), sin esperar a que el hilo
+            # sobreviva su primera línea) y se quedaba así para siempre,
+            # aunque el modo automático llevara muerto desde el primer
+            # instante -- mismo patrón que ya se aplicó al bucle de abajo.
+            _log.exception("Error inesperado al avisar del arranque de AutoWatcher")
         while not self._stop.is_set():
             try:
                 self._scan()

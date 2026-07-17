@@ -522,6 +522,7 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
     # reproducciones sumadas, último visionado el más reciente de todos.
     def _fetch_user_watch_data(user):
         uid = user.get("Id")
+        items, episodes = [], []
         try:
             r = requests.get(
                 f"{base}/Users/{uid}/Items",
@@ -530,36 +531,72 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
                 timeout=timeout,
             )
             r.raise_for_status()
-            return r.json().get("Items", []) or []
+            items = r.json().get("Items", []) or []
         except Exception as e:
             _log.warning("Jellyfin: fallo al consultar visionado del usuario '%s': %s",
                          user.get("Name"), e)
-            return []
+        try:
+            # PlayCount/LastPlayedDate del UserData de la SERIE (a
+            # diferencia de UnplayedItemCount, que sí es fiable, ver abajo)
+            # no siempre vienen poblados por Jellyfin -- visto de verdad
+            # con Arcadia: el panel de administración de Jellyfin sí
+            # mostraba el visionado real de un usuario, pero ese campo del
+            # API a nivel de serie venía a 0/vacío, dejando la puntuación
+            # de tendencia en 0 aunque sí se hubiera visto. Se agregan en
+            # su lugar desde el UserData de cada EPISODIO (mismo endpoint
+            # que ya usa get_jellyfin_episode_watched, confirmado fiable
+            # ahí), igual que size_bytes ya se agrega desde episodios más
+            # arriba en esta misma función.
+            er = requests.get(
+                f"{base}/Users/{uid}/Items",
+                headers={"X-Emby-Token": api_key},
+                params={"IncludeItemTypes": "Episode", "Recursive": "true", "Fields": "UserData"},
+                timeout=timeout,
+            )
+            er.raise_for_status()
+            episodes = er.json().get("Items", []) or []
+        except Exception as e:
+            _log.warning("Jellyfin: fallo al consultar visionado de episodios del usuario '%s': %s",
+                         user.get("Name"), e)
+        return items, episodes
+
+    def _merge_watch_field(entry, ud):
+        entry["play_count"] += ud.get("PlayCount", 0) or 0
+        last_played = ud.get("LastPlayedDate")
+        # Comparación de cadenas ISO8601 ("2024-01-01T..." <
+        # "2024-06-01T...") da el orden cronológico correcto sin
+        # tener que convertir a datetime.
+        if last_played and (entry["last_played"] is None or last_played > entry["last_played"]):
+            entry["last_played"] = last_played
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(8, len(users_to_query)) or 1) as pool:
-        for items in pool.map(_fetch_user_watch_data, users_to_query):
+        for items, episodes in pool.map(_fetch_user_watch_data, users_to_query):
             for item in items:
                 entry = stats.get(item.get("Id"))
                 if entry is None:
                     continue
                 ud = item.get("UserData", {}) or {}
-                # Una película está vista si Played=true; una serie se
-                # considera vista por completo si no le queda ningún
-                # episodio sin ver (UnplayedItemCount llega a 0) --
-                # Played a nivel de serie no siempre refleja esto bien.
                 if entry["media_type"] == "movie":
+                    # Una película sí es un solo archivo -- Played/
+                    # PlayCount/LastPlayedDate en su propio UserData son
+                    # fiables directamente, sin agregar nada.
                     watched = bool(ud.get("Played"))
+                    entry["fully_watched"] = entry["fully_watched"] or watched
+                    _merge_watch_field(entry, ud)
                 else:
+                    # Una serie se considera vista por completo si no le
+                    # queda ningún episodio sin ver (UnplayedItemCount
+                    # llega a 0) -- este campo SÍ es fiable a nivel de
+                    # serie. PlayCount/LastPlayedDate, no -- se agregan
+                    # abajo desde los episodios en su lugar.
                     watched = ud.get("UnplayedItemCount", 1) == 0
-                entry["fully_watched"] = entry["fully_watched"] or watched
-                entry["play_count"] += ud.get("PlayCount", 0) or 0
-                last_played = ud.get("LastPlayedDate")
-                # Comparación de cadenas ISO8601 ("2024-01-01T..." <
-                # "2024-06-01T...") da el orden cronológico correcto sin
-                # tener que convertir a datetime.
-                if last_played and (entry["last_played"] is None or last_played > entry["last_played"]):
-                    entry["last_played"] = last_played
+                    entry["fully_watched"] = entry["fully_watched"] or watched
+            for ep in episodes:
+                entry = stats.get(ep.get("SeriesId"))
+                if entry is None:
+                    continue
+                _merge_watch_field(entry, ep.get("UserData", {}) or {})
 
     _log.info("Jellyfin: %d elemento(s) con datos de uso obtenidos (%d usuario(s) consultado(s))",
               len(stats), len(users_to_query))

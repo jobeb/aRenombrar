@@ -260,6 +260,54 @@ class _ClearDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class _DubHiddenDialog(ctk.CTkToplevel):
+    """Lista de series ocultas por "Ocultar sin doblaje ES" -- para poder
+    auditarlas y detectar un veredicto de doblaje equivocado (de TMDB o de
+    la IA) que las esconde sin dejar ningún rastro visible en la tabla
+    principal (ver App._missing_ep_dub_hidden_rows, caso real: Kung Fu
+    Panda -- la IA dijo que los episodios que faltaban no tenían doblaje
+    castellano, y sí lo tenían). Solo lectura -- para corregirlo, el
+    usuario debe buscar la serie a mano (con el interruptor desactivado)
+    y volver a preguntarle a la IA, o desactivar el interruptor entero."""
+    def __init__(self, parent, hidden: list):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.title("Series ocultas por doblaje")
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.update_idletasks()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        dw, dh = 480, 420
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        plural = "s" if len(hidden) != 1 else ""
+        ctk.CTkLabel(self, text=f"{len(hidden)} serie{plural} con hueco real, "
+                                f"ocultada{plural} por \"Ocultar sin doblaje ES\"",
+                     font=ctk.CTkFont(size=13, weight="bold"), wraplength=440).pack(padx=20, pady=(20, 4))
+        ctk.CTkLabel(self, text="Búscalas con el interruptor desactivado si crees que el "
+                                "doblaje indicado no es correcto.",
+                     font=ctk.CTkFont(size=11), text_color=PENDING_COLOR, wraplength=440).pack(padx=20, pady=(0, 12))
+
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        for r in hidden:
+            row = ctk.CTkFrame(scroll, fg_color=("gray90", "gray20"), corner_radius=6)
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(row, text=r["name"], font=ctk.CTkFont(size=12, weight="bold"),
+                        anchor="w").pack(fill="x", padx=10, pady=(6, 0))
+            ai_verdict = r.get("ai_verdict") or {}
+            motivo = ai_verdict.get("motivo", "")
+            fuente = "según la IA" if "doblaje_castellano" in ai_verdict else "según TMDB"
+            detalle = f"{fuente}" + (f": {motivo}" if motivo else "")
+            ctk.CTkLabel(row, text=detalle, font=ctk.CTkFont(size=10), text_color=PENDING_COLOR,
+                        anchor="w", wraplength=400).pack(fill="x", padx=10, pady=(0, 6))
+
+        ctk.CTkButton(self, text="Cerrar", width=100, command=self.destroy).pack(pady=(0, 16))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+
 class _SeriesMatchDialog(ctk.CTkToplevel):
     """Diálogo modal: ¿la serie a subir es la misma que una carpeta parecida
     que ya existe en el FTP? (idioma, artículo, nombre corto vs largo...)"""
@@ -2368,7 +2416,24 @@ class App(_AppBase):
                     if root in self._ftp_dir_cache:
                         continue
                     try:
-                        self._ftp_dir_cache[root] = own_ftp.list_dirs(root)
+                        # Dos listados, no uno, misma unión que
+                        # _find_category_with_existing_folder -- este
+                        # prefetch es quien primero rellena
+                        # self._ftp_dir_cache para cada raíz, y esa función
+                        # SOLO vuelve a listar si la raíz no está ya en
+                        # caché: un listado único e incompleto aquí "envenena"
+                        # la caché para el resto de la sesión, saltándose la
+                        # protección de doble listado de esa otra función por
+                        # completo. Caso real: Futurama sí existía en
+                        # /datos2/series/, pero al subir un capítulo nuevo se
+                        # creó una carpeta duplicada en /datos2/seriespeques
+                        # -- la búsqueda de carpeta existente nunca llegó a
+                        # listar de verdad esa raíz porque este prefetch ya
+                        # la había dejado en caché (incompleta) nada más
+                        # arrancar.
+                        first = set(own_ftp.list_dirs(root))
+                        second = set(own_ftp.list_dirs(root))
+                        self._ftp_dir_cache[root] = list(first | second)
                         changed = True
                     except Exception:
                         continue
@@ -2592,7 +2657,17 @@ class App(_AppBase):
             root = category.get("root", "")
             if root:
                 if root not in self._ftp_dir_cache:
-                    self._ftp_dir_cache[root] = ftp_conn.list_dirs(root)
+                    # Dos listados, no uno, misma unión que
+                    # _find_category_with_existing_folder -- esta caché es
+                    # compartida (self._ftp_dir_cache) y quien la rellene
+                    # primero decide lo que ven todos los demás lectores
+                    # mientras dure la sesión (ninguno vuelve a listar si ya
+                    # está en caché); un listado único e incompleto aquí
+                    # tiene el mismo riesgo de "envenenarla" que ya se vio
+                    # en _prefetch_ftp_category_dirs.
+                    first = set(ftp_conn.list_dirs(root))
+                    second = set(ftp_conn.list_dirs(root))
+                    self._ftp_dir_cache[root] = list(first | second)
                 existing = self._ftp_dir_cache[root]
 
                 sanitized_desired = _ftp_safe(desired)
@@ -4803,22 +4878,35 @@ class App(_AppBase):
         # (ver _on_toggle_missing_ep_switch), no solo al cerrar la app.
         self._missing_ep_show_ignored_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_show_ignored", False))
-        ctk.CTkSwitch(right_fr, text="Mostrar ignoradas", variable=self._missing_ep_show_ignored_var,
-                      command=lambda: self._on_toggle_missing_ep_switch(
-                          "missing_ep_show_ignored", self._missing_ep_show_ignored_var,
-                          self._render_missing_episodes_table)).pack(side="right", padx=(4, 12), pady=8)
+        self._missing_ep_show_ignored_switch = ctk.CTkSwitch(
+            right_fr, text="Mostrar ignoradas", variable=self._missing_ep_show_ignored_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_ep_show_ignored", self._missing_ep_show_ignored_var,
+                self._render_missing_episodes_table))
+        self._missing_ep_show_ignored_switch.pack(side="right", padx=(4, 12), pady=8)
         self._missing_ep_hide_ai_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_hide_ai_dismissed", False))
-        ctk.CTkSwitch(right_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
-                      command=lambda: self._on_toggle_missing_ep_switch(
-                          "missing_ep_hide_ai_dismissed", self._missing_ep_hide_ai_var,
-                          self._render_missing_episodes_table)).pack(side="right", padx=4, pady=8)
+        self._missing_ep_hide_ai_switch = ctk.CTkSwitch(
+            right_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_ep_hide_ai_dismissed", self._missing_ep_hide_ai_var,
+                self._render_missing_episodes_table))
+        self._missing_ep_hide_ai_switch.pack(side="right", padx=4, pady=8)
         self._missing_ep_hide_no_dub_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_hide_no_dub", False))
-        ctk.CTkSwitch(right_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
-                      command=lambda: self._on_toggle_missing_ep_switch(
-                          "missing_ep_hide_no_dub", self._missing_ep_hide_no_dub_var,
-                          self._on_toggle_hide_no_dub)).pack(side="right", padx=4, pady=8)
+        self._missing_ep_hide_no_dub_switch = ctk.CTkSwitch(
+            right_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_ep_hide_no_dub", self._missing_ep_hide_no_dub_var,
+                self._on_toggle_hide_no_dub))
+        self._missing_ep_hide_no_dub_switch.pack(side="right", padx=4, pady=8)
+        # El recuento de series ocultas se funde en el propio texto del
+        # interruptor (ver _update_missing_ep_dub_hidden_counter) en vez de
+        # una etiqueta aparte al lado -- esa ocupaba demasiado sitio.
+        # Clic derecho (no toca el toggle normal, que sigue siendo clic
+        # izquierdo) abre el detalle de qué series se ocultaron y por qué.
+        self._missing_ep_hide_no_dub_switch.bind(
+            "<Button-3>", lambda e: self._show_missing_ep_dub_hidden_dialog())
         self._missing_ep_search_entry = ctk.CTkEntry(right_fr, width=180, placeholder_text="Filtrar por nombre...")
         self._missing_ep_search_entry.pack(side="right", padx=4, pady=8)
         self._missing_ep_search_entry.bind("<KeyRelease>", lambda e: self._render_missing_episodes_table())
@@ -5489,6 +5577,7 @@ class App(_AppBase):
         self._missing_ep_season_widgets = {}
 
         sorted_rows = self._missing_ep_visible_rows()
+        self._update_missing_ep_switch_counters()
 
         if not sorted_rows:
             if self._missing_ep_results:
@@ -5572,13 +5661,8 @@ class App(_AppBase):
         if not self._missing_ep_hide_no_dub_var.get():
             return r
 
-        if ai_verdict and "doblaje_castellano" in ai_verdict:
-            from core.missing_episodes import filter_missing_by_dub_cutoff, format_missing_summary
-            filtered_missing = filter_missing_by_dub_cutoff(r["missing"], ai_verdict["doblaje_castellano"])
-        else:
-            from core.missing_episodes import filter_missing_by_spanish_dub, format_missing_summary
-            dub_episodes = self._spanish_dub_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
-            filtered_missing = filter_missing_by_spanish_dub(r["missing"], dub_episodes)
+        from core.missing_episodes import format_missing_summary
+        filtered_missing = self._missing_ep_dub_filtered(r)
         if not filtered_missing and not r.get("unknown_seasons"):
             return None
         if filtered_missing == r["missing"]:
@@ -5587,6 +5671,78 @@ class App(_AppBase):
         display["missing"] = filtered_missing
         display["summary"] = format_missing_summary(r["name"], filtered_missing) if filtered_missing else r["summary"]
         return display
+
+    def _missing_ep_dub_filtered(self, r: dict) -> dict:
+        """El "missing" de *r* recortado a solo los episodios sin doblaje
+        castellano confirmado -- IA si la serie tiene doblaje_castellano
+        (ver _ask_ai_about_current_missing_ep_show), si no TMDB
+        (self._spanish_dub_cache). Extraído de _visible_missing_ep_row para
+        reutilizarlo también en _missing_ep_dub_hidden_rows (el contador
+        "N series ocultas por doblaje") sin duplicar el criterio."""
+        ai_verdict = r.get("ai_verdict")
+        if ai_verdict and "doblaje_castellano" in ai_verdict:
+            from core.missing_episodes import filter_missing_by_dub_cutoff
+            return filter_missing_by_dub_cutoff(r["missing"], ai_verdict["doblaje_castellano"])
+        from core.missing_episodes import filter_missing_by_spanish_dub
+        dub_episodes = self._spanish_dub_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
+        return filter_missing_by_spanish_dub(r["missing"], dub_episodes)
+
+    def _missing_ep_dub_hidden_rows(self) -> list:
+        """Series que "Ocultar sin doblaje ES" deja sin nada visible --
+        independiente de otros filtros (búsqueda, ignoradas, descartadas
+        por IA), para el contador pulsable junto al interruptor. Un
+        veredicto de la IA equivocado sobre el doblaje (visto de verdad:
+        Kung Fu Panda -- la IA dijo que solo tenían doblaje los episodios
+        ya presentes, y no era así) esconde la serie ENTERA sin dejar
+        ningún rastro visible de por qué -- este contador es la única
+        forma de revisar qué se ocultó y detectarlo."""
+        if not self._missing_ep_hide_no_dub_var.get():
+            return []
+        hidden = []
+        for r in self._missing_ep_results:
+            filtered_missing = self._missing_ep_dub_filtered(r)
+            if not filtered_missing and not r.get("unknown_seasons"):
+                hidden.append(r)
+        return sorted(hidden, key=lambda r: r["name"].lower())
+
+    def _missing_ep_ai_dismissed_rows(self) -> list:
+        """Series que "Ocultar descartados por IA" oculta ahora mismo --
+        mismo criterio que _missing_ep_dub_hidden_rows, para fundir el
+        recuento en el propio texto del interruptor."""
+        if not self._missing_ep_hide_ai_var.get():
+            return []
+        hidden = [r for r in self._missing_ep_results
+                 if bool(r.get("ai_verdict")) and r["ai_verdict"].get("veredicto") == "numeracion_distinta"]
+        return sorted(hidden, key=lambda r: r["name"].lower())
+
+    def _missing_ep_ignored_count(self) -> int:
+        """A diferencia de los otros dos contadores, "ignorada" es un dato
+        propio de cada fila (r["ignored"]), no algo que dependa de si el
+        interruptor está activo -- tiene sentido mostrarlo pase lo que
+        pase (con el interruptor apagado, cuántas hay para revelar; con
+        él encendido, cuántas se están mostrando ahora)."""
+        return sum(1 for r in self._missing_ep_results if r.get("ignored"))
+
+    def _update_missing_ep_switch_counters(self):
+        """Funde el recuento de cada filtro en el propio texto de su
+        interruptor (Mostrar/Ocultar N ...) en vez de una etiqueta aparte
+        al lado -- menos sitio ocupado en la cabecera."""
+        n_ignored = self._missing_ep_ignored_count()
+        self._missing_ep_show_ignored_switch.configure(
+            text=f"Mostrar {n_ignored} ignoradas" if n_ignored else "Mostrar ignoradas")
+
+        n_ai = len(self._missing_ep_ai_dismissed_rows())
+        self._missing_ep_hide_ai_switch.configure(
+            text=f"Ocultar {n_ai} descartados por IA" if n_ai else "Ocultar descartados por IA")
+
+        n_dub = len(self._missing_ep_dub_hidden_rows())
+        self._missing_ep_hide_no_dub_switch.configure(
+            text=f"Ocultar {n_dub} sin doblaje ES" if n_dub else "Ocultar sin doblaje ES")
+
+    def _show_missing_ep_dub_hidden_dialog(self):
+        hidden = self._missing_ep_dub_hidden_rows()
+        if hidden:
+            _DubHiddenDialog(self, hidden)
 
     def _build_missing_ep_row(self, r: dict):
         """Construye y empaqueta la fila de una serie en la tabla --
@@ -6033,6 +6189,17 @@ class App(_AppBase):
         veredicto_txt = "probablemente NO falta nada real" if dismissed else "probablemente sí falta de verdad"
         motivo = verdict.get("motivo", "")
         text = f"🤖 Según la IA, {veredicto_txt}" + (f": {motivo}" if motivo else "")
+        # El "motivo" es texto libre de la IA -- puede generalizar de más
+        # ("en todas las temporadas") aunque r["missing"] (la misma fuente
+        # que ya construye bien la lista/tabla) solo tenga huecos de
+        # verdad en alguna temporada concreta. Se añade aquí, calculado
+        # por la app y no por la IA, para que el mensaje nunca pueda
+        # contradecir lo que la lista ya muestra correctamente.
+        if not dismissed:
+            affected = sorted(r.get("missing", {}).keys())
+            if affected:
+                etiqueta = "temporada" if len(affected) == 1 else "temporadas"
+                text += f"\n📋 Huecos reales en la lista: {etiqueta} {', '.join(str(s) for s in affected)}"
         dub_cutoff = verdict.get("doblaje_castellano")
         if dub_cutoff is not None:
             if dub_cutoff:
@@ -6506,7 +6673,7 @@ class App(_AppBase):
         cache = dict(load_cache())
         if tmdb_id != old_tmdb_id:
             cache.pop(str(old_tmdb_id), None)   # identificación corregida -- no dejar la entrada vieja huérfana
-        cache[str(tmdb_id)] = {
+        cache_entry = {
             "name": name, "source": source, "server_id": server_id,
             "folder_name": folder_name,
             "last_episode_id": (details.get("last_episode_to_air") or {}).get("id"),
@@ -6526,13 +6693,14 @@ class App(_AppBase):
             # ficha y no debe arrastrarse.
             "ai_verdict": r.get("ai_verdict") if tmdb_id == old_tmdb_id else None,
         }
-        save_cache(cache)
+        cache[str(tmdb_id)] = cache_entry
 
         if not (missing or unknown_seasons):
+            save_cache(cache)
             return []   # ya no le falta nada -- se quita de la lista
 
-        # missing aquí es SOLO para mostrar -- la caché en disco (arriba,
-        # cache[str(tmdb_id)] = {...}) ya guardó el hueco SIN filtrar.
+        # missing aquí es SOLO para mostrar -- cache_entry["missing"] se
+        # corrige más abajo, tras el cruce con el FTP, antes de guardar.
         missing, split_seasons = apply_season_split_filter(missing, expected)
         new_row = {
             "tmdb_id": tmdb_id, "name": name, "source": source, "server_id": server_id,
@@ -6549,6 +6717,17 @@ class App(_AppBase):
             "folder_name": folder_name,
         }
         new_row = self._cross_check_single_result_with_ftp(new_row)
+        # Propagar la corrección del cruce FTP a la caché de disco -- antes
+        # se guardaba (arriba) con el hueco de ANTES del cruce, así que una
+        # corrección real (ej. Dragon Ball GT: 3 episodios que sí estaban
+        # en el servidor) solo vivía en esta sesión y volvía a aparecer tal
+        # cual en el próximo arranque, mismo bug que en _scan_missing_episodes.
+        cache_entry["missing"] = {str(k): v for k, v in new_row["missing"].items()}
+        cache_entry["unknown_seasons"] = sorted(new_row.get("unknown_seasons") or [])
+        cache_entry["present_season_counts"] = {
+            str(k): v for k, v in (new_row.get("server_season_counts") or {}).items()}
+        save_cache(cache)
+
         if not (new_row["missing"] or new_row["unknown_seasons"]):
             return []
         return [new_row]
@@ -6943,14 +7122,38 @@ class App(_AppBase):
                     on_result_cb(row)
 
         if results and (cancel_event is None or not cancel_event.is_set()):
-            results = self._cross_check_results_with_ftp(results, cancel_event=cancel_event)
+            # _cross_check_results_with_ftp muta cada fila IN PLACE
+            # (r["missing"] = ...) y solo al final filtra las que se
+            # quedaron sin ningún hueco real de su valor de retorno -- por
+            # eso se guarda la lista de ANTES del cruce (pre_cross_check,
+            # mismos objetos dict, no una copia) para poder propagar la
+            # corrección a `cache` también para esas, no solo a las que
+            # siguen apareciendo en pantalla.
+            pre_cross_check = results
+            results = self._cross_check_results_with_ftp(pre_cross_check, cancel_event=cancel_event,
+                                                          progress_cb=progress_cb)
+            # Sin esto, la corrección del cruce FTP (p.ej. Dragon Ball GT:
+            # 3 episodios que sí estaban en el servidor pero Jellyfin no
+            # los tenía bien indexados) solo vivía en esta sesión --
+            # `cache[key]["missing"]` seguía con el hueco de ANTES del
+            # cruce (se escribió más arriba, en el bucle principal, antes
+            # de cruzar con el FTP), así que al guardar se persistía el
+            # dato viejo y el hueco falso volvía a aparecer tal cual en el
+            # siguiente arranque, aunque ya se hubiera visto corregido.
+            for r in pre_cross_check:
+                key = str(r["tmdb_id"])
+                if key in cache:
+                    cache[key]["missing"] = {str(k): v for k, v in r["missing"].items()}
+                    cache[key]["unknown_seasons"] = sorted(r.get("unknown_seasons") or [])
+                    cache[key]["present_season_counts"] = {
+                        str(k): v for k, v in (r.get("server_season_counts") or {}).items()}
 
         import time as _time
         cache["_meta"] = {"last_scan_ts": _time.time()}
         save_cache(cache)
         return results
 
-    def _build_ftp_episode_index(self, ftp_conn, cancel_event=None) -> dict:
+    def _build_ftp_episode_index(self, ftp_conn, cancel_event=None, progress_cb=None) -> dict:
         """Listado COMPLETO (de una sola vez, no serie por serie) de todas
         las categorías de TV configuradas en el FTP -- se llama solo si el
         escaneo por Jellyfin/Plex ya encontró algún hueco, para no pagar
@@ -6964,7 +7167,16 @@ class App(_AppBase):
         listados individuales seguidos), y antes de este parámetro
         "Cancelar" no tenía forma de interrumpirla: el hilo tenía que
         terminar las ~360 carpetas sí o sí antes de que el botón
-        surtiera efecto."""
+        surtiera efecto.
+        progress_cb(current, total, nombre): mismo contrato que en
+        _scan_missing_episodes, reutilizado aquí para ESTA fase (el
+        respaldo carpeta-a-carpeta) -- sin esto, la barra de progreso se
+        quedaba clavada al 100% (el recuento de series ya había terminado)
+        mientras esta fase, la más lenta con diferencia con una raíz
+        grande, seguía trabajando en silencio varios minutos más -- el
+        usuario veía el escaneo "parado" y no tenía forma de saber que en
+        realidad seguía cruzando datos con el FTP, ni que la lista que
+        estaba mirando todavía podía cambiar cuando terminara de verdad."""
         cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get("tv", [])
         index = {}
         for cat in cats:
@@ -6981,7 +7193,25 @@ class App(_AppBase):
             # mando" que ninguna serie está en el FTP. Aquí la fiabilidad
             # importa más que ahorrarse una consulta (esta función solo se
             # llama una vez por escaneo).
-            show_folders = ftp_conn.list_dirs(root)
+            # Dos listados, no uno -- mismo motivo que
+            # _find_category_with_existing_folder (un único NLST a esta
+            # raíz a veces vuelve incompleto sin dar ningún error, visto de
+            # verdad con "(Des)encanto"): un escaneo completo real dejó
+            # fuera "Los Vengadores: Los Súper Héroes más poderosos de la
+            # Tierra" de show_folders con un solo intento, así que su
+            # carpeta nunca llegaba a procesarse aunque LIST -R sí trajera
+            # sus archivos -- _match_ftp_present no encontraba ninguna
+            # carpeta con esa confianza y el cruce se saltaba en silencio
+            # para esa serie entera, dejando el hueco falso que Jellyfin
+            # había reportado. "Reescanear esta serie" no tenía este fallo
+            # porque ya usa la unión de dos intentos para su propia serie.
+            first_folders = set(ftp_conn.list_dirs(root))
+            second_folders = set(ftp_conn.list_dirs(root))
+            if first_folders != second_folders:
+                _log.warning("Cruce FTP: listado de '%s' inconsistente entre dos intentos seguidos "
+                            "(%d vs %d carpetas) -- usando la unión de ambos",
+                            root, len(first_folders), len(second_folders))
+            show_folders = list(first_folders | second_folders)
             if show_folders:
                 self._ftp_dir_cache[root] = show_folders   # sí se aprovecha para otras partes de la app
                 _log.info("Cruce FTP: raíz '%s' -> %d carpeta(s) de serie: %s",
@@ -6996,10 +7226,38 @@ class App(_AppBase):
             # FTPClient.list_tree_recursive) -- evita un
             # list_files_recursive por cada serie, que es lo que hacía
             # lento este cruce en categorías con muchas series.
+            # Igual que show_folders arriba: dos peticiones, no una, y
+            # unión de los archivos por carpeta -- un escaneo completo real
+            # dio "falta Bleach 1x08" con el archivo presente de verdad en
+            # el servidor: la carpeta de Bleach SÍ se resolvía por LIST -R
+            # (así que nunca caía en el respaldo carpeta-a-carpeta de más
+            # abajo, que sí es fiable), pero esa respuesta concreta venía
+            # incompleta DENTRO de esa carpeta -- el aviso de "respuesta
+            # cortada" de más abajo solo detecta carpetas enteras que
+            # faltan, no archivos sueltos que faltan dentro de una carpeta
+            # que sí se resolvió. Un segundo LIST -R independiente rara vez
+            # se corta exactamente en el mismo punto, así que la unión
+            # recupera el archivo que faltaba en cualquiera de los dos.
             files_by_folder = None
-            tree = ftp_conn.list_tree_recursive(root)
-            if tree is not None:
-                files_by_folder = files_by_top_level_folder(tree, root)
+            tree1 = ftp_conn.list_tree_recursive(root)
+            tree2 = ftp_conn.list_tree_recursive(root)
+            if tree1 is not None or tree2 is not None:
+                by_folder_1 = files_by_top_level_folder(tree1, root) if tree1 is not None else {}
+                by_folder_2 = files_by_top_level_folder(tree2, root) if tree2 is not None else {}
+                files_by_folder = {}
+                for folder in set(by_folder_1) | set(by_folder_2):
+                    set_1 = set(by_folder_1.get(folder, []))
+                    set_2 = set(by_folder_2.get(folder, []))
+                    files_by_folder[folder] = sorted(set_1 | set_2)
+                    # Comparado como conjuntos, no como listas -- el orden en
+                    # que el servidor devuelve los archivos puede variar entre
+                    # dos peticiones sin que eso sea una respuesta cortada de
+                    # verdad, y comparar listas habría avisado de un "hueco"
+                    # falso en cada carpeta solo por el orden.
+                    if folder in by_folder_1 and folder in by_folder_2 and set_1 != set_2:
+                        _log.warning("Cruce FTP: '%s/%s' -- LIST -R inconsistente entre dos intentos "
+                                    "seguidos (%d vs %d archivo(s)) -- usando la unión de ambos",
+                                    root, folder, len(set_1), len(set_2))
                 _log.info("Cruce FTP: LIST -R soportado en '%s' -- %d carpeta(s) resueltas de una vez",
                           root, len(files_by_folder))
                 if show_folders and len(files_by_folder) < len(show_folders) * 0.5:
@@ -7071,8 +7329,23 @@ class App(_AppBase):
                         if not ok:
                             return folder, []
                         try:
-                            return folder, worker_ftp.list_files_recursive(
-                                f"{root.rstrip('/')}/{folder}", max_depth=2)
+                            # Dos listados, no uno, misma unión que el resto
+                            # de esta función -- una raíz real (368+
+                            # carpetas) resultó SIEMPRE sin soporte de
+                            # verdad para LIST -R (atascada en 1/368 en 33
+                            # escaneos seguidos, nunca de casualidad, ver el
+                            # aviso de "respuesta cortada" más arriba), así
+                            # que TODAS sus carpetas caen aquí en cada
+                            # escaneo -- este respaldo no es un caso raro
+                            # para esa categoría, es el camino normal, y un
+                            # listado cortado aquí (mismo NLST/LIST que ya
+                            # falla en otros sitios de este mismo servidor)
+                            # dejaba huecos falsos (Bleach 1x08, presente de
+                            # verdad en el servidor).
+                            path = f"{root.rstrip('/')}/{folder}"
+                            files = list(set(worker_ftp.list_files_recursive(path, max_depth=2))
+                                        | set(worker_ftp.list_files_recursive(path, max_depth=2)))
+                            return folder, files
                         finally:
                             worker_ftp.disconnect()
 
@@ -7087,9 +7360,13 @@ class App(_AppBase):
                         # terminado, dejando el mismo silencio que se quiere
                         # evitar aquí.
                         futures = [executor.submit(_list_folder_files, f) for f in fallback_folders]
+                        done = 0
                         for future in as_completed(futures):
                             folder, files = future.result()
                             _process_folder(folder, files)
+                            done += 1
+                            if progress_cb:
+                                progress_cb(done, len(fallback_folders), f"cruzando con el FTP: {folder}")
                             if cancel_event and cancel_event.is_set():
                                 # No se puede matar a media petición un
                                 # listado FTP ya en marcha en otro hilo, pero
@@ -7102,24 +7379,30 @@ class App(_AppBase):
                                     f.cancel()
                                 break
                 else:
-                    for folder in fallback_folders:
+                    for i, folder in enumerate(fallback_folders, 1):
                         if cancel_event and cancel_event.is_set():
                             break
-                        files = ftp_conn.list_files_recursive(f"{root.rstrip('/')}/{folder}", max_depth=2)
+                        path = f"{root.rstrip('/')}/{folder}"
+                        files = list(set(ftp_conn.list_files_recursive(path, max_depth=2))
+                                    | set(ftp_conn.list_files_recursive(path, max_depth=2)))
                         _process_folder(folder, files)
+                        if progress_cb:
+                            progress_cb(i, len(fallback_folders), f"cruzando con el FTP: {folder}")
         return index
 
-    def _cross_check_results_with_ftp(self, results: list, cancel_event=None) -> list:
+    def _cross_check_results_with_ftp(self, results: list, cancel_event=None, progress_cb=None) -> list:
         """Para las series que YA salieron con algún hueco (según Jellyfin/
         Plex), comprueba también el listado real del FTP -- por si el
         propio servidor de medios falló al indexar algo que sí está físi-
         camente en el servidor (visto con Desencanto: Jellyfin decía "0
         episodios" con la carpeta llena). Si de verdad no hay conexión FTP
         configurada o falla, se devuelven los resultados tal cual, sin
-        romper el escaneo por esto. cancel_event: ver _build_ftp_episode_index,
-        que es donde de verdad se comprueba (esta fase es la más lenta de
-        todo el escaneo, así que es la que más falta hacía que "Cancelar"
-        pudiera interrumpir)."""
+        romper el escaneo por esto. cancel_event/progress_cb: ver
+        _build_ftp_episode_index, que es donde de verdad se comprueba (esta
+        fase es la más lenta de todo el escaneo, así que es la que más
+        falta hacía tanto que "Cancelar" pudiera interrumpirla como que la
+        barra de progreso no se quedara clavada al 100% mientras seguía
+        trabajando en silencio)."""
         from core.missing_episodes import find_missing_episodes, find_unknown_seasons, format_missing_summary
 
         if not self.config_data.get("ftp_host", ""):
@@ -7142,7 +7425,7 @@ class App(_AppBase):
             if not own_ftp.is_connected():
                 _log.warning("Cruce FTP: omitido, no se pudo conectar al servidor")
                 return results
-            ftp_index = self._build_ftp_episode_index(own_ftp, cancel_event=cancel_event)
+            ftp_index = self._build_ftp_episode_index(own_ftp, cancel_event=cancel_event, progress_cb=progress_cb)
         except Exception as e:
             _log.warning("Cruce FTP: fallo inesperado, se deja el resultado tal cual: %s", e)
             return results   # sin FTP no se puede cruzar -- se deja tal cual
@@ -7226,7 +7509,14 @@ class App(_AppBase):
                           result["name"])
                 return result
             root = category.get("root", "")
-            files = own_ftp.list_files_recursive(f"{root.rstrip('/')}/{folder_name}", max_depth=2)
+            # Dos listados, no uno, misma unión que el cruce completo (ver
+            # _build_ftp_episode_index) -- barato aquí porque es UNA sola
+            # carpeta, no cientos, así que vale la pena pagarlo siempre en
+            # vez de arriesgarse a un listado cortado que deje fuera un
+            # episodio suelto.
+            path = f"{root.rstrip('/')}/{folder_name}"
+            files = list(set(own_ftp.list_files_recursive(path, max_depth=2))
+                        | set(own_ftp.list_files_recursive(path, max_depth=2)))
         except Exception as e:
             _log.warning("Cruce FTP (individual): fallo inesperado para '%s': %s", result["name"], e)
             return result
@@ -7801,7 +8091,7 @@ class App(_AppBase):
             if pendientes:
                 dlg = _ClearDialog(self, len(pendientes))
                 if dlg.result == "solo_subidos":
-                    self.files = [e for e in self.files if e.status == "subido"]
+                    self.files = [e for e in self.files if e.status != "subido"]
                 elif dlg.result == "todo":
                     if self._upload_running:
                         self._upload_cancel.set()

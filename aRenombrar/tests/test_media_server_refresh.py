@@ -505,6 +505,43 @@ def test_get_jellyfin_usage_stats_sums_episode_sizes_for_series(monkeypatch):
     assert stats["series1"]["size_bytes"] == 2_200_000_000
 
 
+def test_get_jellyfin_usage_stats_aggregates_series_play_count_from_episodes(monkeypatch):
+    # Caso real: Arcadia -- el panel de Jellyfin mostraba visionado
+    # reciente de un usuario, pero el UserData de la SERIE traía
+    # PlayCount=0/LastPlayedDate vacío (no fiable a ese nivel), dejando la
+    # puntuación de tendencia en 0 pese a que sí se había visto. Debe
+    # agregarse desde el UserData de cada EPISODIO en su lugar.
+    users_payload = [{"Id": "alvaro_id", "Name": "Alvaro"}]
+    series_payload = {"Items": [
+        {"Id": "series1", "Name": "Arcadia", "Type": "Series", "ProviderIds": {},
+         "DateCreated": "2022-01-01T00:00:00Z"},
+    ]}
+    watch_series_payload = {"Items": [
+        {"Id": "series1", "UserData": {"UnplayedItemCount": 0, "PlayCount": 0}},
+    ]}
+    watch_episodes_payload = {"Items": [
+        {"SeriesId": "series1", "UserData": {"PlayCount": 1, "LastPlayedDate": "2024-05-01T00:00:00Z"}},
+        {"SeriesId": "series1", "UserData": {"PlayCount": 2, "LastPlayedDate": "2024-06-15T00:00:00Z"}},
+        {"SeriesId": "otra_serie", "UserData": {"PlayCount": 5, "LastPlayedDate": "2024-07-01T00:00:00Z"}},
+    ]}
+
+    def _fake_get(url, **kw):
+        if url.endswith("/Users"):
+            return _FakeResponse(users_payload)
+        params = kw.get("params", {})
+        if params.get("IncludeItemTypes") == "Series,Movie" and params.get("Fields") == "UserData":
+            return _FakeResponse(watch_series_payload)
+        if params.get("IncludeItemTypes") == "Episode" and params.get("Fields") == "UserData":
+            return _FakeResponse(watch_episodes_payload)
+        return _FakeResponse(series_payload)
+
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    stats = msr.get_jellyfin_usage_stats("http://jf:8096", "key")
+    assert stats["series1"]["play_count"] == 3   # 1 + 2, no el 0 de UserData de la serie
+    assert stats["series1"]["last_played"] == "2024-06-15T00:00:00Z"   # el más reciente de los dos episodios
+    assert stats["series1"]["fully_watched"] is True   # sigue viniendo de UnplayedItemCount
+
+
 # ── Plex: datos de uso (liberar espacio) ────────────────────────────────────
 
 def test_get_plex_usage_stats_without_config_returns_none():
