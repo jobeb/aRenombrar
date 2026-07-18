@@ -218,10 +218,28 @@ class TMDBClient:
 # ── Patrones de detección ──────────────────────────────────────────────────────
 
 EPISODE_PATTERNS = [
-    # S01E01
-    (r"[Ss](\d{1,2})[Ee](\d{1,3})", "tv"),
-    # 1x01 / 1X01 (algunos grupos de release usan la X en mayúscula)
-    (r"(\d{1,2})[xX](\d{2,3})", "tv"),
+    # S01E01 -- con un segundo episodio opcional, de tres formas:
+    #   1) "E" pegada: S07E21E22
+    #   2) temporada+episodio repetida: S07E21-S07E22 / S07E21 S07E22
+    #   3) rango compacto SIN indicador propio: S07E21-22 (visto de verdad:
+    #      "Stargate Atlantis 1x01-02...", ver el patrón siguiente)
+    # Las formas 1 y 2 tienen su propio indicador inequívoco (otra "E", o
+    # la temporada repetida) y se aceptan sin más comprobación. La forma 3
+    # NO tiene ningún indicador propio -- un número de 2-3 dígitos justo
+    # después de un guion sería indistinguible de un año o una resolución
+    # (p.ej. "1x05-720p") si se aceptara sin más -- por eso detect_episode
+    # solo acepta el último grupo (el de esta forma) cuando el número es
+    # CONSECUTIVO al primer episodio (episodio+1): un episodio doble real
+    # siempre son dos números seguidos, un año o una resolución nunca lo
+    # son "por casualidad" salvo coincidencia extrema. (?!\d) en cada grupo
+    # para no comerse solo una parte de un número más largo (p.ej. "108"
+    # de "1080p").
+    (r"[Ss](\d{1,2})[Ee](\d{1,3})(?:[Ee](\d{1,3})(?!\d)|[\s\-]+[Ss]\d{1,2}[Ee](\d{1,3})(?!\d)|-(\d{1,3})(?!\d))?", "tv"),
+    # 1x01 / 1X01 (algunos grupos de release usan la X en mayúscula) -- con
+    # un segundo episodio opcional, mismas tres formas y mismo motivo que
+    # el patrón de arriba (temporada repetida = de fiar directamente;
+    # rango compacto "1x01-02" = solo si es consecutivo, ver detect_episode).
+    (r"(\d{1,2})[xX](\d{2,3})(?:[\s\-]+\d{1,2}[xX](\d{2,3})(?!\d)|-(\d{2,3})(?!\d))?", "tv"),
     # Episode.1078 / Episodio 5 / Episode07
     (r"[Ee]pisod[eo]s?[\s.\-]*(\d{1,4})", "anime"),
     # Ep.01 / Ep01
@@ -318,6 +336,13 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
     en esta llamada concreta (sin persistir) — los usa el fallback de IA
     (core/ai_title_fallback.py) para probar si limpian el título antes de
     aprenderlos de verdad vía core/learned_terms.py.
+
+    "extra_episodes": lista de episodios adicionales cuando el archivo
+    empaqueta más de uno (p.ej. "Serie 7x21-7x22 Título.avi", un doble
+    episodio con su propia numeración repetida, ver EPISODE_PATTERNS) --
+    vacía en el caso normal de un episodio por archivo. "season"/"episode"
+    NO cambian de significado: siguen siendo el primer/principal episodio
+    del archivo, así que el renombrado (que solo usa esos dos) no cambia.
     """
     stem = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)  # quitar extensión
 
@@ -327,8 +352,27 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
             groups = m.groups()
             if media_type == "tv":
                 season, episode = int(groups[0]), int(groups[1])
+                # Grupos 3+ (si el patrón los tiene, ver EPISODE_PATTERNS):
+                # variantes alternativas del mismo segundo episodio -- como
+                # mucho una participa por match, las demás quedan en None.
+                # La ÚLTIMA es siempre la forma de rango compacto sin
+                # indicador propio ("1x01-02") -- solo de fiar si el
+                # número es consecutivo al primer episodio (ver el
+                # comentario largo en EPISODE_PATTERNS); las demás formas
+                # (temporada repetida, "E" pegada) tienen su propio
+                # indicador inequívoco y se aceptan tal cual.
+                extra_groups = groups[2:]
+                extra_episodes = []
+                for i, g in enumerate(extra_groups):
+                    if g is None:
+                        continue
+                    val = int(g)
+                    if i == len(extra_groups) - 1 and val != episode + 1:
+                        continue
+                    extra_episodes.append(val)
             else:
                 season, episode = 1, int(groups[0])
+                extra_episodes = []
 
             title_raw = stem[:m.start()]
             title = _clean_title(title_raw, extra_junk_terms)
@@ -339,6 +383,7 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
                 "episode": episode,
                 "media_type": media_type,
                 "raw_match": m.group(),
+                "extra_episodes": extra_episodes,
             }
 
     # Sin patrón → película
@@ -351,6 +396,7 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
         "episode": None,
         "media_type": "movie",
         "raw_match": None,
+        "extra_episodes": [],
     }
 
 

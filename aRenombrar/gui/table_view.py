@@ -70,6 +70,14 @@ class TableView(ctk.CTkFrame):
     _PADX_BETWEEN = 4   # separación horizontal entre columnas consecutivas
     _HEADER_TEXT_PADDING = 16   # margen que se añade al medir el texto de cabecera
 
+    # Tamaño de página dinámico (ver enable_dynamic_page_size/note_rows_rendered
+    # más abajo) -- en vez de un número fijo de filas por pestaña, se calcula
+    # cuántas caben de verdad en el alto real del canvas, para no depender del
+    # scroll interno en uso normal.
+    MIN_PAGE_ROWS = 10       # suelo pedido por el usuario, aunque la ventana sea muy pequeña
+    DEFAULT_PAGE_ROWS = 25   # valor de arranque, antes de medir ninguna fila real
+    _RESIZE_DEBOUNCE_MS = 150   # mismo valor que _DETAIL_RESIZE_DEBOUNCE_MS en gui/app.py
+
     def __init__(self, master, columns, scrollable: bool = True, **kwargs):
         """scrollable=False: self.body es un CTkFrame normal (crece con
         cada fila añadida, sin barra de scroll propia) en vez de un
@@ -102,6 +110,11 @@ class TableView(ctk.CTkFrame):
         self._sash_state = None
         self._header_labels = {}
         self._bold_font = ctk.CTkFont(weight="bold")
+
+        self.page_size = self.DEFAULT_PAGE_ROWS
+        self._row_stride_px = None   # alto medio medido por fila, ver note_rows_rendered
+        self._resize_after_id = None
+        self.on_page_size_changed = None   # callback opcional, ver enable_dynamic_page_size
 
         # fg_color explícito: sin esto la cabecera usa el gris por defecto
         # de CTkFrame (gray17 en modo oscuro), que es EXACTAMENTE el mismo
@@ -292,3 +305,95 @@ class TableView(ctk.CTkFrame):
         la pantalla que contiene esta tabla)."""
         if self.scrollable:
             self.body._parent_canvas.yview_moveto(0)
+
+    # ------------------------------------------------- tamaño de página --
+
+    def enable_dynamic_page_size(self, on_change):
+        """A partir de ahora, page_size se recalcula solo cuando el
+        contenedor cambia de alto (redimensionar la ventana), en vez de
+        quedarse fijo en DEFAULT_PAGE_ROWS -- on_change(nuevo_tamaño) se
+        llama solo cuando el número de filas que caben cambia de verdad,
+        nunca en cada píxel de un arrastre (ver _on_body_configure).
+        No-op si scrollable=False: sin CTkScrollableFrame no hay canvas
+        cuyo alto real represente "lo que cabe sin scroll" (ver
+        Sincronizar visionado, cuyas tablas viven dentro del scroll de
+        toda la pestaña, no de un hueco acotado propio)."""
+        if not self.scrollable:
+            return
+        self.on_page_size_changed = on_change
+        # add="+": este mismo canvas puede tener ya otro binding de
+        # <Configure> propio de la pestaña (p.ej. _on_table_resize en
+        # Archivos, que solo reajusta anchos de columna) -- sin add="+"
+        # este binding lo sustituiría en vez de convivir con él.
+        self.body._parent_canvas.bind("<Configure>", self._on_body_configure, add="+")
+
+    def _on_body_configure(self, event):
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(
+            self._RESIZE_DEBOUNCE_MS, lambda h=event.height: self._recompute_page_size(h))
+
+    def _recompute_page_size(self, avail_height):
+        self._resize_after_id = None
+        if self._row_stride_px is None or avail_height <= 1:
+            # Todavía no se ha medido ninguna fila real, o el canvas aún
+            # no tiene geometría de verdad (ventana sin mapear) -- se
+            # autocorrige en el siguiente note_rows_rendered().
+            return
+        fitting = max(self.MIN_PAGE_ROWS, avail_height // self._row_stride_px)
+        if fitting != self.page_size:
+            self.page_size = fitting
+            if self.on_page_size_changed:
+                self.on_page_size_changed(fitting)
+
+    def note_rows_rendered(self, n_rows: int):
+        """Las funciones _render_*_page deben llamar a esto justo al
+        terminar de construir su página -- mide el alto medio real por
+        fila (self._row_stride_px) y lo usa para saber cuántas filas
+        caben la próxima vez que cambie el alto disponible.
+
+        Se mide el promedio de TODA la página (winfo_reqheight() / n_rows),
+        no el alto de una sola fila, para que absorba sin más el pady/padx
+        propio de cada tabla (Archivos usa pady=1; las tablas "de tarjeta"
+        como Episodios/Protegidos usan más espaciado) sin necesitar una
+        constante de alto distinta por pestaña. winfo_reqheight() (no
+        winfo_height()) porque ya está disponible nada más construir los
+        widgets, incluso antes de que la ventana esté mapeada en
+        pantalla -- así se puede medir en el primerísimo dibujado, no
+        solo tras un redimensionado real.
+
+        Nota: si la página incluye una fila "expandida" (ver
+        self._missing_ep_expanded en gui/app.py, el estado de expandir/
+        colapsar persiste entre redibujados), el alto medido sale un poco
+        mayor de lo estrictamente necesario y el tamaño de página calculado
+        es ligeramente conservador -- seguro (el canvas absorbe cualquier
+        desajuste) y se autocorrige en cuanto el usuario colapsa filas.
+
+        IMPORTANTE -- por qué la autocorrección solo dispara UNA vez: la
+        primera versión de esto volvía a llamar a on_page_size_changed
+        cada vez que la medida cambiaba (con el cuidado de solo remedir en
+        páginas "completas"), pero eso no bastaba -- con una lista ya
+        corta (menos elementos que page_size), TODA página es "completa"
+        por definición (page_items nunca puede pasar del total), así que
+        cada redibujado (p.ej. al ir terminando subidas una a una, o justo
+        al arrancar con pocos resultados) volvía a remedir, y cualquier
+        variación de un solo píxel entre medidas (redondeo de división
+        entera, una fila con distinto contenido) disparaba otra
+        autocorrección más -- un bucle de redibujado sin fin, reproducido
+        dos veces en sesiones reales. Ahora la autocorrección SOLO ocurre
+        una vez, la primerísima vez que hay una medida real (para
+        corregir el valor de arranque, DEFAULT_PAGE_ROWS, por el real).
+        A partir de ahí, page_size únicamente vuelve a cambiar por una
+        redimensión de ventana genuina (ver _on_body_configure, que solo
+        reacciona a que el propio CANVAS cambie de tamaño, no a que
+        cambien las filas dentro) -- nunca porque el contenido cambie y
+        se redibuje, así que un redibujado ya no puede encadenar otro."""
+        if n_rows <= 0 or not self.scrollable:
+            return
+        first_measurement = self._row_stride_px is None
+        if not first_measurement and n_rows < self.page_size:
+            return   # página corta -- no fiable para refinar la medida (ver más arriba)
+        self.update_idletasks()
+        self._row_stride_px = max(1, self.body.winfo_reqheight() // n_rows)
+        if first_measurement and self.on_page_size_changed:
+            self.after(0, lambda: self._recompute_page_size(self.body._parent_canvas.winfo_height()))

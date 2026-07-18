@@ -95,7 +95,8 @@ def test_optional_context_fields_included_when_present(monkeypatch):
               "first_air_date": "2004-10-05", "origin_country": ["JP"],
               "genres": ["Animation"], "tmdb_seasons": {"1": 366}, "server_seasons": {"1": 109},
               "missing_episodes": {"1": [110, 111, 112]},
-              "present_episodes": {"1": list(range(1, 110))}}]
+              "present_episodes": {"1": list(range(1, 110))},
+              "ftp_filenames": ["Bleach 1x01.mkv", "Bleach 1x02-1x03.mkv"]}]
     mea.analyze_missing_episodes(shows, api_key="fake-key")
 
     sent = _json.loads(sent_payloads[0])[0]
@@ -105,6 +106,7 @@ def test_optional_context_fields_included_when_present(monkeypatch):
     assert sent["genres"] == ["Animation"]
     assert sent["missing_episodes"] == {"1": [110, 111, 112]}
     assert sent["present_episodes"] == {"1": list(range(1, 110))}
+    assert sent["ftp_filenames"] == ["Bleach 1x01.mkv", "Bleach 1x02-1x03.mkv"]
 
 
 def test_optional_context_fields_omitted_when_absent(monkeypatch):
@@ -120,7 +122,7 @@ def test_optional_context_fields_omitted_when_absent(monkeypatch):
 
     sent = _json.loads(sent_payloads[0])[0]
     for key in ("original_name", "first_air_date", "origin_country", "genres",
-                "missing_episodes", "present_episodes"):
+                "missing_episodes", "present_episodes", "ftp_filenames"):
         assert key not in sent
 
 
@@ -157,6 +159,25 @@ def test_check_spanish_dub_true_parses_dub_cutoff(monkeypatch):
     assert result[1396]["doblaje_castellano"] == {}
 
 
+def test_check_spanish_dub_true_warns_against_using_present_episodes_as_dub_cutoff(monkeypatch):
+    # Caso real: Arcadia -- la IA dijo que el doblaje castellano cortaba
+    # justo donde el usuario tenía descargado (T2 hasta el 2x02), cuando
+    # en realidad toda la serie está doblada. El prompt debe dejar claro
+    # que missing_episodes/present_episodes son solo lo que hay
+    # descargado, no un dato real sobre el doblaje.
+    sent_prompts = []
+    def _fake_post(url, headers, json, timeout):
+        sent_prompts.append(json["messages"][0]["content"])
+        content = _json.dumps({"veredictos": [{"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "x"}]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+    shows = [{"tmdb_id": 1, "name": "Arcadia", "tmdb_seasons": {}, "server_seasons": {},
+              "present_episodes": {"2": [1, 2]}}]
+    mea.analyze_missing_episodes(shows, api_key="fake-key", check_spanish_dub=True)
+    assert "NUNCA son un dato" in sent_prompts[0]
+    assert "último episodio presente en el servidor" in sent_prompts[0]
+
+
 def test_check_spanish_dub_true_ignores_malformed_dub_field(monkeypatch):
     content = json.dumps({"veredictos": [
         {"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "x", "doblaje_castellano": "no es un objeto"},
@@ -188,3 +209,25 @@ def test_prompt_instructs_motivo_consistent_with_missing_episodes(monkeypatch):
     assert "missing_episodes" in sent_prompts[0]
     assert "coherente" in sent_prompts[0]
     assert "todas las temporadas" in sent_prompts[0]
+
+
+def test_check_spanish_dub_true_uses_dub_check_model_not_caller_model(monkeypatch):
+    # Probado en vivo contra la API real de Groq (ver el comentario de
+    # DUB_CHECK_MODEL): el modelo por defecto (y uno más pequeño) copian
+    # el límite de present_episodes en vez de saber el dato real --
+    # openai/gpt-oss-120b fue el único que no lo hizo. La pregunta de
+    # doblaje debe usar SIEMPRE ese modelo, ignorando el *model* que pase
+    # el llamador -- solo aplica cuando check_spanish_dub=True.
+    sent_models = []
+    def _fake_post(url, headers, json, timeout):
+        sent_models.append(json["model"])
+        content = _json.dumps({"veredictos": [{"tmdb_id": 1, "veredicto": "hueco_real", "motivo": "x"}]})
+        return _FakeResponse(_groq_payload(content))
+    monkeypatch.setattr(mea.requests, "post", _fake_post)
+    shows = [{"tmdb_id": 1, "name": "X", "tmdb_seasons": {}, "server_seasons": {}}]
+
+    mea.analyze_missing_episodes(shows, api_key="fake-key", model="modelo-normal", check_spanish_dub=False)
+    mea.analyze_missing_episodes(shows, api_key="fake-key", model="modelo-normal", check_spanish_dub=True)
+
+    assert sent_models == ["modelo-normal", mea.DUB_CHECK_MODEL]
+    assert mea.DUB_CHECK_MODEL != "modelo-normal"

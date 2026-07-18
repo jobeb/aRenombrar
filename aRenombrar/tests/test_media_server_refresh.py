@@ -646,8 +646,11 @@ class _FakePlexUser:
 
 
 class _FakeMyPlexAccount:
-    def __init__(self, users, token=None):
+    def __init__(self, users, token=None, title="Propietario", username="owner_user", email="owner@example.com"):
         self._users = users
+        self.title = title
+        self.username = username
+        self.email = email
 
     def users(self):
         return self._users
@@ -724,9 +727,28 @@ def test_get_plex_home_users_without_config_returns_none():
 
 def test_get_plex_home_users_returns_id_and_title(monkeypatch):
     users = [_FakePlexUser("1", "Ana"), _FakePlexUser("2", "Bruno")]
-    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(users))
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(
+        users, username="CineBechos", title="CineBechos", email="tecnicoefrenrr@gmail.com"))
     result = msr.get_plex_home_users("http://plex:32400", "owner_tok")
-    assert result == [{"id": "1", "title": "Ana"}, {"id": "2", "title": "Bruno"}]
+    # El propietario va PRIMERO -- MyPlexAccount.users() nunca lo incluye
+    # por sí solo (caso real reportado: faltaba en la lista de emparejar
+    # para "Sincronizar visionado", el administrador de la cuenta también
+    # quiere sincronizar su propio visionado). La parte del email antes
+    # de la @, no username/title -- probado en vivo: esos dos dan el
+    # nombre de marca del servidor Plex ("CineBechos"), no la persona.
+    assert result == [
+        {"id": "owner", "title": "tecnicoefrenrr"},
+        {"id": "1", "title": "Ana"},
+        {"id": "2", "title": "Bruno"},
+    ]
+
+
+def test_get_plex_home_users_owner_falls_back_to_title_or_username_without_email(monkeypatch):
+    users = []
+    monkeypatch.setattr(msr, "MyPlexAccount", lambda token: _FakeMyPlexAccount(
+        users, username="CineBechos", title="Jose Title", email=""))
+    result = msr.get_plex_home_users("http://plex:32400", "owner_tok")
+    assert result == [{"id": "owner", "title": "Jose Title"}]
 
 
 def test_get_plex_home_users_returns_none_on_failure(monkeypatch):
@@ -738,6 +760,17 @@ def test_get_plex_home_users_returns_none_on_failure(monkeypatch):
 
 def test_get_plex_user_token_without_config_returns_none():
     assert msr.get_plex_user_token("", "", "1") is None
+
+
+def test_get_plex_user_token_owner_returns_owner_token_directly(monkeypatch):
+    # id="owner" (ver get_plex_home_users) no aparece en account.users()
+    # -- no se busca ahí, se devuelve owner_token tal cual, sin ni
+    # siquiera llamar a MyPlexAccount/PlexServer.
+    def _fail(*a, **kw):
+        raise AssertionError("no debería llamarse para id=owner")
+    monkeypatch.setattr(msr, "MyPlexAccount", _fail)
+    monkeypatch.setattr(msr, "PlexServer", _fail)
+    assert msr.get_plex_user_token("http://plex:32400", "owner_tok", "owner") == "owner_tok"
 
 
 def test_get_plex_user_token_returns_token_for_matching_user(monkeypatch):

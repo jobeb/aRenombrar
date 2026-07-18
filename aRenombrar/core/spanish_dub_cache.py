@@ -5,11 +5,22 @@ core/missing_episodes_cache.py porque se rellena bajo demanda, solo al
 activar el interruptor, no en cada escaneo normal de huecos.
 
 Formato: {tmdb_id_como_texto: {"spanish_available": bool|None,
-"episodes": {"{temporada}x{episodio:02d}": bool}}}
+"episodes": {"{temporada}x{episodio:02d}": bool}, "checked_at": epoch_segundos}}
 
 "spanish_available" es el resultado (cacheado, una vez por serie) de
 /tv/{id}/watch/providers para la región "ES" -- evita repetir esa consulta
 por cada episodio de la misma serie.
+
+"checked_at" (epoch de la última vez que se comprobó ALGÚN episodio de
+esta serie, ver App._start_spanish_dub_check) sirve para caducar la
+entrada -- ver is_stale()/MAX_AGE_DAYS más abajo. Sin esto, una entrada
+guardada aquí no se volvía a comprobar NUNCA, aunque TMDB cambiara
+(nueva plataforma disponible, texto traducido añadido más tarde...) o el
+propio resultado fuera de entrada un falso positivo (ver
+core/missing_episodes.py::episode_has_spanish_text). Entradas de antes de
+que existiera este campo no tienen "checked_at" -- se tratan como
+caducadas (None cuenta como "hace más de MAX_AGE_DAYS"), no como un
+error.
 
 Este chequeo basado en TMDB es el comportamiento POR DEFECTO del
 interruptor -- se sabe que puede dar falsos positivos (TMDB traduce el
@@ -26,6 +37,18 @@ from core.appdirs import app_data_dir
 
 _FILENAME = "spanish_dub_cache.json"
 _cache: dict | None = None
+
+MAX_AGE_DAYS = 30.0   # mismo valor que DEFAULT_HALF_LIFE_DAYS de core/trending.py, por convención, no por relación funcional
+
+
+def is_stale(entry: dict, now: float) -> bool:
+    """True si *entry* (una entrada de serie de este caché) no se ha
+    comprobado en más de MAX_AGE_DAYS, o nunca se comprobó (sin
+    "checked_at" -- entradas de antes de que existiera este campo)."""
+    checked_at = entry.get("checked_at")
+    if checked_at is None:
+        return True
+    return (now - checked_at) / 86400 > MAX_AGE_DAYS
 
 
 def _path():

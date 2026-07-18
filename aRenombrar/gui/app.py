@@ -46,6 +46,7 @@ from gui.table_view import TableView, ColumnSpec
 from core.appdirs import app_data_dir, is_windows, is_macos
 from core.applog import get_logger
 from core.version import __version__
+from core.trending import trending_score, format_trending_score
 
 _log = get_logger("aRenombrar.gui", "app.log")
 
@@ -268,35 +269,73 @@ class _DubHiddenDialog(ctk.CTkToplevel):
     Panda -- la IA dijo que los episodios que faltaban no tenían doblaje
     castellano, y sí lo tenían). Solo lectura -- para corregirlo, el
     usuario debe buscar la serie a mano (con el interruptor desactivado)
-    y volver a preguntarle a la IA, o desactivar el interruptor entero."""
+    y volver a preguntarle a la IA, o desactivar el interruptor entero.
+
+    Se construye una sola vez y se reutiliza (ver
+    App._show_missing_ep_dub_hidden_dialog y self._dub_hidden_win) en vez
+    de crear un CTkToplevel nuevo cada apertura: customtkinter nunca
+    deshace los bind_all(<MouseWheel>/...) globales que registra
+    CTkScrollableFrame al construirse, así que recrearlo en cada apertura
+    iba acumulando handlers para siempre y ralentizando el scroll de toda
+    la app, no solo de este diálogo."""
     def __init__(self, parent, hidden: list):
         super().__init__(parent)
+        self._parent = parent
         parent._apply_icon(self)
         self.title("Series ocultas por doblaje")
-        self.grab_set()
-        self.lift()
         self.attributes("-topmost", True)
-        self.update_idletasks()
-        pw = parent.winfo_rootx() + parent.winfo_width() // 2
-        ph = parent.winfo_rooty() + parent.winfo_height() // 2
-        dw, dh = 480, 420
-        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
 
-        plural = "s" if len(hidden) != 1 else ""
-        ctk.CTkLabel(self, text=f"{len(hidden)} serie{plural} con hueco real, "
-                                f"ocultada{plural} por \"Ocultar sin doblaje ES\"",
-                     font=ctk.CTkFont(size=13, weight="bold"), wraplength=440).pack(padx=20, pady=(20, 4))
+        self._title_lbl = ctk.CTkLabel(self, font=ctk.CTkFont(size=13, weight="bold"), wraplength=440)
+        self._title_lbl.pack(padx=20, pady=(20, 4))
         ctk.CTkLabel(self, text="Búscalas con el interruptor desactivado si crees que el "
                                 "doblaje indicado no es correcto.",
                      font=ctk.CTkFont(size=11), text_color=PENDING_COLOR, wraplength=440).pack(padx=20, pady=(0, 12))
 
-        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        self._scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self._scroll.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+
+        ctk.CTkButton(self, text="Cerrar", width=100, command=self._hide).pack(pady=(0, 16))
+        self.protocol("WM_DELETE_WINDOW", self._hide)
+
+        self.refresh(hidden)
+
+    def _hide(self):
+        self.grab_release()
+        self.withdraw()
+
+    def refresh(self, hidden: list):
+        """Repuebla la lista con los datos actuales -- se llama tanto al
+        construir el diálogo como cada vez que se reabre (ver
+        App._show_missing_ep_dub_hidden_dialog), en vez de crear un
+        CTkScrollableFrame nuevo por apertura (ver docstring de la clase)."""
+        for w in self._scroll.winfo_children():
+            w.destroy()
+
+        plural = "s" if len(hidden) != 1 else ""
+        self._title_lbl.configure(text=f"{len(hidden)} serie{plural} con hueco real, "
+                                        f"ocultada{plural} por \"Ocultar sin doblaje ES\"")
+
         for r in hidden:
-            row = ctk.CTkFrame(scroll, fg_color=("gray90", "gray20"), corner_radius=6)
+            row = ctk.CTkFrame(self._scroll, fg_color=("gray90", "gray20"), corner_radius=6)
             row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=r["name"], font=ctk.CTkFont(size=12, weight="bold"),
-                        anchor="w").pack(fill="x", padx=10, pady=(6, 0))
+            top = ctk.CTkFrame(row, fg_color="transparent")
+            top.pack(fill="x", padx=10, pady=(6, 0))
+            ctk.CTkLabel(top, text=r["name"], font=ctk.CTkFont(size=12, weight="bold"),
+                        anchor="w").pack(side="left", fill="x", expand=True)
+            # Solo tiene sentido repasar el lado TMDB -- un veredicto de la
+            # IA (ver App._ask_ai_about_current_missing_ep_show) solo se
+            # corrige volviendo a preguntarle a mano, no se puede forzar
+            # desde aquí.
+            if "doblaje_castellano" not in (r.get("ai_verdict") or {}):
+                ctk.CTkLabel(top, text="🔄", cursor="hand2", font=ctk.CTkFont(size=13)).pack(side="right")
+                # Oculta el diálogo antes de disparar el repaso -- es modal
+                # (grab_set), así que el usuario no vería la barra de
+                # progreso de la ventana principal mientras siga abierto, y
+                # la lista que muestra quedaría obsoleta en cuanto empiece.
+                def _recheck(event, tmdb_id=r["tmdb_id"]):
+                    self._hide()
+                    self._parent._on_force_recheck(tmdb_id)
+                top.winfo_children()[-1].bind("<Button-1>", _recheck)
             ai_verdict = r.get("ai_verdict") or {}
             motivo = ai_verdict.get("motivo", "")
             fuente = "según la IA" if "doblaje_castellano" in ai_verdict else "según TMDB"
@@ -304,8 +343,14 @@ class _DubHiddenDialog(ctk.CTkToplevel):
             ctk.CTkLabel(row, text=detalle, font=ctk.CTkFont(size=10), text_color=PENDING_COLOR,
                         anchor="w", wraplength=400).pack(fill="x", padx=10, pady=(0, 6))
 
-        ctk.CTkButton(self, text="Cerrar", width=100, command=self.destroy).pack(pady=(0, 16))
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.update_idletasks()
+        pw = self._parent.winfo_rootx() + self._parent.winfo_width() // 2
+        ph = self._parent.winfo_rooty() + self._parent.winfo_height() // 2
+        dw, dh = 480, 420
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+        self.deiconify()
+        self.lift()
+        self.grab_set()
 
 
 class _SeriesMatchDialog(ctk.CTkToplevel):
@@ -925,6 +970,40 @@ class App(_AppBase):
         self._config_panel_built = False
         self._startup_mark("  _build_config_panel() [diferida]")
 
+        # Diálogos reabribles que se construyen una sola vez y se reutilizan
+        # (ver _DubHiddenDialog, _show_template_guide, _open_learned_terms_dialog)
+        # en vez de crear un CTkToplevel/CTkScrollableFrame nuevo en cada
+        # apertura: customtkinter nunca deshace los bind_all(<MouseWheel>/...)
+        # globales que registra CTkScrollableFrame al construirse, así que
+        # recrearlo cada vez iba acumulando handlers para siempre y
+        # ralentizando el scroll de TODA la app, no solo de ese diálogo.
+        self._dub_hidden_win = None
+        self._template_guide_win = None
+        self._learned_terms_win = None
+        self._learned_terms_refresh = None
+
+        # Frenar la sincronización FTP redundante -- ver
+        # _sync_favorites_from_ftp/_sync_reservations_from_ftp, ambas
+        # llamadas desde _show_view_impl en cada visita a Archivos/
+        # Episodios/Liberar espacio/Protegidos.
+        self._last_favorites_sync_ts = 0.0
+        self._last_reservations_sync_ts = 0.0
+        self._last_dub_verdicts_sync_ts = 0.0
+        self._last_activity_sync_ts = 0.0
+
+        # Mirror local de los veredictos de doblaje compartidos (ver
+        # core/shared_dub_verdicts.py) -- último estado conocido antes de
+        # la primera sincronización real, para poder mostrar algo sin
+        # esperar a conectar.
+        from core.shared_dub_verdicts import load_local_cache as _load_dub_verdicts_cache
+        self._shared_dub_verdicts = _load_dub_verdicts_cache()
+
+        # Historial de actividad compartido (ver Historial → "Ver todo el
+        # servidor") -- solo vive en memoria, se sincroniza de verdad al
+        # entrar en esa pestaña (ver _sync_activity_history_from_ftp);
+        # vacío hasta la primera sincronización real de esta sesión.
+        self._shared_activity_history = []
+
         # Historial de subidas -- integrado como una vista más (igual que
         # Episodios/Configuración), no una ventana emergente aparte.
         self._history_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
@@ -1067,6 +1146,15 @@ class App(_AppBase):
             parts = [f"{n} archivo{'s' if n != 1 else ''}", _fmt_size(total_size)]
             if breakdown:
                 parts.append(breakdown)
+            # Suma de la velocidad de TODAS las subidas en curso ahora mismo
+            # (entry.ftp_speed, ya lo mantiene vivo el propio callback de
+            # progreso de cada subida, ver _upload_one::progress) -- con
+            # "Subidas simultáneas" > 1 esto es justo lo que no se ve fila a
+            # fila, cuánto se está aprovechando de verdad el ancho de banda
+            # disponible en conjunto.
+            total_speed = sum(e.ftp_speed for e in self.files if e.status == "subiendo")
+            if total_speed > 0:
+                parts.append(f"Subiendo: {_fmt_speed(total_speed)}")
             self._status_bar_left.configure(text="   ·   ".join(parts))
 
         # El texto de la derecha refleja la selección de la vista ACTIVA
@@ -1336,14 +1424,25 @@ class App(_AppBase):
         self._show_view(key)
 
     def _show_view(self, view_key: str):
+        """Cambia a la vista *view_key* -- envoltorio fino sobre
+        _show_view_impl solo para medir cuánto tarda un cambio de pantalla
+        de verdad (ver app.log, mismo hábito que el "Arranque: ..." de
+        __init__) sin tener que instrumentar cada return anticipado de
+        _show_view_impl por separado."""
+        if view_key == self._current_view_key():
+            return
+        _t0 = _time.perf_counter()
+        try:
+            self._show_view_impl(view_key)
+        finally:
+            _log.info("Vista: _show_view('%s') %6.0f ms", view_key, (_time.perf_counter() - _t0) * 1000)
+
+    def _show_view_impl(self, view_key: str):
         """Cambia a la vista *view_key* ("files"/"missing_ep"/"history"/
         "config"), ocultando la que estuviera activa. Si se sale de
         Ajustes con cambios sin guardar y el usuario cancela, la pestaña
         segmentada vuelve a marcar Configuración en vez de quedarse en el
         valor a medio pulsar."""
-        if view_key == self._current_view_key():
-            return
-
         if self._config_visible:
             try:
                 dirty = self._settings_dirty()
@@ -1403,9 +1502,11 @@ class App(_AppBase):
             self._missing_ep_frame.grid(row=0, column=0, sticky="nsew")
             self._missing_ep_visible = True
             self._sync_favorites_from_ftp()
+            self._sync_shared_dub_verdicts_from_ftp()
         elif view_key == "history":
             self._history_frame.grid(row=0, column=0, sticky="nsew")
             self._history_visible = True
+            self._sync_activity_history_from_ftp()
             self._refresh_history_view()   # por si hay subidas nuevas desde la última vez
         elif view_key == "cleanup":
             self._cleanup_frame.grid(row=0, column=0, sticky="nsew")
@@ -1535,18 +1636,21 @@ class App(_AppBase):
         # que ajusta el ancho del frame interno al canvas; sin él las filas no llenan el ancho completo
         self._file_list_frame._parent_canvas.bind(
             "<Configure>", self._on_table_resize, add="+")
+        self._file_table.enable_dynamic_page_size(lambda _size: self._refresh_table())
         self._file_rows = []
         self._files_page = 0
         self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
 
-        # Paginado (ver _FILES_PAGE_SIZE) -- mismo motivo y mismo patrón que
-        # Episodios/Liberar espacio/Historial: con muchos archivos en cola
-        # (auto-watcher llevando un rato, o una carpeta grande arrastrada de
-        # golpe) dibujar todas las filas a la vez obliga a hacer scroll
-        # dentro de la ventana en vez de solo dentro de la tabla, y con
-        # cientos de filas se acerca al límite de objetos GUI de Windows
-        # (ver [[project_pagination_user_object_limit]]). Debajo de la
-        # tabla, centrada (sin sticky="ew", la columna 0 de "body" ya tiene
+        # Paginado (ver TableView.page_size, calculado dinámicamente según
+        # el alto disponible -- ver enable_dynamic_page_size arriba) --
+        # mismo motivo y mismo patrón que Episodios/Liberar espacio/
+        # Historial: con muchos archivos en cola (auto-watcher llevando un
+        # rato, o una carpeta grande arrastrada de golpe) dibujar todas las
+        # filas a la vez obliga a hacer scroll dentro de la ventana en vez
+        # de solo dentro de la tabla, y con cientos de filas se acerca al
+        # límite de objetos GUI de Windows (ver
+        # [[project_pagination_user_object_limit]]). Debajo de la tabla,
+        # centrada (sin sticky="ew", la columna 0 de "body" ya tiene
         # weight=1).
         files_nav_fr = ctk.CTkFrame(body, fg_color="transparent")
         files_nav_fr.grid(row=2, column=0, pady=(6, 0))
@@ -1636,7 +1740,17 @@ class App(_AppBase):
         # nunca el valor por defecto.
         dest_w = self._file_table.col_width("dest")
         new_cw = self._compute_cw(event.width, dest_w=dest_w)
-        if new_cw["name"] == self._col_widths["name"] and new_cw["det"] == self._col_widths["det"]:
+        # "name"/"det" tienen un mínimo (max(80, ...)/max(55, ...)) -- con la
+        # ventana ya estrecha, ambos se quedan clavados en ese mínimo aunque
+        # siga estrechándose más, así que compararlos SOLO a ellos para
+        # decidir "¿hizo falta cambiar algo?" dejaba "nn" (sin mínimo propio,
+        # max(0, flex - name - det)) congelado con un ancho viejo demasiado
+        # generoso -- el texto dejaba de truncarse lo suficiente para el
+        # hueco real y desbordaba la columna (CTkLabel: width es un mínimo,
+        # no un máximo, así que el label se ensanchaba y desplazaba el resto
+        # de la fila). Hay que comprobar también "nn".
+        if (new_cw["name"] == self._col_widths["name"] and new_cw["det"] == self._col_widths["det"]
+                and new_cw["nn"] == self._col_widths["nn"]):
             return
         for key in ("name", "det", "nn"):
             self._file_table.set_width(key, new_cw[key], refresh=False)
@@ -1989,15 +2103,22 @@ class App(_AppBase):
 
     def _apply_synced_favorites(self, merged: dict, on_done=None):
         from core.favorites import save_local_cache
+        changed = merged != self._favorites
         self._favorites = merged
         save_local_cache(self._favorites)
         if on_done:
             on_done()
-        else:
+        elif changed:
             # Sin un callback puntual (p.ej. tras _sync_favorites_from_ftp
             # al abrir una pestaña, en vez de tras marcar/desmarcar una
             # fila concreta) -- refrescar la vista activa para que las
             # estrellas reflejen lo que haya cambiado desde otro cliente.
+            # Solo si de verdad cambió algo: _sync_favorites_from_ftp se
+            # dispara cada vez que se entra en una pestaña (pasado
+            # _FAVORITES_SYNC_MIN_INTERVAL), y redibujar la tabla entera
+            # (con Liberar espacio, además, volviendo a la página 1) por
+            # una sincronización que no trajo nada nuevo se veía como un
+            # "carga y enseguida recarga" sin motivo real.
             if self._current_view_key() == "files":
                 self._refresh_table()
             elif self._missing_ep_visible:
@@ -2005,12 +2126,22 @@ class App(_AppBase):
             elif self._cleanup_visible:
                 self._apply_cleanup_filters()
 
+    _FAVORITES_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_favorites_from_ftp
+
     def _sync_favorites_from_ftp(self):
         """Refresca el mirror local desde el FTP en segundo plano -- se
         llama al abrir cada una de las 3 pestañas que muestran favoritos,
         para reflejar cambios hechos desde otro cliente del mismo servidor.
         Silencioso si no hay ruta configurada o la conexión falla: el mirror
-        local ya tiene el último estado conocido."""
+        local ya tiene el último estado conocido. Si se saltó rápido entre
+        varias de esas pestañas, no repite la consulta al FTP dentro de
+        _FAVORITES_SYNC_MIN_INTERVAL -- los datos no pueden haber cambiado
+        en ese margen y cada visita repetía tráfico innecesario."""
+        now = _time.time()
+        if now - self._last_favorites_sync_ts < self._FAVORITES_SYNC_MIN_INTERVAL:
+            return
+        self._last_favorites_sync_ts = now
+
         remote_path = self._favorites_remote_path()
         if not remote_path:
             return
@@ -2055,6 +2186,20 @@ class App(_AppBase):
         core/server_config.py) -- archivo propio dentro de la misma
         carpeta compartida, mismo motivo que _reservations_remote_path."""
         return self._shared_data_path("aRenombrar_config_servidor.json")
+
+    def _shared_dub_verdicts_remote_path(self) -> str:
+        """Ruta remota de los veredictos de doblaje castellano obtenidos
+        por IA, compartidos entre clientes (ver core/shared_dub_verdicts.py)
+        -- archivo propio dentro de la misma carpeta compartida, mismo
+        motivo que _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_doblaje_ia.json")
+
+    def _activity_remote_path(self) -> str:
+        """Ruta remota del historial de actividad compartido (subidas y
+        borrados de todos los clientes, ver Historial → "Ver todo el
+        servidor") -- archivo propio dentro de la misma carpeta
+        compartida, mismo motivo que _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_actividad.json")
 
     def _sync_server_config_from_ftp(self):
         """Descarga la configuración compartida del servidor y la aplica en
@@ -2300,10 +2445,13 @@ class App(_AppBase):
 
     def _apply_synced_reservations(self, merged: dict, on_done=None):
         from core.reservations import save_local_cache as _save_reservations_cache
+        changed = merged != self._reservations
         self._reservations = merged
         _save_reservations_cache(self._reservations)
         if on_done:
             on_done()
+        elif not changed:
+            pass   # ver _apply_synced_favorites: no redibujar si no cambió nada de verdad
         elif self._cleanup_visible:
             self._apply_cleanup_filters()
         elif self._protected_visible:
@@ -2311,11 +2459,19 @@ class App(_AppBase):
         elif self._current_view_key() == "files":
             self._refresh_table()
 
+    _RESERVATIONS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_reservations_from_ftp
+
     def _sync_reservations_from_ftp(self):
         """Refresca el mirror local desde el FTP en segundo plano -- mismo
-        motivo y patrón que _sync_favorites_from_ftp. Se llama al abrir
-        Archivos (los candados de las filas ya subidas), Liberar espacio
-        (protección + cuota) y Protegidos (gestión)."""
+        motivo y patrón que _sync_favorites_from_ftp, incluido el freno de
+        _RESERVATIONS_SYNC_MIN_INTERVAL. Se llama al abrir Archivos (los
+        candados de las filas ya subidas), Liberar espacio (protección +
+        cuota) y Protegidos (gestión)."""
+        now = _time.time()
+        if now - self._last_reservations_sync_ts < self._RESERVATIONS_SYNC_MIN_INTERVAL:
+            return
+        self._last_reservations_sync_ts = now
+
         remote_path = self._reservations_remote_path()
         if not remote_path:
             return
@@ -2343,6 +2499,228 @@ class App(_AppBase):
                 if not isinstance(remote_data, dict):
                     return
                 self.after(0, lambda: self._apply_synced_reservations(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_shared_dub_verdicts(self, merged: dict):
+        """Aplica los veredictos de doblaje compartidos (ver
+        core/shared_dub_verdicts.py) a las filas ya cargadas de Episodios
+        que faltan -- solo los que sean más recientes que la última vez
+        que se sincronizó (comparando checked_at contra la copia anterior
+        de self._shared_dub_verdicts), para no reprocesar/redibujar en
+        cada sincronización si nada cambió de verdad desde la última.
+        Reutiliza _persist_ai_verdicts tal cual: series sin entrada en
+        missing_episodes_cache.json (no salieron de un escaneo local)
+        simplemente no tienen dónde guardarlo todavía -- se aplicarán la
+        próxima vez que esa serie se escanee y vuelva a sincronizar."""
+        previous = getattr(self, "_shared_dub_verdicts", {}) or {}
+        self._shared_dub_verdicts = merged
+        from core.shared_dub_verdicts import save_local_cache as _save_dub_verdicts_cache
+        _save_dub_verdicts_cache(merged)
+
+        to_apply = {}
+        for r in self._missing_ep_results:
+            key = str(r["tmdb_id"])
+            shared = merged.get(key)
+            if not shared:
+                continue
+            prev_checked_at = (previous.get(key) or {}).get("checked_at", 0)
+            if shared.get("checked_at", 0) <= prev_checked_at:
+                continue
+            verdict = {k: v for k, v in shared.items() if k not in ("checked_at", "checked_by")}
+            r["ai_verdict"] = verdict
+            to_apply[r["tmdb_id"]] = verdict
+        if to_apply:
+            self._persist_ai_verdicts(to_apply)
+            self._render_missing_episodes_table(reset_page=False)
+
+    def _push_shared_dub_verdict_to_ftp(self, tmdb_id: int, verdict: dict):
+        """Comparte con el resto de clientes del mismo servidor el
+        veredicto de doblaje que la IA acaba de dar para una serie --
+        llamado solo tras una consulta manual real (ver
+        _apply_single_missing_ep_ai_verdict), nunca desde el chequeo
+        automático por lotes (ese no pasa por aquí, se queda solo local).
+        Mismo patrón lectura-modificación-escritura que
+        _push_reservations_to_ftp: descarga el remoto fresco, le fija esta
+        sola entrada y lo vuelve a subir, para minimizar la carrera si
+        otro cliente compartió un veredicto de OTRA serie casi a la vez."""
+        remote_path = self._shared_dub_verdicts_remote_path()
+        if not remote_path:
+            return
+        app_user_name = self.config_data.get("app_user_name", "")
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.shared_dub_verdicts import set_verdict
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = set_verdict(remote_data, tmdb_id, verdict, app_user_name)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    self.after(0, lambda: self._apply_synced_shared_dub_verdicts(merged))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    _DUB_VERDICTS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_shared_dub_verdicts_from_ftp
+
+    def _sync_shared_dub_verdicts_from_ftp(self):
+        """Refresca el mirror local de veredictos de doblaje compartidos
+        desde el FTP en segundo plano -- mismo patrón y mismo freno que
+        _sync_reservations_from_ftp. Se llama al abrir Episodios que
+        faltan."""
+        now = _time.time()
+        if now - self._last_dub_verdicts_sync_ts < self._DUB_VERDICTS_SYNC_MIN_INTERVAL:
+            return
+        self._last_dub_verdicts_sync_ts = now
+
+        remote_path = self._shared_dub_verdicts_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_shared_dub_verdicts(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_activity_entry_to_ftp(self, entry: dict, kind: str):
+        """Añade *entry* (una subida o un borrado, ya guardada en el
+        historial LOCAL antes de llamar a esto) al historial de actividad
+        compartido entre clientes del mismo servidor -- silencioso si no
+        hay carpeta compartida configurada o la subida falla, mismo
+        criterio que el resto de sincronizaciones de la app: el historial
+        local es la copia que de verdad importa, esto es un añadido de
+        mejor esfuerzo.
+
+        A diferencia de reservas/favoritos/veredictos de doblaje (un dict
+        que se fusiona clave a clave), el remoto aquí es una LISTA que
+        solo crece por añadido -- se descarga fresca, se le añade esta
+        entrada con su "kind" ("subida"/"borrado"), se recorta a los
+        últimos 500 igual que los históricos locales, y se vuelve a
+        subir."""
+        remote_path = self._activity_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_list = _json.loads(raw.decode("utf-8")) if raw else []
+                except ValueError:
+                    remote_list = []
+                if not isinstance(remote_list, list):
+                    remote_list = []
+                remote_list.append({**entry, "kind": kind})
+                if len(remote_list) > 500:
+                    remote_list = remote_list[-500:]
+                data = _json.dumps(remote_list, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    self.after(0, lambda: self._apply_synced_activity_history(remote_list))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_activity_history(self, activity_list: list):
+        self._shared_activity_history = activity_list
+        if self._history_visible and self._history_show_all_var.get():
+            self._history_dirty = True
+            self._refresh_history_view()
+
+    _ACTIVITY_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_activity_history_from_ftp
+
+    def _sync_activity_history_from_ftp(self):
+        """Refresca el mirror en memoria del historial de actividad
+        compartido desde el FTP en segundo plano -- mismo patrón y mismo
+        freno que _sync_reservations_from_ftp. Se llama al entrar en
+        Historial; solo importa de verdad si "Ver todo el servidor" está
+        activo, pero se sincroniza siempre que se visita la pestaña para
+        que el interruptor no tenga que esperar a una conexión nueva al
+        encenderlo."""
+        now = _time.time()
+        if now - self._last_activity_sync_ts < self._ACTIVITY_SYNC_MIN_INTERVAL:
+            return
+        self._last_activity_sync_ts = now
+
+        remote_path = self._activity_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_list = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_list, list):
+                    return
+                self.after(0, lambda: self._apply_synced_activity_history(remote_list))
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
@@ -2586,18 +2964,20 @@ class App(_AppBase):
         se queda sin ver hasta reiniciar la app; para una acción tan poco
         frecuente y tan seria como borrar, vale la pena pagar el listado
         de verdad en vez de arriesgarse a un "no encontrado" con la
-        carpeta ahí delante."""
+        carpeta ahí delante.
+
+        El propio emparejamiento (nombre exacto/folder_name conocido/
+        parecido >=0.90) vive en core.ftp_categories.find_existing_category_folder,
+        compartido con AutoWatcher (ver core/auto_watcher.py) -- aquí solo
+        queda la parte de CÓMO listar/cachear cada raíz, que sí es propia
+        de la GUI (use_cache_only para no bloquear la interfaz)."""
         cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get(info.media_type, [])
-        desired = info.title
-        sanitized_desired = _ftp_safe(desired)
         known_folder_name = getattr(info, "folder_name", None)
-        for cat in cats:
-            root = cat.get("root", "")
-            if not root:
-                continue
+
+        def dir_lookup(root):
             if root not in self._ftp_dir_cache or force_refresh:
                 if use_cache_only:
-                    continue
+                    return None
                 # Dos listados, no uno -- visto de verdad con "(Des)encanto":
                 # ya tenía carpeta en "Series" desde antes, pero un ÚNICO
                 # NLST a esa raíz (360 carpetas) a veces vuelve incompleto
@@ -2614,27 +2994,10 @@ class App(_AppBase):
                     _log.warning("Listado de '%s' inconsistente entre dos intentos seguidos "
                                 "(%d vs %d carpetas) -- usando la unión de ambos", root, len(first), len(second))
                 self._ftp_dir_cache[root] = list(first | second)
-            existing = self._ftp_dir_cache[root]
-            # Nombre real de carpeta ya conocido (ver get_jellyfin_series::
-            # folder_name) -- comprobado ANTES del parecido difuso: el
-            # nombre mostrado puede estar traducido y no parecerse nada al
-            # de la carpeta real ("Acusado" en Jellyfin vs carpeta
-            # "Accused"), y en ese caso el ratio de series_similarity no
-            # llega ni de lejos al 0.90 que hace falta para un match
-            # automático -- un nombre de carpeta que YA SABEMOS que es el
-            # real (nos lo dio el propio servidor de medios) no necesita
-            # parecerse a nada, solo existir tal cual.
-            if known_folder_name:
-                existing_lower = {e.lower(): e for e in existing}
-                real = existing_lower.get(known_folder_name.lower())
-                if real:
-                    return cat, real
-            if sanitized_desired in existing:
-                return cat, sanitized_desired
-            candidate, ratio = best_match(desired, existing, min_ratio=0.55)
-            if ratio >= 0.90:
-                return cat, candidate
-        return None, None
+            return self._ftp_dir_cache[root]
+
+        from core.ftp_categories import find_existing_category_folder
+        return find_existing_category_folder(cats, info.title, known_folder_name, dir_lookup)
 
     def _resolve_series_folder(self, ftp_conn, category: dict, info, entry=None) -> str:
         """Si ya existe en la raíz de *category* una carpeta con nombre
@@ -3235,6 +3598,11 @@ class App(_AppBase):
                 row["ftp_bar"].set(pct)
                 row["ftp_speed"].configure(text=_fmt_speed(speed_bps) if speed_bps > 0 else "")
                 break
+        # Velocidad total en la barra de estado (ver _update_status_bar) --
+        # solo reconfigura una etiqueta de texto, no reconstruye ninguna
+        # tabla, así que no hace falta frenar esto aunque se llame varias
+        # veces por segundo con varias subidas a la vez.
+        self._update_status_bar()
 
     def _ftp_row_set(self, entry, status_text, pct, speed_bps):
         """Fija el estado final de una fila FTP (llamado desde worker, usa after)."""
@@ -3632,9 +4000,20 @@ class App(_AppBase):
                                       "y se confirma antes de guardar cada pareja.",
                      font=ctk.CTkFont(size=12, weight="bold"), wraplength=460, justify="center").grid(
             row=0, column=0, pady=(10, 6), padx=10)
+        status_row_fr = ctk.CTkFrame(mapping_fr, fg_color="transparent")
+        status_row_fr.grid(row=1, column=0, pady=(0, 6))
         self._watch_sync_mapping_status_label = ctk.CTkLabel(
-            mapping_fr, text="Cargando usuarios...", text_color=WARNING_COLOR)
-        self._watch_sync_mapping_status_label.grid(row=1, column=0, pady=(0, 6))
+            status_row_fr, text="Cargando usuarios...", text_color=WARNING_COLOR)
+        self._watch_sync_mapping_status_label.pack(side="left")
+        # La lista de usuarios de Plex/Jellyfin solo se carga UNA vez, al
+        # construir esta pestaña -- si algo cambia después (una cuenta
+        # nueva, o el propietario apareciendo por primera vez tras este
+        # mismo arreglo, ver get_plex_home_users) no se refleja solo,
+        # antes había que reiniciar la app entera para volver a verla.
+        refresh_lbl = ctk.CTkLabel(status_row_fr, text=" 🔄 Actualizar", cursor="hand2",
+                                   font=ctk.CTkFont(size=11, underline=True), text_color=PENDING_COLOR)
+        refresh_lbl.pack(side="left", padx=(8, 0))
+        refresh_lbl.bind("<Button-1>", lambda e: self._refresh_watch_sync_mapping_users())
 
         # Mismo componente TableView que el resto de la app (Archivos/
         # Episodios/Liberar espacio/Historial), pero scrollable=False --
@@ -3873,6 +4252,7 @@ class App(_AppBase):
         self._WATCH_SYNC_HISTORY_PAGE_SIZE = 25
         self._watch_sync_history_all = []
         self._watch_sync_history_page = 0
+        self._watch_sync_history_dirty = True   # ver _refresh_watch_sync_history_view
         self._watch_sync_history_col_order = ["fecha", "persona", "titulo", "season_ep", "destino", "estado"]
         self._watch_sync_history_font = ctk.CTkFont(size=11)
         self._watch_sync_history_empty_msg = None
@@ -3914,15 +4294,28 @@ class App(_AppBase):
         (manual o programada) por si acaba de haber entradas nuevas.
         No-op si Plex/Jellyfin no están activos: _build_watch_sync_top_tab
         no llega a construir esta sección en ese caso (ver el "return"
-        temprano), así que no hay tabla que redibujar."""
+        temprano), así que no hay tabla que redibujar. También no-op si no
+        hubo sincronizaciones/borrados de historial nuevos desde la última
+        vez (self._watch_sync_history_dirty) -- releer el JSON y
+        reconstruir la tabla en cada cambio de pestaña era trabajo
+        desperdiciado la mayoría de las veces."""
         if not hasattr(self, "_watch_sync_history_table"):
             return
-        history = self._load_watch_sync_history()
-        self._watch_sync_history_all = list(reversed(history))   # más reciente primero
-        self._watch_sync_history_title_lbl.configure(
-            text=f"Historial de sincronizaciones  ({len(history)} registros)")
-        self._watch_sync_history_page = 0
-        self._watch_sync_history_render_page()
+        _t0 = _time.perf_counter()
+        skipped = not self._watch_sync_history_dirty
+        try:
+            if skipped:
+                return
+            history = self._load_watch_sync_history()
+            self._watch_sync_history_all = list(reversed(history))   # más reciente primero
+            self._watch_sync_history_title_lbl.configure(
+                text=f"Historial de sincronizaciones  ({len(history)} registros)")
+            self._watch_sync_history_page = 0
+            self._watch_sync_history_render_page()
+            self._watch_sync_history_dirty = False
+        finally:
+            _log.info("Vista: _refresh_watch_sync_history_view %6.0f ms%s",
+                       (_time.perf_counter() - _t0) * 1000, " (sin cambios, omitido)" if skipped else "")
 
     def _watch_sync_history_change_page(self, delta: int):
         n_pages = max(1, -(-len(self._watch_sync_history_all) // self._WATCH_SYNC_HISTORY_PAGE_SIZE))
@@ -3933,6 +4326,13 @@ class App(_AppBase):
         self._watch_sync_history_render_page()
 
     def _watch_sync_history_render_page(self):
+        _t0 = _time.perf_counter()
+        try:
+            self._watch_sync_history_render_page_impl()
+        finally:
+            _log.info("Vista: _watch_sync_history_render_page %6.0f ms", (_time.perf_counter() - _t0) * 1000)
+
+    def _watch_sync_history_render_page_impl(self):
         """Dibuja solo la página actual (self._watch_sync_history_page) de
         self._watch_sync_history_all -- ver _WATCH_SYNC_HISTORY_PAGE_SIZE."""
         import datetime
@@ -3990,12 +4390,24 @@ class App(_AppBase):
             self._watch_sync_history_path().write_text("[]", encoding="utf-8")
         except Exception:
             pass
+        self._watch_sync_history_dirty = True   # escribe el JSON directamente, no pasa por _save_watch_sync_history_entry
         self._refresh_watch_sync_history_view()
+
+    def _refresh_watch_sync_mapping_users(self):
+        """Botón "🔄 Actualizar" junto a la lista -- reutiliza
+        _load_watch_sync_mapping_users_async tal cual, solo pone el
+        estado en "Actualizando..." antes de lanzarlo para que quede
+        claro que está pasando algo (si no, con la lista ya cargada
+        antes, no había ninguna señal visible del refresco)."""
+        self._watch_sync_mapping_status_label.configure(text="Actualizando usuarios...", text_color=WARNING_COLOR)
+        self._load_watch_sync_mapping_users_async()
 
     def _load_watch_sync_mapping_users_async(self):
         """Carga los usuarios de ambas plataformas al construir la
         pestaña -- siempre visible, ya no hace falta un botón "Editar"
-        para desencadenarlo."""
+        para desencadenarlo. También reutilizado por
+        _refresh_watch_sync_mapping_users para volver a pedirlos a mano
+        sin reiniciar la app."""
         host = self.config_data.get("plex_host", "")
         owner_token = self.config_data.get("plex_token", "")
         jf_host = self.config_data.get("jellyfin_host", "")
@@ -4418,6 +4830,7 @@ class App(_AppBase):
                     json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
                 pass
+            self._watch_sync_history_dirty = True
 
     def _confirm_watch_sync_preview(self):
         """Aplica EXACTAMENTE la lista de SyncAction ya mostrada en la
@@ -4704,6 +5117,17 @@ class App(_AppBase):
         row.destroy()
 
     def _show_template_guide(self):
+        # Contenido estático (ver _build_guide_content) -- se construye una
+        # sola vez y se reutiliza (self._template_guide_win) en vez de crear
+        # un CTkToplevel/CTkScrollableFrame nuevo cada apertura, por la
+        # misma fuga de bind_all(<MouseWheel>/...) de customtkinter
+        # documentada en _DubHiddenDialog.
+        if self._template_guide_win is not None and self._template_guide_win.winfo_exists():
+            self._template_guide_win.grab_set()
+            self._template_guide_win.lift()
+            self._template_guide_win.focus_force()
+            return
+
         win = ctk.CTkToplevel(self)
         self._apply_icon(win)
         win.title("Guía de plantillas")
@@ -4725,6 +5149,13 @@ class App(_AppBase):
         sf = ctk.CTkScrollableFrame(win)
         sf.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self._build_guide_content(sf)
+
+        def _hide():
+            win.grab_release()
+            win.withdraw()
+        win.protocol("WM_DELETE_WINDOW", _hide)
+
+        self._template_guide_win = win
 
     # ── Servidores de medios (Plex/Jellyfin) ──
 
@@ -4957,11 +5388,12 @@ class App(_AppBase):
         self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
         self._missing_ep_table.on_column_resize = self._on_missing_ep_column_resize
         self._missing_ep_table.on_widths_changed = lambda w: self._save_table_col_widths("episodios", w)
+        self._missing_ep_table.enable_dynamic_page_size(lambda _size: self._missing_ep_render_page())
 
         self._missing_ep_side_panel = self._build_missing_ep_side_panel(body)
         self._missing_ep_side_panel.grid(row=0, column=1, sticky="nsew")
 
-        # Paginado (ver _MISSING_EP_PAGE_SIZE) -- con varios cientos de
+        # Paginado (ver TableView.page_size, calculado dinámicamente) -- con varios cientos de
         # series cacheadas, dibujar la tabla entera de golpe (o incluso en
         # lotes vía after(), que solo reparte el trabajo en el tiempo pero
         # no reduce el total) llega a agotar el límite de objetos GUI de
@@ -5256,7 +5688,7 @@ class App(_AppBase):
 
     def _append_missing_ep_result_live(self, row: dict):
         """Registra una fila recién encontrada durante un reescaneo
-        completo. Con páginas de tamaño fijo (ver _MISSING_EP_PAGE_SIZE)
+        completo. Con páginas de tamaño acotado (ver TableView.page_size)
         no tiene sentido repintar en CADA fila (sería tan caro como el
         problema que la paginación evitó) -- pero tampoco dejar la tabla
         completamente en blanco hasta el final: con un cruce FTP lento
@@ -5337,6 +5769,17 @@ class App(_AppBase):
         else:
             self._render_missing_episodes_table()
 
+    def _on_force_recheck(self, tmdb_id):
+        """Botón "🔄" de _DubHiddenDialog -- fuerza un repaso inmediato del
+        doblaje TMDB de UNA sola serie. Borra su entrada de
+        self._spanish_dub_cache (is_stale() la trata como caducada al no
+        tener "checked_at") y reutiliza _start_spanish_dub_check tal
+        cual: como es la ÚNICA serie caducada en ese momento, el repaso
+        que hace ya queda acotado a ella sola, sin tener que duplicar esa
+        lógica para un caso "una sola serie"."""
+        self._spanish_dub_cache.pop(str(tmdb_id), None)
+        self._start_spanish_dub_check()
+
     def _start_spanish_dub_check(self):
         """Comprueba el doblaje ES de todos los episodios que faltan (de
         series no ignoradas) que aún no estén en self._spanish_dub_cache --
@@ -5349,12 +5792,18 @@ class App(_AppBase):
         límite de peticiones de TMDB."""
         if self._missing_ep_scanning:
             return
+        from core.spanish_dub_cache import is_stale
         known_cache = self._spanish_dub_cache   # solo lectura mientras corre el worker
+        now = _time.time()
         pending = []
         for r in self._missing_ep_results:
             if r.get("ignored"):
                 continue
-            dub_episodes = known_cache.get(str(r["tmdb_id"]), {}).get("episodes", {})
+            series_entry = known_cache.get(str(r["tmdb_id"]), {})
+            # Una entrada caducada (ver is_stale) se trata como si no
+            # tuviera NINGÚN episodio comprobado -- se repasa la serie
+            # entera, no solo los episodios nuevos desde la última vez.
+            dub_episodes = {} if is_stale(series_entry, now) else series_entry.get("episodes", {})
             for season, eps in r["missing"].items():
                 for ep in eps:
                     if f"{season}x{ep:02d}" not in dub_episodes:
@@ -5381,9 +5830,17 @@ class App(_AppBase):
                 key = str(tmdb_id)
                 entry = updates.get(key)
                 if entry is None:
-                    entry = dict(known_cache.get(key, {}))
+                    old_entry = known_cache.get(key, {})
+                    entry = dict(old_entry)
                     entry["episodes"] = dict(entry.get("episodes", {}))
-                    entry.setdefault("spanish_available", None)
+                    if is_stale(old_entry, now):
+                        # Caducada -- también se vuelve a comprobar
+                        # spanish_available, no solo los episodios (podría
+                        # haber cambiado de plataforma desde la última vez).
+                        entry["spanish_available"] = None
+                    else:
+                        entry.setdefault("spanish_available", None)
+                    entry["checked_at"] = now   # ver core.spanish_dub_cache.is_stale
                     updates[key] = entry
 
                 # available: solo para ESTE episodio/intento. Si la consulta
@@ -5509,8 +5966,6 @@ class App(_AppBase):
             text = f"{len(pending)} serie(s) con episodios que faltan" + (f" -- último escaneo {when}" if when else "")
         self._missing_ep_status_lbl.configure(text=text)
 
-    _MISSING_EP_PAGE_SIZE = 25   # filas por página -- ver _missing_ep_render_page
-
     def _render_missing_episodes_table(self, reset_page: bool = True):
         """Punto de entrada tras cambiar filtros, terminar un escaneo, o
         cualquier otro cambio que pueda alterar QUÉ filas hay que ver --
@@ -5529,7 +5984,7 @@ class App(_AppBase):
 
     def _missing_ep_change_page(self, delta: int):
         rows = self._missing_ep_visible_rows()
-        n_pages = max(1, -(-len(rows) // self._MISSING_EP_PAGE_SIZE))
+        n_pages = max(1, -(-len(rows) // self._missing_ep_table.page_size))
         new_page = max(0, min(n_pages - 1, self._missing_ep_page + delta))
         if new_page == self._missing_ep_page:
             return
@@ -5543,7 +5998,7 @@ class App(_AppBase):
 
     def _missing_ep_render_page(self, scroll_top: bool = True):
         """Dibuja solo self._missing_ep_page de las filas que pasan los
-        filtros activos -- ver _MISSING_EP_PAGE_SIZE. Página fija, no
+        filtros activos -- ver TableView.page_size. Página acotada, no
         lotes acumulativos: con varios cientos de series cacheadas, el
         número de widgets vivos a la vez tiene que tener un techo fijo
         pase lo que pase con el tamaño real de la lista (ver el comentario
@@ -5592,10 +6047,11 @@ class App(_AppBase):
             return
 
         total = len(sorted_rows)
-        n_pages = max(1, -(-total // self._MISSING_EP_PAGE_SIZE))
+        page_size = self._missing_ep_table.page_size
+        n_pages = max(1, -(-total // page_size))
         self._missing_ep_page = max(0, min(n_pages - 1, self._missing_ep_page))
-        start = self._missing_ep_page * self._MISSING_EP_PAGE_SIZE
-        page_rows = sorted_rows[start:start + self._MISSING_EP_PAGE_SIZE]
+        start = self._missing_ep_page * page_size
+        page_rows = sorted_rows[start:start + page_size]
 
         self._missing_ep_page_lbl.configure(text=f"Página {self._missing_ep_page + 1} de {n_pages}")
         self._missing_ep_prev_btn.configure(state="normal" if self._missing_ep_page > 0 else "disabled")
@@ -5629,6 +6085,11 @@ class App(_AppBase):
                 self._build_missing_ep_row(r)
             if start + _BATCH < len(page_rows):
                 self.after(1, lambda: _render_batch(start + _BATCH))
+            else:
+                # Solo al terminar el ÚLTIMO lote -- medir con la página a
+                # medio construir daría un alto medio por fila incorrecto
+                # (ver TableView.note_rows_rendered).
+                self._missing_ep_table.note_rows_rendered(len(page_rows))
 
         _render_batch()
 
@@ -5741,8 +6202,12 @@ class App(_AppBase):
 
     def _show_missing_ep_dub_hidden_dialog(self):
         hidden = self._missing_ep_dub_hidden_rows()
-        if hidden:
-            _DubHiddenDialog(self, hidden)
+        if not hidden:
+            return
+        if self._dub_hidden_win is not None and self._dub_hidden_win.winfo_exists():
+            self._dub_hidden_win.refresh(hidden)
+        else:
+            self._dub_hidden_win = _DubHiddenDialog(self, hidden)
 
     def _build_missing_ep_row(self, r: dict):
         """Construye y empaqueta la fila de una serie en la tabla --
@@ -5837,7 +6302,6 @@ class App(_AppBase):
                                    text_color=summary_color, anchor="w")
         summary_lbl.pack(side="left", padx=(4, 4), pady=6)
 
-        from core.trending import trending_score, format_trending_score
         score = trending_score(r.get("play_count", 0), r.get("last_played_ts"), _time.time())
         trending_lbl = ctk.CTkLabel(header_row, text=format_trending_score(score), width=cw("trending"),
                                     font=self._missing_ep_summary_font, text_color=PENDING_COLOR)
@@ -6424,7 +6888,27 @@ class App(_AppBase):
         título original: sin esto, la IA solo tenía el nombre en español
         para identificar la serie y su época, que es justo el tipo de dato
         que más ayuda a acertar con el doblaje castellano (series antiguas
-        o con doblaje interrumpido)."""
+        o con doblaje interrumpido).
+
+        Si check_spanish_dub, también se busca la serie en eldoblaje.com
+        (ver core/eldoblaje.py) y se manda su texto real como
+        "info_doblaje_eldoblaje" -- probado en vivo: sin este texto, hasta
+        el modelo más fiable puede quedarse sin datos reales para
+        responder; con él, extrae el corte correcto de verdad (confirmado
+        con Bleach). Si la búsqueda no encuentra nada, sigue funcionando
+        igual que antes -- nunca bloquea la consulta a la IA.
+
+        También se manda "ftp_filenames" -- los nombres de archivo REALES
+        de esta serie en el FTP, no solo los números de missing/present ya
+        calculados -- para que la IA pueda ver de primera mano cosas que un
+        simple recuento no distingue, como un episodio doble empaquetado
+        en un mismo archivo ("7x21-7x22"). detect_episode() ya reconoce
+        estos casos y los añade a "presentes" durante el propio escaneo
+        (ver _build_ftp_episode_index/_cross_check_results_with_ftp), así
+        que esto es un refuerzo/red de seguridad para lo que ese regex no
+        cubra, no la única vía. Con una conexión FTP propia (nunca
+        self.ftp, mismo motivo que _missing_ep_series_path); si falla o no
+        hay servidor configurado, sigue funcionando igual que antes."""
         r = self._missing_ep_current_row
         api_key = self.config_data.get("ai_api_key", "")
         if not r or not api_key:
@@ -6451,6 +6935,38 @@ class App(_AppBase):
                 present = [ep for ep in expected_eps if ep not in missing_eps]
                 if present:
                     present_episodes[season] = present
+
+            info_doblaje_eldoblaje = ""
+            if check_spanish_dub:
+                from core.eldoblaje import search_series, get_dub_summary
+                # Nombre en español primero (eldoblaje.com es un sitio
+                # para audiencia española, indexa por el título comercial
+                # con el que se estrenó aquí) -- si no hay resultado, se
+                # prueba con el original como respaldo. Se queda con el
+                # primer resultado marcado como serie -- el sitio no da
+                # más señales para desambiguar que el propio orden.
+                candidates = search_series(r["name"]) or search_series(details.get("original_name") or "")
+                if candidates:
+                    info_doblaje_eldoblaje = get_dub_summary(candidates[0]["id"])
+
+            ftp_filenames = []
+            if self.config_data.get("ftp_host", ""):
+                from core.ftp_client import FTPClient as _FTPClient
+                own_ftp = _FTPClient()
+                try:
+                    own_ftp.connect(
+                        self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
+                        self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
+                        self.config_data.get("ftp_use_tls", False))
+                    if own_ftp.is_connected():
+                        path = self._missing_ep_series_path(r, use_cache_only=False, ftp_conn=own_ftp)
+                        if path:
+                            ftp_filenames = own_ftp.list_files_recursive(path, max_depth=2)
+                except Exception:
+                    pass
+                finally:
+                    own_ftp.disconnect()
+
             show_payload = [{
                 "tmdb_id": tmdb_id, "name": r["name"],
                 "original_name": details.get("original_name") or "",
@@ -6467,6 +6983,8 @@ class App(_AppBase):
                 # corte de doblaje.
                 "missing_episodes": {str(k): v for k, v in r.get("missing", {}).items()},
                 "present_episodes": {str(k): v for k, v in present_episodes.items()},
+                "info_doblaje_eldoblaje": info_doblaje_eldoblaje,
+                "ftp_filenames": ftp_filenames,
             }]
             from core.missing_episodes_ai import analyze_missing_episodes
             verdicts = analyze_missing_episodes(show_payload, api_key, check_spanish_dub=check_spanish_dub)
@@ -6477,6 +6995,10 @@ class App(_AppBase):
         if verdict:
             r["ai_verdict"] = verdict
             self._persist_ai_verdicts({r["tmdb_id"]: verdict})
+            # Compartir con el resto de clientes del mismo servidor -- solo
+            # en esta consulta manual real, nunca desde el chequeo
+            # automático por lotes (ver _push_shared_dub_verdict_to_ftp).
+            self._push_shared_dub_verdict_to_ftp(r["tmdb_id"], verdict)
         elif not r.get("ai_verdict"):
             self._missing_ep_ai_verdict_lbl.configure(
                 text="🤖 No se pudo obtener un veredicto (revisa la API Key de Groq o la conexión).")
@@ -7288,6 +7810,10 @@ class App(_AppBase):
                     det = detect_episode(fname)
                     if det.get("season") is not None and det.get("episode") is not None:
                         present.add((det["season"], det["episode"]))
+                        # Episodio doble empaquetado en el mismo archivo
+                        # (p.ej. "7x21-7x22") -- ver detect_episode.
+                        for extra_ep in det.get("extra_episodes", []):
+                            present.add((det["season"], extra_ep))
                     else:
                         unparsed.append(fname)
                 index[root][folder] = present
@@ -7528,6 +8054,10 @@ class App(_AppBase):
             det = detect_episode(fname)
             if det.get("season") is not None and det.get("episode") is not None:
                 ftp_present.add((det["season"], det["episode"]))
+                # Episodio doble empaquetado en el mismo archivo (p.ej.
+                # "7x21-7x22") -- ver detect_episode.
+                for extra_ep in det.get("extra_episodes", []):
+                    ftp_present.add((det["season"], extra_ep))
         _log.info("Cruce FTP (individual): '%s' -> %d episodio(s) encontrados en '%s/%s' (hueco antes: %s)",
                   result["name"], len(ftp_present), root, folder_name, result["missing"])
 
@@ -8105,10 +8635,8 @@ class App(_AppBase):
         self._refresh_table()   # destruye widgets usando _file_rows antes de vaciarlo
         self._clear_detail()
 
-    _FILES_PAGE_SIZE = 25   # filas por página -- ver el comentario junto a files_nav_fr
-
     def _files_change_page(self, delta: int):
-        n_pages = max(1, -(-len(self.files) // self._FILES_PAGE_SIZE))
+        n_pages = max(1, -(-len(self.files) // self._file_table.page_size))
         new_page = max(0, min(n_pages - 1, self._files_page + delta))
         if new_page == self._files_page:
             return
@@ -8134,7 +8662,8 @@ class App(_AppBase):
         self._drop_zone.pack_forget()
 
         total = len(self.files)
-        n_pages = max(1, -(-total // self._FILES_PAGE_SIZE))
+        page_size = self._file_table.page_size
+        n_pages = max(1, -(-total // page_size))
         # No se resetea a la página 0 en cada refresco (a diferencia de
         # Episodios en un reescaneo completo): aquí _refresh_table() se
         # llama constantemente por cambios normales de la cola (añadir/
@@ -8143,8 +8672,8 @@ class App(_AppBase):
         # mirando otra -- solo se corrige (clamp) si la página actual ya no
         # existe (p.ej. tras borrar los últimos archivos de la última página).
         self._files_page = max(0, min(n_pages - 1, self._files_page))
-        start = self._files_page * self._FILES_PAGE_SIZE
-        page_files = self.files[start:start + self._FILES_PAGE_SIZE]
+        start = self._files_page * page_size
+        page_files = self.files[start:start + page_size]
 
         self._files_page_lbl.configure(text=f"Página {self._files_page + 1} de {n_pages}")
         self._files_prev_btn.configure(state="normal" if self._files_page > 0 else "disabled")
@@ -8270,6 +8799,7 @@ class App(_AppBase):
                 "_raw_det":  det_text,
             })
 
+        self._file_table.note_rows_rendered(len(page_files))
         self._update_status_bar()
 
     def _file_size_text(self, entry) -> str:
@@ -9074,7 +9604,20 @@ class App(_AppBase):
     def _open_learned_terms_dialog(self):
         """Ver/añadir/quitar a mano los términos que el fallback de IA ha
         ido aprendiendo (core/learned_terms.py) -- por si alguno resultó ser
-        un error y hace falta corregirlo sin tocar el JSON a mano."""
+        un error y hace falta corregirlo sin tocar el JSON a mano.
+
+        Se construye una sola vez y se reutiliza (self._learned_terms_win)
+        en vez de crear un CTkToplevel/CTkScrollableFrame nuevo cada
+        apertura, por la misma fuga de bind_all(<MouseWheel>/...) de
+        customtkinter documentada en _DubHiddenDialog -- en el reabierto
+        solo se recarga la lista de términos (self._learned_terms_refresh)."""
+        if self._learned_terms_win is not None and self._learned_terms_win.winfo_exists():
+            self._learned_terms_win.grab_set()
+            self._learned_terms_win.lift()
+            self._learned_terms_win.focus_force()
+            self._learned_terms_refresh()
+            return
+
         win = ctk.CTkToplevel(self)
         self._apply_icon(win)
         win.title("Términos aprendidos")
@@ -9131,7 +9674,12 @@ class App(_AppBase):
         ctk.CTkButton(add_fr, text="+ Añadir", width=80, command=_add).pack(side="left", padx=(6, 0))
 
         _refresh()
-        ctk.CTkButton(win, text="Cerrar", command=win.destroy).pack(pady=(0, 16))
+
+        def _hide():
+            win.grab_release()
+            win.withdraw()
+        ctk.CTkButton(win, text="Cerrar", command=_hide).pack(pady=(0, 16))
+        win.protocol("WM_DELETE_WINDOW", _hide)
 
         # Centrar en la ventana padre, ya con el tamaño real del contenido
         win.update_idletasks()
@@ -9140,6 +9688,9 @@ class App(_AppBase):
         px = self.winfo_rootx() + self.winfo_width() // 2
         py = self.winfo_rooty() + self.winfo_height() // 2
         win.geometry(f"{dw}x{dh}+{px - dw//2}+{py - dh//2}")
+
+        self._learned_terms_win = win
+        self._learned_terms_refresh = _refresh
 
     def _category_to_plain_dict(self, cat: dict) -> dict:
         """Quita las referencias a widgets de un dict de categoría, dejando
@@ -9705,22 +10256,27 @@ class App(_AppBase):
 
     def _save_history_entry(self, filename: str, remote: str, status: str, size: int, error_msg: str = "",
                              local_path: str = ""):
+        entry = {
+            "ts":        _time.time(),
+            "filename":  filename,
+            "remote":    remote,
+            "status":    status,
+            "size":      size,
+            "error_msg": error_msg,
+            # Ruta local en el momento de la subida -- solo para poder
+            # reintentar directamente desde Historial sin tener que
+            # volver a Archivos (ver _retry_history_upload). Vacía en
+            # registros de antes de este campo; el botón "Reintentar"
+            # se deshabilita en ese caso.
+            "local_path": local_path,
+            # Quién lo subió -- para el historial de actividad compartido
+            # entre clientes (ver _push_activity_entry_to_ftp), y también
+            # útil ya en local si en el futuro hace falta distinguir.
+            "person":    self.config_data.get("app_user_name", ""),
+        }
         with self._history_lock:
             history = self._load_history()
-            history.append({
-                "ts":        _time.time(),
-                "filename":  filename,
-                "remote":    remote,
-                "status":    status,
-                "size":      size,
-                "error_msg": error_msg,
-                # Ruta local en el momento de la subida -- solo para poder
-                # reintentar directamente desde Historial sin tener que
-                # volver a Archivos (ver _retry_history_upload). Vacía en
-                # registros de antes de este campo; el botón "Reintentar"
-                # se deshabilita en ese caso.
-                "local_path": local_path,
-            })
+            history.append(entry)
             # Mantener solo los últimos 500 registros
             if len(history) > 500:
                 history = history[-500:]
@@ -9730,6 +10286,8 @@ class App(_AppBase):
                     encoding="utf-8")
             except Exception:
                 pass
+            self._history_dirty = True
+        self._push_activity_entry_to_ftp(entry, "subida")
 
     # ── Historial de borrados ("Liberar espacio") -- mismo patrón que el
     # historial de subidas de arriba, en un archivo aparte para no
@@ -9753,17 +10311,20 @@ class App(_AppBase):
         """reason: descripción legible de qué filtros la marcaron como
         candidata (p.ej. "vista, sin repetir en 12 meses") -- para poder
         entender después POR QUÉ se borró algo, no solo QUÉ."""
+        entry = {
+            "ts":        _time.time(),
+            "name":      name,
+            "ftp_path":  ftp_path,
+            "size":      size_bytes,
+            "reason":    reason,
+            "status":    status,
+            "error_msg": error_msg,
+            # Quién lo borró -- ver _save_history_entry.
+            "person":    self.config_data.get("app_user_name", ""),
+        }
         with self._history_lock:
             history = self._load_deletion_history()
-            history.append({
-                "ts":        _time.time(),
-                "name":      name,
-                "ftp_path":  ftp_path,
-                "size":      size_bytes,
-                "reason":    reason,
-                "status":    status,
-                "error_msg": error_msg,
-            })
+            history.append(entry)
             if len(history) > 500:
                 history = history[-500:]
             try:
@@ -9772,8 +10333,7 @@ class App(_AppBase):
                     encoding="utf-8")
             except Exception:
                 pass
-
-    _HISTORY_PAGE_SIZE = 25   # filas por página -- ver _refresh_history_view
+        self._push_activity_entry_to_ftp(entry, "borrado")
 
     def _build_history_tab(self, parent):
         """Vista de historial integrada (igual que Episodios/Configuración,
@@ -9786,6 +10346,15 @@ class App(_AppBase):
         self._history_title_lbl = ctk.CTkLabel(
             header, text="Historial de subidas", font=ctk.CTkFont(size=14, weight="bold"))
         self._history_title_lbl.pack(side="left", padx=12, pady=8)
+        # "Ver todo el servidor" -- mismo componente y mismo sitio
+        # conceptual que ya usa Protegidos (self._protected_show_all_var):
+        # apagado (por defecto) muestra solo lo que este cliente subió,
+        # igual que siempre; encendido muestra el historial de actividad
+        # compartido (subidas Y borrados de todos los clientes del mismo
+        # servidor, ver _push_activity_entry_to_ftp/_shared_activity_history).
+        self._history_show_all_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(header, text="Ver todo el servidor", variable=self._history_show_all_var,
+                      command=self._on_history_show_all_toggled).pack(side="left", padx=(0, 12), pady=8)
         ctk.CTkButton(header, text="🗑 Limpiar historial", width=150,
                       fg_color="transparent", border_width=1,
                       border_color=ERROR_COLOR, text_color=ERROR_COLOR,
@@ -9803,7 +10372,7 @@ class App(_AppBase):
         table_fr.grid_columnconfigure(0, weight=1)
         table_fr.grid_rowconfigure(0, weight=1)
 
-        # Paginado (ver _HISTORY_PAGE_SIZE): con hasta 500 registros y 5
+        # Paginado (ver TableView.page_size, calculado dinámicamente): con hasta 500 registros y 5
         # widgets por fila, dibujar el historial entero de golpe llega a
         # sumar miles de ventanas nativas de Tk -- Windows limita a 10000
         # objetos GUI por proceso, y superarlo rompe el pintado de TODA
@@ -9825,12 +10394,13 @@ class App(_AppBase):
             command=lambda: self._history_change_page(1))
         self._history_next_btn.pack(side="left")
 
-        self._history_col_order = ["fecha", "archivo", "destino", "tamano", "estado"]
+        self._history_col_order = ["fecha", "archivo", "tipo", "cliente", "destino", "tamano", "estado"]
         self._history_font = ctk.CTkFont(size=11)
         self._history_rows = []
         self._history_empty_msg = None   # label "sin subidas...", ver _refresh_history_view
         self._history_all = []   # historial completo (más reciente primero), ver _refresh_history_view
         self._history_page = 0
+        self._history_dirty = True   # ver _refresh_history_view: solo se relee/redibuja si hubo cambios reales
 
         # TableView: cabecera fija (no scrollea con las filas) + cuerpo
         # con scroll -- mismo componente que usan Archivos/Episodios/
@@ -9841,6 +10411,14 @@ class App(_AppBase):
         self._history_table = TableView(table_fr, columns=[
             ColumnSpec("fecha", "Fecha", width=sw0.get("fecha", 130), min_width=50, resizable=True),
             ColumnSpec("archivo", "Archivo", width=sw0.get("archivo", 280), min_width=50, resizable=True),
+            # tipo/cliente: solo tienen contenido variado con "Ver todo el
+            # servidor" activo (en local, "archivo" siempre es "Subida" y
+            # "cliente" siempre este mismo usuario) -- se muestran siempre
+            # de todas formas, mismo criterio que la columna "Persona" ya
+            # existente en Sincronizar visionado, para no reconstruir la
+            # tabla entera solo por encender/apagar el interruptor.
+            ColumnSpec("tipo", "Tipo", width=sw0.get("tipo", 70), min_width=50, resizable=True),
+            ColumnSpec("cliente", "Cliente", width=sw0.get("cliente", 110), min_width=50, resizable=True),
             ColumnSpec("destino", "Destino FTP / motivo", width=sw0.get("destino", 200), min_width=50, resizable=True),
             ColumnSpec("tamano", "Tamaño", width=sw0.get("tamano", 70), min_width=50, resizable=True),
             ColumnSpec("estado", "Estado", width=sw0.get("estado", 80), min_width=50),
@@ -9852,6 +10430,7 @@ class App(_AppBase):
         # su propia cabecera.
         self._history_table.on_column_resize = lambda: self._history_render_page()
         self._history_table.on_widths_changed = lambda w: self._save_table_col_widths("historial", w)
+        self._history_table.enable_dynamic_page_size(self._on_history_page_size_changed)
 
         # Diferido -- ver el mismo motivo en _build_missing_episodes_tab:
         # esta pestaña se construye al arrancar aunque esté oculta, y el
@@ -9865,25 +10444,68 @@ class App(_AppBase):
         """Recarga el historial de disco y redibuja la página actual --
         se llama al construir la vista y cada vez que se entra en ella
         (_show_view), por si hubo subidas nuevas desde la última vez que
-        se miró. Como es una recarga desde disco (el orden/contenido
-        puede haber cambiado), vuelve siempre a la primera página."""
-        history = self._load_history()
-        self._history_all = list(reversed(history))   # más reciente primero
-        self._history_title_lbl.configure(text=f"Historial de subidas  ({len(history)} registros)")
-        self._history_page = 0
-        self._history_render_page()
+        se miró. Si no hay subidas/borrados nuevos desde la última vez
+        (self._history_dirty), no hace nada -- releer el JSON y reconstruir
+        la tabla en cada cambio de pestaña era trabajo desperdiciado la
+        mayoría de las veces. Como es una recarga desde disco (el
+        orden/contenido puede haber cambiado), vuelve siempre a la primera
+        página."""
+        _t0 = _time.perf_counter()
+        skipped = not self._history_dirty
+        try:
+            if skipped:
+                return
+            if self._history_show_all_var.get():
+                # Ya sincronizado en memoria (ver _sync_activity_history_from_ftp,
+                # llamado al entrar en esta pestaña) -- no hace falta releer
+                # nada de disco para esta rama.
+                self._history_all = list(reversed(self._shared_activity_history))
+                self._history_title_lbl.configure(
+                    text=f"Historial de subidas  ({len(self._history_all)} registros, todo el servidor)")
+            else:
+                history = self._load_history()
+                self._history_all = list(reversed(history))   # más reciente primero
+                self._history_title_lbl.configure(text=f"Historial de subidas  ({len(history)} registros)")
+            self._history_page = 0
+            self._history_render_page()
+            self._history_dirty = False
+        finally:
+            _log.info("Vista: _refresh_history_view %6.0f ms%s", (_time.perf_counter() - _t0) * 1000,
+                       " (sin cambios, omitido)" if skipped else "")
+
+    def _on_history_show_all_toggled(self):
+        self._history_dirty = True
+        self._refresh_history_view()
 
     def _history_change_page(self, delta: int):
-        n_pages = max(1, -(-len(self._history_all) // self._HISTORY_PAGE_SIZE))
+        n_pages = max(1, -(-len(self._history_all) // self._history_table.page_size))
         new_page = max(0, min(n_pages - 1, self._history_page + delta))
         if new_page == self._history_page:
             return
         self._history_page = new_page
         self._history_render_page()
 
+    def _on_history_page_size_changed(self, new_size: int):
+        """Callback de TableView.enable_dynamic_page_size -- a diferencia
+        de Archivos/Episodios/Liberar espacio, _history_render_page_impl
+        NO reclampa self._history_page por su cuenta (solo lo hace
+        _history_change_page), así que un cambio de tamaño de página por
+        redimensionado necesita reclamparlo aquí antes de redibujar, o el
+        usuario podría quedar "aparcado" en una página que ya no existe."""
+        n_pages = max(1, -(-len(self._history_all) // new_size))
+        self._history_page = max(0, min(n_pages - 1, self._history_page))
+        self._history_render_page()
+
     def _history_render_page(self):
+        _t0 = _time.perf_counter()
+        try:
+            self._history_render_page_impl()
+        finally:
+            _log.info("Vista: _history_render_page %6.0f ms", (_time.perf_counter() - _t0) * 1000)
+
+    def _history_render_page_impl(self):
         """Dibuja solo la página actual (self._history_page) de
-        self._history_all -- ver _HISTORY_PAGE_SIZE. Separado de
+        self._history_all -- ver TableView.page_size. Separado de
         _refresh_history_view para que cambiar de página no implique
         releer el historial de disco."""
         import datetime
@@ -9893,9 +10515,10 @@ class App(_AppBase):
         self._history_empty_msg = None
 
         total = len(self._history_all)
-        n_pages = max(1, -(-total // self._HISTORY_PAGE_SIZE))
-        start = self._history_page * self._HISTORY_PAGE_SIZE
-        page_items = self._history_all[start:start + self._HISTORY_PAGE_SIZE]
+        page_size = self._history_table.page_size
+        n_pages = max(1, -(-total // page_size))
+        start = self._history_page * page_size
+        page_items = self._history_all[start:start + page_size]
 
         self._history_page_lbl.configure(
             text=f"Página {self._history_page + 1} de {n_pages}" if total else "")
@@ -9929,12 +10552,27 @@ class App(_AppBase):
             else:
                 sz_str = f"{sz} B"
             st = entry.get("status", "ok")
-            # Si falló, en esta columna es más útil el motivo que la ruta remota
+            # kind: solo lo llevan las entradas del historial compartido
+            # (ver _push_activity_entry_to_ftp) -- las locales son siempre
+            # subidas, así que a falta de esta clave se asume "subida".
+            kind = entry.get("kind", "subida")
+            is_deletion = kind == "borrado"
+            # Si falló, en esta columna es más útil el motivo que la ruta
+            # remota -- en un borrado, "reason" (por qué se marcó como
+            # candidata) ocupa el mismo hueco conceptual.
             error_msg = entry.get("error_msg", "")
             showing_error = st == "error" and bool(error_msg)
+            if is_deletion:
+                destino_text = entry.get("reason", "")
+                archivo_text = entry.get("name", "")
+            else:
+                destino_text = error_msg if showing_error else entry.get("remote", "")
+                archivo_text = entry.get("filename", "")
             raw = {
-                "fecha": ts, "archivo": entry.get("filename", ""),
-                "destino": error_msg if showing_error else entry.get("remote", ""),
+                "fecha": ts, "archivo": archivo_text,
+                "tipo": "Borrado" if is_deletion else "Subida",
+                "cliente": entry.get("person", ""),
+                "destino": destino_text,
                 "tamano": sz_str, "estado": st.capitalize(),
             }
             extra_by_col = {
@@ -9959,16 +10597,19 @@ class App(_AppBase):
             # si se guardó la ruta local en su momento (registros de antes
             # de este campo, o si la ruta ya no existe, se avisa al pulsar
             # en vez de deshabilitarlo aquí en silencio, ver
-            # _retry_history_upload).
+            # _retry_history_upload). Un borrado no tiene "reintentar" en
+            # este mismo sentido -- deshabilitado siempre para esas filas.
             retry_btn = ctk.CTkButton(
                 row_fr, text="🔄 Reintentar", width=self._history_table.col_width("accion"),
                 fg_color="transparent", border_width=1,
-                state="normal" if st == "error" else "disabled",
+                state="normal" if (st == "error" and not is_deletion) else "disabled",
                 command=lambda e=entry: self._retry_history_upload(e))
             retry_btn.pack(side="left", padx=(4, 4), pady=2)
             row_labels["accion"] = retry_btn
 
             self._history_rows.append(row_labels)
+
+        self._history_table.note_rows_rendered(len(page_items))
 
     def _retry_history_upload(self, entry: dict):
         """Reintenta una subida fallida directamente desde Historial, sin
@@ -10042,6 +10683,7 @@ class App(_AppBase):
             self._history_path().write_text("[]", encoding="utf-8")
         except Exception:
             pass
+        self._history_dirty = True   # escribe el JSON directamente, no pasa por _save_history_entry
         self._refresh_history_view()
         self._set_status("Historial borrado", WARNING_COLOR)
 
@@ -10287,8 +10929,9 @@ class App(_AppBase):
             ColumnSpec("del", "", width=110),
         ])
         self._cleanup_table.grid(row=0, column=0, sticky="nsew")
+        self._cleanup_table.enable_dynamic_page_size(lambda _size: self._render_cleanup_page())
 
-        # Paginado (ver _CLEANUP_PAGE_SIZE) -- mismo motivo que en
+        # Paginado (ver TableView.page_size, calculado dinámicamente) -- mismo motivo que en
         # Episodios que faltan/Historial: con un servidor grande, cientos
         # de candidatas de golpe llegan a agotar el límite de objetos GUI
         # de Windows (10000 por proceso) y rompen el pintado de la
@@ -10799,8 +11442,6 @@ class App(_AppBase):
             parts.append("nunca vista")
         return ", ".join(parts) if parts else "sin datos de visionado"
 
-    _CLEANUP_PAGE_SIZE = 25   # filas por página -- ver _render_cleanup_page
-
     def _render_cleanup_results(self):
         """Punto de entrada tras aplicar filtros o terminar un análisis --
         el conjunto de candidatas cambió, así que vuelve a la primera
@@ -10818,7 +11459,7 @@ class App(_AppBase):
         self._render_cleanup_page()
 
     def _cleanup_change_page(self, delta: int):
-        n_pages = max(1, -(-len(self._cleanup_filtered_items) // self._CLEANUP_PAGE_SIZE))
+        n_pages = max(1, -(-len(self._cleanup_filtered_items) // self._cleanup_table.page_size))
         new_page = max(0, min(n_pages - 1, self._cleanup_page + delta))
         if new_page == self._cleanup_page:
             return
@@ -10827,7 +11468,7 @@ class App(_AppBase):
 
     def _render_cleanup_page(self):
         """Dibuja solo self._cleanup_page de self._cleanup_filtered_items
-        -- ver _CLEANUP_PAGE_SIZE. Página fija (no "Mostrar más"
+        -- ver TableView.page_size. Página acotada (no "Mostrar más"
         acumulativo): con cientos de candidatas (habitual desde que
         también se detectan archivos sueltos), crear TODAS las filas de
         golpe -- o ir acumulando cada vez más sin soltar las anteriores --
@@ -10849,10 +11490,11 @@ class App(_AppBase):
             return
 
         total = len(items)
-        n_pages = max(1, -(-total // self._CLEANUP_PAGE_SIZE))
+        page_size = self._cleanup_table.page_size
+        n_pages = max(1, -(-total // page_size))
         self._cleanup_page = max(0, min(n_pages - 1, self._cleanup_page))
-        start = self._cleanup_page * self._CLEANUP_PAGE_SIZE
-        page_items = items[start:start + self._CLEANUP_PAGE_SIZE]
+        start = self._cleanup_page * page_size
+        page_items = items[start:start + page_size]
 
         self._cleanup_page_lbl.configure(text=f"Página {self._cleanup_page + 1} de {n_pages}")
         self._cleanup_prev_btn.configure(state="normal" if self._cleanup_page > 0 else "disabled")
@@ -10875,6 +11517,11 @@ class App(_AppBase):
             self._build_cleanup_result_row(item)
         if batch_end < end:
             self.after(1, lambda: self._render_cleanup_rows_batch(items, batch_end, end, token, batch_size))
+        else:
+            # Solo al terminar el ÚLTIMO lote -- medir con la página a
+            # medio construir daría un alto medio por fila incorrecto
+            # (ver TableView.note_rows_rendered).
+            self._cleanup_table.note_rows_rendered(len(items))
 
     def _build_cleanup_result_row(self, item):
         # pack (side="left", una columna con fill="x"+expand=True) --
@@ -10906,7 +11553,6 @@ class App(_AppBase):
         reason_lbl.pack(fill="x")
         reason_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
 
-        from core.trending import trending_score, format_trending_score
         score = trending_score(item.play_count, item.last_played_ts, _time.time())
         ctk.CTkLabel(row, text=format_trending_score(score), width=cw("tendencia"),
                      font=self._cleanup_reason_font, text_color=PENDING_COLOR).pack(
@@ -11219,16 +11865,47 @@ class App(_AppBase):
         ])
         self._protected_table.grid(row=0, column=0, sticky="nsew")
         self._protected_table.on_widths_changed = lambda w: self._save_table_col_widths("protected", w)
+        self._protected_table.enable_dynamic_page_size(self._on_protected_page_size_changed)
 
         self._protected_name_font = ctk.CTkFont(size=12)
 
+        # Paginado (ver TableView.page_size, calculado dinámicamente) -- esta era la única tabla de
+        # listado de toda la app sin límite: con muchas reservas acumuladas
+        # se reconstruía entera (sin límite de filas) cada vez que se
+        # entraba en la pestaña. Mismo patrón que Historial/Liberar espacio.
+        nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
+        nav_fr.grid(row=3, column=0, pady=(6, 0))
+        self._protected_prev_btn = ctk.CTkButton(
+            nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._protected_change_page(-1))
+        self._protected_prev_btn.pack(side="left")
+        self._protected_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
+        self._protected_page_lbl.pack(side="left", padx=12)
+        self._protected_next_btn = ctk.CTkButton(
+            nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._protected_change_page(1))
+        self._protected_next_btn.pack(side="left")
+
+        self._protected_items = []   # página actual, ver _render_protected_table
+        self._protected_page = 0
+
     def _render_protected_table(self):
-        """Redibuja la tabla entera con lo que haya en self._reservations
-        ahora mismo -- se llama al abrir la pestaña, tras liberar una fila,
-        tras alternar "Ver todo el servidor" y tras cualquier
-        sincronización con el FTP mientras esta pestaña esté activa (ver
-        _apply_synced_reservations)."""
-        self._protected_table.clear_rows()
+        # Envoltorio fino solo para medir tiempos (ver app.log) -- mismo
+        # patrón que _show_view/_show_view_impl.
+        _t0 = _time.perf_counter()
+        try:
+            self._render_protected_table_impl()
+        finally:
+            _log.info("Vista: _render_protected_table %6.0f ms", (_time.perf_counter() - _t0) * 1000)
+
+    def _render_protected_table_impl(self):
+        """Recalcula qué mostrar a partir de self._reservations ahora mismo
+        -- se llama al abrir la pestaña, tras liberar una fila, tras
+        alternar "Ver todo el servidor" y tras cualquier sincronización con
+        el FTP mientras esta pestaña esté activa (ver
+        _apply_synced_reservations). Vuelve siempre a la primera página;
+        separado de _render_protected_page para que cambiar de página no
+        implique recalcular el filtro."""
         user = self.config_data.get("app_user_name", "").strip()
         show_all = self._protected_show_all_var.get()
 
@@ -11251,7 +11928,54 @@ class App(_AppBase):
             shown = []
         shown.sort(key=lambda kv: kv[1].get("name", "").lower())
 
-        if not shown:
+        self._protected_items = shown
+        self._protected_page = 0
+        self._render_protected_page()
+
+    def _protected_change_page(self, delta: int):
+        n_pages = max(1, -(-len(self._protected_items) // self._protected_table.page_size))
+        new_page = max(0, min(n_pages - 1, self._protected_page + delta))
+        if new_page == self._protected_page:
+            return
+        self._protected_page = new_page
+        self._render_protected_page()
+
+    def _on_protected_page_size_changed(self, new_size: int):
+        """Callback de TableView.enable_dynamic_page_size -- mismo motivo
+        que _on_history_page_size_changed: _render_protected_page_impl no
+        reclampa self._protected_page por su cuenta, así que un cambio de
+        tamaño de página por redimensionado necesita reclamparlo aquí
+        antes de redibujar."""
+        n_pages = max(1, -(-len(self._protected_items) // new_size))
+        self._protected_page = max(0, min(n_pages - 1, self._protected_page))
+        self._render_protected_page()
+
+    def _render_protected_page(self):
+        _t0 = _time.perf_counter()
+        try:
+            self._render_protected_page_impl()
+        finally:
+            _log.info("Vista: _render_protected_page %6.0f ms", (_time.perf_counter() - _t0) * 1000)
+
+    def _render_protected_page_impl(self):
+        """Dibuja solo la página actual (self._protected_page) de
+        self._protected_items -- ver TableView.page_size."""
+        self._protected_table.clear_rows()
+
+        user = self.config_data.get("app_user_name", "").strip()
+        show_all = self._protected_show_all_var.get()
+        total = len(self._protected_items)
+        page_size = self._protected_table.page_size
+        n_pages = max(1, -(-total // page_size))
+        start = self._protected_page * page_size
+        page_items = self._protected_items[start:start + page_size]
+
+        self._protected_page_lbl.configure(
+            text=f"Página {self._protected_page + 1} de {n_pages}" if total else "")
+        self._protected_prev_btn.configure(state="normal" if self._protected_page > 0 else "disabled")
+        self._protected_next_btn.configure(state="normal" if self._protected_page < n_pages - 1 else "disabled")
+
+        if not page_items:
             if show_all:
                 msg = "Nadie ha reservado nada en este servidor todavía."
             elif user:
@@ -11262,8 +11986,10 @@ class App(_AppBase):
             ctk.CTkLabel(self._protected_table.body, text=msg, text_color=PENDING_COLOR).pack(pady=30)
             return
 
-        for key, entry in shown:
+        for key, entry in page_items:
             self._build_protected_row(key, entry, user)
+        self._protected_table.scroll_to_top()
+        self._protected_table.note_rows_rendered(len(page_items))
 
     def _build_protected_row(self, key: str, entry: dict, user: str):
         cw = self._protected_table.col_width

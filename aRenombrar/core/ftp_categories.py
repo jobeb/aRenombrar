@@ -7,7 +7,10 @@ comodín (catch-all).
 """
 
 import uuid
-from typing import Optional
+from typing import Callable, Optional
+
+from core.ftp_client import _ftp_safe
+from core.series_match import best_match
 
 
 def new_category_id() -> str:
@@ -29,6 +32,57 @@ def choose_category(genre_ids, categories: list) -> Optional[dict]:
         if genre_set & set(cat_genres):
             return cat
     return wildcard
+
+
+def find_existing_category_folder(categories: list, desired_title: str,
+                                    known_folder_name: Optional[str],
+                                    dir_lookup: Callable[[str], Optional[list]]) -> tuple:
+    """Busca en *categories* (ya filtradas por tipo de media) si ya existe
+    una carpeta con nombre igual o prácticamente idéntico a *desired_title*
+    -- para que la organización real del servidor prevalezca sobre la
+    clasificación automática por género cuando no coinciden (series
+    movidas a mano de categoría, p.ej. por tener contenido para adultos y
+    ya no encajar en una categoría infantil aunque el género -- Animación,
+    normalmente -- siga siendo el mismo). Usado tanto por la subida manual
+    (gui/app.py) como por AutoWatcher (core/auto_watcher.py); ambos deciden
+    ellos mismos CÓMO listar/cachear cada raíz (gui/app.py evita bloquear
+    la interfaz, AutoWatcher siempre lista de verdad) a través de
+    *dir_lookup*.
+
+    dir_lookup(root) -> lista de nombres de carpeta ya existentes en esa
+    raíz, o None si no se puede/quiere comprobar esa categoría ahora mismo
+    (p.ej. "use_cache_only" en gui/app.py y esa raíz aún no está en caché)
+    -- en ese caso la categoría se salta, no cuenta como "no hay carpeta".
+
+    Solo hace caso a coincidencias de alta confianza: el folder_name ya
+    conocido de antemano (p.ej. de un servidor de medios -- el nombre
+    mostrado puede estar traducido y no parecerse nada al de la carpeta
+    real, así que si YA se sabe cuál es el real no hace falta que se
+    parezca a nada), nombre exacto tras sanear, o ratio >= 0.90 de
+    series_similarity (el que da cuando un nombre está literalmente
+    contenido en el otro, o solo difiere en mayúsculas/capitalización --
+    no es un parecido vago). Devuelve (categoría, nombre_de_carpeta_
+    existente), o (None, None) si no hay ninguna coincidencia de esa
+    confianza en ninguna categoría."""
+    sanitized_desired = _ftp_safe(desired_title)
+    for cat in categories:
+        root = cat.get("root", "")
+        if not root:
+            continue
+        existing = dir_lookup(root)
+        if existing is None:
+            continue
+        if known_folder_name:
+            existing_lower = {e.lower(): e for e in existing}
+            real = existing_lower.get(known_folder_name.lower())
+            if real:
+                return cat, real
+        if sanitized_desired in existing:
+            return cat, sanitized_desired
+        candidate, ratio = best_match(desired_title, existing, min_ratio=0.55)
+        if ratio >= 0.90:
+            return cat, candidate
+    return None, None
 
 
 def split_template(template: str):

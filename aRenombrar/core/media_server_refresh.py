@@ -726,8 +726,20 @@ def get_plex_usage_stats(host: str, token: str, timeout: int = 20) -> Optional[d
 def get_plex_home_users(host: str, owner_token: str, timeout: int = 15) -> Optional[list]:
     """[{"id": str, "title": str}, ...] -- todos los usuarios (Home/
     gestionados o compartidos) con acceso al servidor Plex del propietario
-    de *owner_token*, SIN el propio propietario (igual que
-    MyPlexAccount.users()). None si falla o no está configurado."""
+    de *owner_token*, MÁS el propio propietario (con id="owner", una
+    cadena que nunca choca con un id numérico real de Plex) -- caso real:
+    el administrador de la cuenta también ve contenido con su propio
+    usuario y quiere sincronizar SU visionado, no solo el de las cuentas
+    gestionadas/compartidas. MyPlexAccount.users() nunca lo incluye por
+    sí solo (es "quien pregunta", no alguien "compartido consigo mismo"),
+    así que se añade aquí a mano -- ver get_plex_user_token, que sabe
+    resolver id="owner" sin necesitar buscarlo en esa lista (no
+    aparecería). Se muestra con la parte del email antes de la @, no con
+    account.username/title -- probado en vivo: username da el nombre de
+    marca del servidor Plex ("CineBechos"), no el nombre de la persona --
+    el email es lo que de verdad identifica a quién pertenece la cuenta,
+    igual que ya se usa para las demás integraciones de esta app. None si
+    falla o no está configurado."""
     if not host or not owner_token:
         return None
     try:
@@ -736,7 +748,11 @@ def get_plex_home_users(host: str, owner_token: str, timeout: int = 15) -> Optio
     except Exception as e:
         _log.warning("Plex: fallo al listar usuarios de la cuenta: %s", e)
         return None
-    return [{"id": str(u.id), "title": u.title} for u in users]
+    email_local_part = (account.email or "").split("@", 1)[0]
+    owner_name = email_local_part or account.title or account.username or "Propietario"
+    result = [{"id": "owner", "title": owner_name}]
+    result += [{"id": str(u.id), "title": u.title} for u in users]
+    return result
 
 
 def get_plex_user_token(host: str, owner_token: str, plex_user_id: str,
@@ -748,9 +764,16 @@ def get_plex_user_token(host: str, owner_token: str, plex_user_id: str,
     re-derivarlo cada vez que guardarlo). None si el usuario no existe o
     la llamada falla (p.ej. una cuenta restringida con PIN -- no
     confirmado como bloqueante en la práctica, pero se trata igual como
-    "no disponible" si ocurre)."""
+    "no disponible" si ocurre).
+
+    plex_user_id="owner" (ver get_plex_home_users) es un caso especial:
+    el propio owner_token YA ES su token, no hace falta derivar nada -- y
+    no se podría, porque el propietario nunca aparece en
+    account.users()."""
     if not host or not owner_token or not plex_user_id:
         return None
+    if plex_user_id == "owner":
+        return owner_token
     try:
         account = MyPlexAccount(token=owner_token)
         plex = PlexServer(host, owner_token)

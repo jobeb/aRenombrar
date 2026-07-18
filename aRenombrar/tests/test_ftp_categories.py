@@ -3,6 +3,7 @@ from core.ftp_categories import (
     choose_category,
     split_template,
     build_wildcard_category,
+    find_existing_category_folder,
 )
 
 
@@ -87,3 +88,85 @@ def test_build_wildcard_category_shape():
 def test_build_wildcard_category_blank_template_has_no_root():
     cat = build_wildcard_category("Películas", "")
     assert cat["root"] == ""
+
+
+# ── find_existing_category_folder ──
+
+def test_find_existing_category_folder_real_world_case_rick_y_morty():
+    # Caso real que motivo esta funcion: Rick y Morty (animacion para
+    # adultos) ya archivada a mano en "Series", pero "SeriesPeques" (genero
+    # Animacion+Infantil) va PRIMERO en la lista -- sin esta funcion,
+    # choose_category() sola habria elegido "SeriesPeques" y creado una
+    # carpeta duplicada, exactamente lo que paso de verdad.
+    categories = [
+        {"name": "SeriesPeques", "root": "/datos2/seriespeques", "genre_ids": [16, 10762]},
+        {"name": "Series", "root": "/datos2/series", "genre_ids": []},
+    ]
+    listings = {
+        "/datos2/seriespeques": [],
+        "/datos2/series": ["Rick Y Morty"],   # capitalizacion distinta a TMDB
+    }
+    cat, folder = find_existing_category_folder(
+        categories, "Rick y Morty", None, lambda root: listings[root])
+    assert cat["name"] == "Series"
+    assert folder == "Rick Y Morty"
+
+
+def test_find_existing_category_folder_no_match_returns_none():
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Serie Nueva", None, lambda root: ["Otra Serie"])
+    assert cat is None
+    assert folder is None
+
+
+def test_find_existing_category_folder_exact_match_after_sanitizing():
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Breaking Bad", None, lambda root: ["Breaking Bad"])
+    assert cat["name"] == "Series"
+    assert folder == "Breaking Bad"
+
+
+def test_find_existing_category_folder_known_folder_name_wins_even_with_low_similarity():
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Acusado", "Accused", lambda root: ["Accused"])
+    assert cat["name"] == "Series"
+    assert folder == "Accused"
+
+
+def test_find_existing_category_folder_skips_category_when_dir_lookup_returns_none():
+    # None de dir_lookup = "no se pudo comprobar esta categoria ahora" (p.ej.
+    # use_cache_only en la GUI) -- se salta, no cuenta como "no existe".
+    categories = [
+        {"name": "SinComprobar", "root": "/a", "genre_ids": []},
+        {"name": "Series", "root": "/b", "genre_ids": []},
+    ]
+    calls = []
+
+    def dir_lookup(root):
+        calls.append(root)
+        if root == "/a":
+            return None
+        return ["Mi Serie"]
+
+    cat, folder = find_existing_category_folder(categories, "Mi Serie", None, dir_lookup)
+    assert cat["name"] == "Series"
+    assert calls == ["/a", "/b"]
+
+
+def test_find_existing_category_folder_ignores_category_without_root():
+    categories = [{"name": "SinRuta", "root": "", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Mi Serie", None, lambda root: ["Mi Serie"])
+    assert cat is None
+    assert folder is None
+
+
+def test_find_existing_category_folder_low_similarity_does_not_match():
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Loki", None, lambda root: ["Lucifer"])
+    assert cat is None
+    assert folder is None

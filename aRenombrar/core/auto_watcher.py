@@ -529,7 +529,20 @@ class AutoWatcher:
                 _log.info("FTP conectado OK")
 
             cats = self.config.get("ftp_categories", {"tv": [], "movie": []})
-            category = choose_category(media_info.genre_ids, cats.get(media_info.media_type, []))
+            type_cats = cats.get(media_info.media_type, [])
+            # La organización real del servidor prevalece sobre la
+            # clasificación automática por género -- ver
+            # _find_category_with_existing_folder. Caso real que motivó
+            # esto: una serie de animación para adultos, ya archivada a
+            # mano fuera de la categoría infantil (mismo género,
+            # "Animación", que sí coincide con esa categoría), se subió a
+            # una carpeta NUEVA en la categoría infantil en vez de a la
+            # que ya tenía, porque antes esta función se saltaba
+            # directamente a choose_category (solo género) sin comprobar
+            # si la serie ya existía en OTRA categoría.
+            category, _existing_folder = self._find_category_with_existing_folder(type_cats, media_info.title)
+            if category is None:
+                category = choose_category(media_info.genre_ids, type_cats)
             if category is None:
                 _log.error("Sin categoría FTP configurada para: %s (%s)", new_name, media_info.media_type)
                 self.on_event("error", f"Sin categoría FTP configurada: {new_name}")
@@ -729,6 +742,35 @@ class AutoWatcher:
             _mark_both("error_ftp", new_name=new_name)
 
     # ── Carpeta de serie en el FTP ─────────────────────────────────────────────
+
+    def _find_category_with_existing_folder(self, categories: list, title: str) -> tuple:
+        """Busca en TODAS las *categories* (ya filtradas por tipo de media)
+        si el título a subir ya tiene carpeta en alguna de ellas -- para
+        que la organización real del servidor prevalezca sobre la
+        clasificación automática por género (ver el comentario en
+        _process, que llama a esto antes de choose_category). Mismo
+        emparejamiento de alta confianza que la GUI (ver
+        gui/app.py::_find_category_with_existing_folder), compartido vía
+        core.ftp_categories.find_existing_category_folder -- aquí solo
+        cambia CÓMO se lista/cachea cada raíz: siempre una conexión ya
+        abierta (self.ftp, dentro de self._ftp_lock) y siempre de verdad
+        (sin equivalente a use_cache_only -- este método solo se llama una
+        vez por archivo procesado, no en un redibujado de la interfaz)."""
+        def dir_lookup(root):
+            if root not in self._ftp_dir_cache:
+                # Dos listados, no uno -- mismo motivo que en
+                # gui/app.py::_find_category_with_existing_folder: un único
+                # NLST a una raíz grande a veces vuelve incompleto sin dar
+                # ningún error, y eso es precisamente el tipo de fallo que
+                # este método existe para evitar (una carpeta ya existente
+                # que no se detecta, así que se crea una nueva por error).
+                first = set(self.ftp.list_dirs(root))
+                second = set(self.ftp.list_dirs(root))
+                self._ftp_dir_cache[root] = list(first | second)
+            return self._ftp_dir_cache[root]
+
+        from core.ftp_categories import find_existing_category_folder
+        return find_existing_category_folder(categories, title, None, dir_lookup)
 
     def _resolve_series_folder(self, category: dict, media_info) -> str:
         """Si ya existe en la raíz de *category* una carpeta con nombre muy

@@ -92,11 +92,19 @@ def test_detect_strips_trailing_uploader_credit_only_at_end():
     assert r["title"] == "Catch Me If You Can"
 
 
-def test_detect_truncates_at_first_junk_marker_even_if_unlisted_credit_follows():
+def test_detect_truncates_at_first_junk_marker_even_if_unlisted_credit_follows(monkeypatch, tmp_path):
     # "Kowalski&Xusman" y "Nocturniap2p" no estan en ninguna lista de basura
     # conocida, pero como aparecen DESPUES de "Eac3"/"Castellano" (que si lo
     # estan), se descartan igualmente por venir despues del primer indicio
     # tecnico -- no hace falta reconocer cada credito de subida posible.
+    # Aislado de los términos aprendidos reales del usuario (ver
+    # test_detect_picks_up_persisted_learned_terms) -- sin esto, un término
+    # aprendido de verdad tan corto como "LA" (visto en la práctica) corta
+    # "La Residencia" entera por el propio título, no por ningún crédito.
+    import core.learned_terms as lt
+    monkeypatch.setattr(lt, "app_data_dir", lambda: tmp_path)
+    lt._reset_cache_for_tests()
+
     r = detect_episode(
         "La.Residencia.Eac3.Castellano.Frances+Forzados+Completos."
         "Kowalski&Xusman.Para.Nocturniap2p.mkv")
@@ -291,3 +299,102 @@ def test_get_gives_up_after_max_429_retries(monkeypatch):
                         lambda url, **kw: _FakeTmdbResponse({}, status_code=429))
     with pytest.raises(RuntimeError):
         client._get("/tv/1")
+
+
+# ── Episodios dobles (mismo archivo con dos episodios empaquetados) ──
+
+def test_detect_double_episode_nxnn_hyphen():
+    # Caso real reportado: "Stargate SG-1 7x21-7x22 La ciudad perdida
+    # [DVDRip][Spanish Divx][cifirip][By Darkseid].avi" -- el episodio 22
+    # se quedaba sin reconocer, y el cruce con el FTP lo marcaba como hueco
+    # real aunque el archivo estuviera ahí.
+    r = detect_episode("Stargate SG-1 7x21-7x22 La ciudad perdida "
+                        "[DVDRip][Spanish Divx][cifirip][By Darkseid].avi")
+    assert r["season"] == 7
+    assert r["episode"] == 21
+    assert r["extra_episodes"] == [22]
+    assert r["media_type"] == "tv"
+
+
+def test_detect_double_episode_nxnn_space():
+    # Segundo caso real reportado, separado por espacio en vez de guion.
+    r = detect_episode("Stargate SG1 - 8x01 8x02 - Un nuevo orden "
+                        "[DVD+SCL][Spanish Xvid][cifirip].avi")
+    assert r["season"] == 8
+    assert r["episode"] == 1
+    assert r["extra_episodes"] == [2]
+
+
+def test_detect_double_episode_sxxexx_chained():
+    r = detect_episode("Serie.S07E21E22.Titulo.mkv")
+    assert r["season"] == 7
+    assert r["episode"] == 21
+    assert r["extra_episodes"] == [22]
+
+
+def test_detect_double_episode_sxxexx_repeated():
+    r = detect_episode("Serie.S07E21-S07E22.Titulo.mkv")
+    assert r["season"] == 7
+    assert r["episode"] == 21
+    assert r["extra_episodes"] == [22]
+
+
+def test_detect_double_episode_nxnn_compact_range():
+    # Caso real reportado (segunda vez): "Stargate Atlantis 1x01-02
+    # Emergiendo (Spa-Eng-Sub) Hd Ia Us 1080P Hevc 10B-Aac By Geot.mkv" --
+    # rango compacto SIN temporada repetida (a diferencia de "7x21-7x22").
+    # Solo se acepta porque "02" es consecutivo a "01" (episodio+1).
+    r = detect_episode(
+        "Stargate Atlantis 1x01-02 Emergiendo (Spa-Eng-Sub) Hd Ia Us "
+        "1080P Hevc 10B-Aac By Geot.mkv")
+    assert r["season"] == 1
+    assert r["episode"] == 1
+    assert r["extra_episodes"] == [2]
+
+
+def test_detect_double_episode_sxxexx_compact_range():
+    r = detect_episode("Serie.S01E01-02.Titulo.mkv")
+    assert r["season"] == 1
+    assert r["episode"] == 1
+    assert r["extra_episodes"] == [2]
+
+
+def test_detect_single_episode_has_empty_extra_episodes():
+    r = detect_episode("Breaking.Bad.S03E07.1080p.BluRay.x264.mkv")
+    assert r["extra_episodes"] == []
+
+
+def test_detect_episode_does_not_confuse_year_with_double_episode():
+    # Sin un segundo indicador de episodio (otra "x"/"E"), un número justo
+    # después no debe tratarse como segundo episodio -- aquí "2019" es un
+    # año, no un episodio doble.
+    r = detect_episode("Serie 1x05 2019 1080p.mkv")
+    assert r["season"] == 1
+    assert r["episode"] == 5
+    assert r["extra_episodes"] == []
+
+
+def test_detect_episode_does_not_confuse_resolution_with_double_episode():
+    # "720"/"1080" pegados tras un guion tampoco deben confundirse con un
+    # segundo episodio -- ninguno de los dos es consecutivo al episodio 5
+    # (episodio+1 = 6), que es lo que de verdad los distingue de un rango
+    # compacto real como "1x05-06".
+    r = detect_episode("Serie 1x05-720p.mkv")
+    assert r["extra_episodes"] == []
+    r2 = detect_episode("Serie 1x05-1080p.mkv")
+    assert r2["extra_episodes"] == []
+
+
+def test_detect_episode_compact_range_requires_consecutive_number():
+    # Un rango compacto que NO es consecutivo (aquí "08", no "06") no se
+    # acepta como episodio doble -- ninguna forma de doble episodio real
+    # salta episodios de por medio.
+    r = detect_episode("Serie 1x05-08.mkv")
+    assert r["episode"] == 5
+    assert r["extra_episodes"] == []
+
+
+def test_detect_movie_has_empty_extra_episodes():
+    r = detect_episode("Inception (2010) 1080p.mkv")
+    assert r["media_type"] == "movie"
+    assert r["extra_episodes"] == []
