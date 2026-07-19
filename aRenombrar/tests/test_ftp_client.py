@@ -717,3 +717,59 @@ def test_download_file_fails_without_connection(tmp_path):
     client = FTPClient()
     ok, msg = client.download_file("/peliculas/Pelicula.mkv", str(tmp_path / "Pelicula.mkv"))
     assert ok is False
+
+
+class _FakeSocket:
+    def __init__(self, timeout):
+        self._timeout = timeout
+
+    def gettimeout(self):
+        return self._timeout
+
+    def settimeout(self, value):
+        self._timeout = value
+
+
+class _FakeFtpWithSocket:
+    def __init__(self, timeout=15):
+        self.sock = _FakeSocket(timeout)
+
+
+def test_widened_timeout_widens_and_restores():
+    client = FTPClient()
+    client.ftp = _FakeFtpWithSocket(timeout=15)
+
+    with client.widened_timeout(300):
+        assert client.ftp.sock.gettimeout() == 300
+
+    assert client.ftp.sock.gettimeout() == 15
+
+
+def test_widened_timeout_restores_even_if_body_raises():
+    client = FTPClient()
+    client.ftp = _FakeFtpWithSocket(timeout=15)
+
+    try:
+        with client.widened_timeout(300):
+            assert client.ftp.sock.gettimeout() == 300
+            raise ValueError("fallo dentro del bloque")
+    except ValueError:
+        pass
+
+    assert client.ftp.sock.gettimeout() == 15
+
+
+def test_widened_timeout_restores_to_30_when_original_was_none():
+    client = FTPClient()
+    client.ftp = _FakeFtpWithSocket(timeout=None)
+
+    with client.widened_timeout(300):
+        assert client.ftp.sock.gettimeout() == 300
+
+    assert client.ftp.sock.gettimeout() == 30
+
+
+def test_widened_timeout_is_a_no_op_without_a_connection():
+    client = FTPClient()   # client.ftp es None -- nunca se conectó
+    with client.widened_timeout(300):
+        pass   # no debe lanzar

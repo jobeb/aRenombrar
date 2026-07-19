@@ -6,6 +6,7 @@ Variables disponibles en la plantilla de ruta:
 
 import ftplib
 import io
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -140,6 +141,36 @@ class FTPClient:
             return self.ftp.size(remote_file)
         except ftplib.all_errors:
             return None
+
+    @contextmanager
+    def widened_timeout(self, seconds: int = 120):
+        """Amplía temporalmente el timeout del socket de control -- el fijo
+        de 15s puesto en connect() vale para comandos rápidos, pero listar
+        una carpeta con miles de archivos (categorías grandes, cientos o
+        miles de películas sueltas sin carpeta propia) puede tardar bastante
+        más en un NAS lento, y el comando fallaría a mitad con un timeout
+        silencioso -- ftplib.all_errors lo cubre, así que el código que
+        llama ni se entera de que fue un timeout, solo ve "no hay datos" o
+        cae al método más lento (list_dirs en vez de LIST -R), agravando
+        aún más la lentitud. Mismo patrón que upload_file ya usa durante la
+        transferencia de archivos grandes, ver ahí. Usar alrededor de
+        cualquier operación de listado que pueda ser grande (ver
+        gui/app.py::_bootstrap_category_stats)."""
+        orig = None
+        try:
+            if self.ftp and self.ftp.sock:
+                orig = self.ftp.sock.gettimeout()
+                self.ftp.sock.settimeout(seconds)
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            try:
+                if self.ftp and self.ftp.sock:
+                    self.ftp.sock.settimeout(orig if orig is not None else 30)
+            except Exception:
+                pass
 
     def list_dirs(self, path: str) -> list[str]:
         """Devuelve los nombres de las subcarpetas directas de *path* (sin archivos).

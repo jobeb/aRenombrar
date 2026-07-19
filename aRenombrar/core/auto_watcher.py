@@ -65,7 +65,9 @@ class AutoWatcher:
           tipo: "info" | "ok" | "skip" | "error"
         on_file_event(path, tipo, **kwargs)
           tipos: "start" | "renamed" | "queued" | "uploading" | "uploaded" | "skip" | "error"
-          kwargs: new_name, progress, speed
+          kwargs: new_name, progress, speed, size (bytes, solo en "uploaded" --
+          ver _save_history_entry, necesario para que el historial/las
+          estadísticas compartidas no cuenten esta subida como 0 B)
         upload_slots: UploadSlotManager compartido con la subida manual de la
           GUI, para que "Subidas simultáneas" limite el total real entre
           ambos orígenes. Si no se pasa (uso standalone/tests), se crea uno
@@ -703,7 +705,7 @@ class AutoWatcher:
         if ok3:
             _log.info("FTP upload OK: %s -> %s", new_name, remote_path)
             self.on_event("ok", f"✓ Subido: {new_name}")
-            self.on_file_event(key, "uploaded", new_name=new_name)
+            self.on_file_event(key, "uploaded", new_name=new_name, size=local_size)
             _mark_both("subido", new_name=new_name)
             from core.media_server_refresh import trigger_refresh
             trigger_refresh(self.config)

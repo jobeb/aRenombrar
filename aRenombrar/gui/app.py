@@ -990,6 +990,10 @@ class App(_AppBase):
         self._last_reservations_sync_ts = 0.0
         self._last_dub_verdicts_sync_ts = 0.0
         self._last_activity_sync_ts = 0.0
+        self._last_upload_stats_sync_ts = 0.0
+        self._last_category_stats_sync_ts = 0.0
+        self._last_deletion_stats_sync_ts = 0.0
+        self._last_category_upload_stats_sync_ts = 0.0
 
         # Mirror local de los veredictos de doblaje compartidos (ver
         # core/shared_dub_verdicts.py) -- último estado conocido antes de
@@ -1003,6 +1007,45 @@ class App(_AppBase):
         # entrar en esa pestaña (ver _sync_activity_history_from_ftp);
         # vacío hasta la primera sincronización real de esta sesión.
         self._shared_activity_history = []
+
+        # Ranking de subidas por usuario (ver core/upload_stats.py, pestaña
+        # Estadísticas) -- mismo criterio que el historial de actividad de
+        # arriba, pero este archivo NUNCA rota (ver el docstring del
+        # módulo), así que sí merece la pena tener un mirror local que
+        # sobreviva entre sesiones.
+        from core.upload_stats import load_local_cache as _load_upload_stats_cache
+        self._shared_upload_stats = _load_upload_stats_cache()
+
+        # Ranking de borrados por usuario (ver core/deletion_stats.py,
+        # panel "Top borradores" de Estadísticas) -- mismo criterio de
+        # persistencia que el de subidas de arriba, pero en un archivo
+        # APARTE (ver el docstring del módulo: mezclar subidas y borrados
+        # en un solo contador no tendría sentido).
+        from core.deletion_stats import load_local_cache as _load_deletion_stats_cache
+        self._shared_deletion_stats = _load_deletion_stats_cache()
+
+        # Ranking de subidas desglosado por categoría (ver
+        # core/category_upload_stats.py, un panel "Top subidores" por
+        # cada categoría configurada) -- aparte del ranking global de
+        # arriba, mismo criterio de persistencia.
+        from core.category_upload_stats import load_local_cache as _load_category_upload_stats_cache
+        self._shared_category_upload_stats = _load_category_upload_stats_cache()
+
+        # Recuento/tamaño por categoría (ver core/category_stats.py, panel
+        # "Por categoría"/"Capacidad" de Estadísticas) -- mismo criterio de
+        # persistencia que el ranking de subidas de arriba: nunca rota, así
+        # que el mirror local sobrevive entre sesiones. bootstrap_done
+        # controla que el recorrido completo del árbol FTP (caro) se haga
+        # como mucho una vez por sesión -- ver _sync_category_stats_from_ftp.
+        from core.category_stats import load_local_cache as _load_category_stats_cache
+        self._shared_category_stats = _load_category_stats_cache()
+        self._category_stats_bootstrap_done = False
+
+        # Espacio libre por disco, en bytes crudos -- lo mantiene al día
+        # _refresh_ftp_space() (arranque, cada 5 min, tras subir/borrar);
+        # la pestaña de Estadísticas lo lee directamente sin abrir su
+        # propia conexión FTP. Vacío hasta el primer chequeo real.
+        self._shared_free_space_by_disk = {}
 
         # Historial de subidas -- integrado como una vista más (igual que
         # Episodios/Configuración), no una ventana emergente aparte.
@@ -1042,6 +1085,24 @@ class App(_AppBase):
         self._watch_sync_top_visible = False
         self._build_watch_sync_top_tab(self._watch_sync_top_frame)
         self._startup_mark("  _build_watch_sync_top_tab()")
+
+        # Estadísticas -- pestaña principal, igual que las de arriba. La
+        # construcción real vive en gui/stats_view.py (StatsView), mismo
+        # motivo que gui/table_view.py: sacar una pieza de UI sustancial
+        # de este archivo en vez de seguir engordándolo.
+        from gui.stats_view import StatsView
+        self._stats_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
+        self._stats_frame.grid_columnconfigure(0, weight=1)
+        # No poner grid_rowconfigure(0, weight=1) aquí -- StatsView._build
+        # ya reparte las filas de ESTE MISMO frame (fila 0 = cabecera,
+        # fila 1 = contenido con weight=1). Ponerlo también aquí hacía que
+        # ambas filas quedaran con weight=1 a la vez, repartiendo el
+        # espacio sobrante entre las dos y estirando la cabecera hasta
+        # ocupar como la mitad de la pestaña (título con un hueco enorme
+        # encima y debajo).
+        self._stats_visible = False
+        self._stats_view = StatsView(self, self._stats_frame)
+        self._startup_mark("  StatsView()")
 
         self._build_status_bar()
         self._startup_mark("  _build_status_bar()")
@@ -1282,7 +1343,8 @@ class App(_AppBase):
         self.after(0, lambda: self._set_status(msg, colors.get(tipo, ACCENT)))
 
     def _on_auto_file_event(self, path, tipo, new_name=None, progress=None, speed=None,
-                             media_info=None, confidence=None, reason=None, renamed_on_disk=True):
+                             media_info=None, confidence=None, reason=None, renamed_on_disk=True,
+                             size=None):
         """Recibe eventos de archivo del AutoWatcher y actualiza la tabla."""
         path = str(Path(path))   # normalizar separadores antes de comparar/asignar
         def _update():
@@ -1363,8 +1425,13 @@ class App(_AppBase):
                 # Notificación de escritorio
                 fname = entry.new_name or entry.name
                 self._send_notification("aRenombrar — Subida completada", fname)
-                # Guardar en historial (modo automático)
-                self._save_history_entry(fname, path, "ok", 0, local_path=path)
+                # Guardar en historial (modo automático) -- size viene del
+                # propio AutoWatcher (ya lo calculó antes de subir, ver
+                # core/auto_watcher.py), NO recalculado aquí: en este punto
+                # el archivo pudo moverse/borrarse ya (mover a "procesados"
+                # o eliminar tras subir), así que Path(path).stat() podría
+                # fallar o dar un tamaño distinto al que de verdad se subió.
+                self._save_history_entry(fname, path, "ok", size or 0, local_path=path)
                 self._remove_uploaded_episode_from_missing_list(entry.media_info)
                 self._refresh_ftp_space()
 
@@ -1401,6 +1468,7 @@ class App(_AppBase):
         "protected": "🔒 Protegidos",
         "history": "📋 Historial",
         "watch_sync": "🔄 Sincronizar visionado",
+        "stats": "📊 Estadísticas",
         "config": "⚙ Configuración",
     }
 
@@ -1417,6 +1485,8 @@ class App(_AppBase):
             return "protected"
         if self._watch_sync_top_visible:
             return "watch_sync"
+        if self._stats_visible:
+            return "stats"
         return "files"
 
     def _on_nav_segment_changed(self, value):
@@ -1491,6 +1561,9 @@ class App(_AppBase):
         elif self._watch_sync_top_visible:
             self._watch_sync_top_frame.grid_remove()
             self._watch_sync_top_visible = False
+        elif self._stats_visible:
+            self._stats_frame.grid_remove()
+            self._stats_visible = False
         else:
             self._files_frame.grid_remove()
 
@@ -1522,6 +1595,15 @@ class App(_AppBase):
             self._watch_sync_top_frame.grid(row=0, column=0, sticky="nsew")
             self._watch_sync_top_visible = True
             self._refresh_watch_sync_history_view()   # por si hay sincronizaciones nuevas desde la última vez
+        elif view_key == "stats":
+            self._stats_frame.grid(row=0, column=0, sticky="nsew")
+            self._stats_visible = True
+            self._sync_activity_history_from_ftp()
+            self._sync_upload_stats_from_ftp()
+            self._sync_category_stats_from_ftp()
+            self._sync_deletion_stats_from_ftp()
+            self._sync_category_upload_stats_from_ftp()
+            self._stats_view.refresh_from_cache()
         elif view_key == "config":
             if not self._config_panel_built:
                 # Construcción diferida hasta la primera visita real --
@@ -1994,10 +2076,12 @@ class App(_AppBase):
                     return
                 parts = []
                 any_low = False
+                free_by_disk = {}
                 for disk_name, root in disks.items():
                     free = self._get_free_space_with_jellyfin_fallback(own_ftp, root)
                     if free is None:
                         continue
+                    free_by_disk[disk_name] = free
                     parts.append(f"{disk_name.capitalize()}-{self._fmt_free_space(free)}")
                     if free <= 1024**3:   # < 1 GB -- mismo umbral de aviso que antes
                         any_low = True
@@ -2008,7 +2092,16 @@ class App(_AppBase):
                 return
             text = "Espacio disponible: " + " · ".join(parts)
             color = WARNING_COLOR if any_low else SUCCESS_COLOR
-            self.after(0, lambda t=text, c=color: self._ftp_space_lbl.configure(text=t, text_color=c))
+
+            def apply():
+                self._ftp_space_lbl.configure(text=text, text_color=color)
+                # Espacio libre en bytes crudos, para el panel "Capacidad"
+                # de Estadísticas -- lee esto directamente, sin abrir su
+                # propia conexión FTP (ver gui/stats_view.py).
+                self._shared_free_space_by_disk = free_by_disk
+                if self._stats_visible:
+                    self._stats_view.refresh_from_cache()
+            self.after(0, apply)
         threading.Thread(target=worker, daemon=True).start()
 
     _FTP_SPACE_PERIODIC_MS = 5 * 60 * 1000   # 5 minutos
@@ -2200,6 +2293,34 @@ class App(_AppBase):
         servidor") -- archivo propio dentro de la misma carpeta
         compartida, mismo motivo que _reservations_remote_path."""
         return self._shared_data_path("aRenombrar_actividad.json")
+
+    def _upload_stats_remote_path(self) -> str:
+        """Ruta remota del ranking de subidas por usuario (ver
+        core/upload_stats.py, pestaña Estadísticas) -- archivo propio
+        dentro de la misma carpeta compartida, mismo motivo que
+        _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_estadisticas_usuarios.json")
+
+    def _category_stats_remote_path(self) -> str:
+        """Ruta remota del recuento/tamaño por categoría (ver
+        core/category_stats.py, pestaña Estadísticas) -- archivo propio
+        dentro de la misma carpeta compartida, mismo motivo que
+        _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_estadisticas_categorias.json")
+
+    def _deletion_stats_remote_path(self) -> str:
+        """Ruta remota del ranking de borrados por usuario (ver
+        core/deletion_stats.py, pestaña Estadísticas) -- archivo propio
+        dentro de la misma carpeta compartida, mismo motivo que
+        _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_estadisticas_borrados.json")
+
+    def _category_upload_stats_remote_path(self) -> str:
+        """Ruta remota del ranking de subidas desglosado por categoría
+        (ver core/category_upload_stats.py, pestaña Estadísticas) --
+        archivo propio dentro de la misma carpeta compartida, mismo
+        motivo que _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_estadisticas_subidores_categoria.json")
 
     def _sync_server_config_from_ftp(self):
         """Descarga la configuración compartida del servidor y la aplica en
@@ -2724,6 +2845,589 @@ class App(_AppBase):
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
+
+    def _push_upload_stat_to_ftp(self, person: str, size_bytes: int, ts: float):
+        """Suma una subida al ranking compartido (ver core/upload_stats.py,
+        pestaña Estadísticas) -- llamado desde _save_history_entry para
+        toda subida OK, manual o de AutoWatcher. A diferencia del
+        historial de actividad (que recorta a 500), este archivo nunca
+        rota: cada subida SUMA a un total por persona, para siempre.
+        Mismo patrón lectura-modificación-escritura que
+        _push_shared_dub_verdict_to_ftp."""
+        remote_path = self._upload_stats_remote_path()
+        if not remote_path:
+            _log.info(
+                "Estadísticas: sin \"Carpeta compartida (datos)\" configurada -- "
+                "no se puede sumar la subida de %r al ranking", person)
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.upload_stats import add_upload
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning("Estadísticas: no se pudo conectar al FTP para sumar la subida de %r al ranking (%s)",
+                                 person, _msg)
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = add_upload(remote_data, person, size_bytes, ts)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    _log.info("Estadísticas: subida de %r sumada al ranking (%d bytes)", person, size_bytes)
+                    self.after(0, lambda: self._apply_synced_upload_stats(merged))
+                else:
+                    _log.warning("Estadísticas: no se pudo subir el ranking actualizado tras sumar a %r (%s)",
+                                 person, _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_upload_stats(self, merged: dict):
+        from core.upload_stats import save_local_cache as _save_upload_stats_cache
+        self._shared_upload_stats = merged
+        _save_upload_stats_cache(merged)
+        if self._stats_visible:
+            self._stats_view.refresh_from_cache()
+
+    _UPLOAD_STATS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_upload_stats_from_ftp
+
+    def _sync_upload_stats_from_ftp(self):
+        """Refresca el mirror local del ranking de subidas desde el FTP en
+        segundo plano -- mismo patrón y mismo freno que
+        _sync_activity_history_from_ftp. Se llama al entrar en
+        Estadísticas."""
+        now = _time.time()
+        if now - self._last_upload_stats_sync_ts < self._UPLOAD_STATS_SYNC_MIN_INTERVAL:
+            return
+        self._last_upload_stats_sync_ts = now
+
+        remote_path = self._upload_stats_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_upload_stats(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_deletion_stat_to_ftp(self, person: str, size_bytes: int, ts: float):
+        """Suma un borrado al ranking de "limpiadores" compartido (ver
+        core/deletion_stats.py, pestaña Estadísticas) -- llamado desde
+        _save_deletion_history_entry para todo borrado OK. Archivo APARTE
+        del ranking de subidas (ver el docstring de core/deletion_stats.py
+        para el motivo); mismo patrón lectura-modificación-escritura que
+        _push_upload_stat_to_ftp."""
+        remote_path = self._deletion_stats_remote_path()
+        if not remote_path:
+            _log.info(
+                "Estadísticas: sin \"Carpeta compartida (datos)\" configurada -- "
+                "no se puede sumar el borrado de %r al ranking de borradores", person)
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.deletion_stats import add_deletion
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning(
+                        "Estadísticas: no se pudo conectar al FTP para sumar el borrado de %r (%s)",
+                        person, _msg)
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = add_deletion(remote_data, person, size_bytes, ts)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    _log.info("Estadísticas: borrado de %r sumado al ranking de borradores (%d bytes)",
+                              person, size_bytes)
+                    self.after(0, lambda: self._apply_synced_deletion_stats(merged))
+                else:
+                    _log.warning(
+                        "Estadísticas: no se pudo subir el ranking de borradores actualizado tras sumar a %r (%s)",
+                        person, _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_deletion_stats(self, merged: dict):
+        from core.deletion_stats import save_local_cache as _save_deletion_stats_cache
+        self._shared_deletion_stats = merged
+        _save_deletion_stats_cache(merged)
+        if self._stats_visible:
+            self._stats_view.refresh_from_cache()
+
+    _DELETION_STATS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_deletion_stats_from_ftp
+
+    def _sync_deletion_stats_from_ftp(self):
+        """Refresca el mirror local del ranking de borradores desde el FTP
+        en segundo plano -- mismo patrón y mismo freno que
+        _sync_upload_stats_from_ftp. Se llama al entrar en Estadísticas."""
+        now = _time.time()
+        if now - self._last_deletion_stats_sync_ts < self._DELETION_STATS_SYNC_MIN_INTERVAL:
+            return
+        self._last_deletion_stats_sync_ts = now
+
+        remote_path = self._deletion_stats_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_deletion_stats(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_category_upload_stat_to_ftp(self, remote_path: str, person: str, size_bytes: int, ts: float):
+        """Suma una subida al ranking de subidores DE ESA CATEGORÍA
+        concreta (ver core/category_upload_stats.py, un panel "Top
+        subidores" por categoría en Estadísticas) -- llamado desde
+        _save_history_entry para toda subida OK. A diferencia del
+        recuento por categoría (core/category_stats.py, que necesita un
+        bootstrap con el árbol completo del FTP porque el servidor sí
+        conserva qué archivos hay), este ranking es puramente incremental
+        -- el servidor no guarda QUIÉN subió cada archivo, así que no hay
+        nada que "re-escanear"; se construye solo a partir de los eventos
+        de subida, igual que core/upload_stats.py."""
+        from core.category_stats import resolve_category_and_folder
+        resolved = resolve_category_and_folder(
+            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}))
+        if resolved is None:
+            return
+        category_id, category_name, _folder_name = resolved
+        remote_stats_path = self._category_upload_stats_remote_path()
+        if not remote_stats_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.category_upload_stats import add_category_upload
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning(
+                        "Estadísticas: no se pudo conectar al FTP para sumar la subida de %r a "
+                        "\"Top subidores\" de %r (%s)", person, category_name, _msg)
+                    return
+                raw = own_ftp.download_bytes(remote_stats_path)
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    remote_data = {}
+                if not isinstance(remote_data, dict):
+                    remote_data = {}
+                merged = add_category_upload(remote_data, category_id, category_name, person, size_bytes, ts)
+                data = _json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_stats_path)
+                if up_ok:
+                    _log.info("Estadísticas: subida de %r sumada a \"Top subidores\" de %r (%d bytes)",
+                              person, category_name, size_bytes)
+                    self.after(0, lambda: self._apply_synced_category_upload_stats(merged))
+                else:
+                    _log.warning(
+                        "Estadísticas: no se pudo subir el ranking por categoría actualizado tras sumar "
+                        "a %r en %r (%s)", person, category_name, _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_category_upload_stats(self, merged: dict):
+        from core.category_upload_stats import save_local_cache as _save_category_upload_stats_cache
+        self._shared_category_upload_stats = merged
+        _save_category_upload_stats_cache(merged)
+        if self._stats_visible:
+            self._stats_view.refresh_from_cache()
+
+    _CATEGORY_UPLOAD_STATS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_category_upload_stats_from_ftp
+
+    def _sync_category_upload_stats_from_ftp(self):
+        """Refresca el mirror local del ranking de subidores por
+        categoría desde el FTP en segundo plano -- mismo patrón y mismo
+        freno que _sync_upload_stats_from_ftp. Se llama al entrar en
+        Estadísticas."""
+        now = _time.time()
+        if now - self._last_category_upload_stats_sync_ts < self._CATEGORY_UPLOAD_STATS_SYNC_MIN_INTERVAL:
+            return
+        self._last_category_upload_stats_sync_ts = now
+
+        remote_path = self._category_upload_stats_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_data, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_category_upload_stats(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_category_stat_addition_to_ftp(self, remote_path: str, size_bytes: int):
+        """Suma el tamaño de una subida OK a la carpeta de nivel superior a
+        la que pertenece (ver core/category_stats.py, panel "Por
+        categoría" de Estadísticas) -- llamado desde _save_history_entry.
+        Si remote_path no encaja con ninguna categoría configurada, o es un
+        archivo suelto sin carpeta propia, no hace nada (mismo criterio de
+        exclusión que sizes_by_top_level_folder)."""
+        from core.category_stats import resolve_category_and_folder
+        resolved = resolve_category_and_folder(
+            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}))
+        if resolved is None:
+            _log.info(
+                "Estadísticas: %r no encaja con ninguna categoría configurada (ftp_categories) -- "
+                "no se suma al recuento por categoría", remote_path)
+            return
+        category_id, category_name, folder_name = resolved
+        remote_stats_path = self._category_stats_remote_path()
+        if not remote_stats_path:
+            _log.info(
+                "Estadísticas: sin \"Carpeta compartida (datos)\" configurada -- "
+                "no se puede sumar %r al recuento por categoría", remote_path)
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.category_stats import add_folder_bytes, unwrap_from_remote, wrap_for_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning("Estadísticas: no se pudo conectar al FTP para sumar %r (%s)",
+                                 remote_path, _msg)
+                    return
+                raw = own_ftp.download_bytes(remote_stats_path)
+                remote_data = None
+                if raw:
+                    try:
+                        remote_data = unwrap_from_remote(_json.loads(raw.decode("utf-8")))
+                    except ValueError:
+                        remote_data = None
+                if remote_data is None:
+                    # Todavía sin una base de la versión de escaneo actual
+                    # (primera vez, o versión antigua pendiente de
+                    # recontar, ver SCAN_VERSION) -- no crear una base
+                    # nueva aquí con solo ESTA subida: eso "fijaría" la
+                    # versión con datos incompletos y el bootstrap real
+                    # (que sí recorre el servidor entero) ya no se
+                    # dispararía nunca (_sync_category_stats_from_ftp solo
+                    # arranca el bootstrap si remote_data sigue siendo
+                    # None). Se deja sin más: el bootstrap, cuando corra,
+                    # ya contará esta subida al escanear el estado real
+                    # del servidor.
+                    _log.info(
+                        "Estadísticas: %r (categoría %r) NO sumado todavía -- el archivo "
+                        "compartido de categorías aún no tiene una base válida (hace falta "
+                        "visitar la pestaña Estadísticas al menos una vez para que el "
+                        "bootstrap la cree; entonces esta subida ya se contará sola)",
+                        folder_name, category_name)
+                    return
+                merged = add_folder_bytes(remote_data, category_id, category_name, folder_name, size_bytes)
+                data = _json.dumps(wrap_for_remote(merged), ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_stats_path)
+                if up_ok:
+                    _log.info("Estadísticas: %r (categoría %r) sumado -- %d bytes",
+                              folder_name, category_name, size_bytes)
+                    self.after(0, lambda: self._apply_synced_category_stats(merged))
+                else:
+                    _log.warning("Estadísticas: no se pudo subir el recuento actualizado tras sumar %r (%s)",
+                                 folder_name, _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_category_stat_removal_to_ftp(self, ftp_path: str, size_bytes: int):
+        """Igual que _push_category_stat_addition_to_ftp, pero quitando la
+        carpeta borrada por completo -- llamado desde
+        _save_deletion_history_entry para todo borrado OK. size_bytes no se
+        usa (remove_folder quita el total ya conocido, no resta un valor
+        suelto); se recibe por simetría con el resto de hooks de borrado."""
+        from core.category_stats import resolve_category_and_folder
+        resolved = resolve_category_and_folder(
+            ftp_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}), is_folder_path=True)
+        if resolved is None:
+            _log.info(
+                "Estadísticas: %r no encaja con ninguna categoría configurada -- "
+                "no se resta del recuento por categoría", ftp_path)
+            return
+        category_id, _category_name, folder_name = resolved
+        remote_stats_path = self._category_stats_remote_path()
+        if not remote_stats_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.category_stats import remove_folder, unwrap_from_remote, wrap_for_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning("Estadísticas: no se pudo conectar al FTP para restar %r (%s)", ftp_path, _msg)
+                    return
+                raw = own_ftp.download_bytes(remote_stats_path)
+                remote_data = None
+                if raw:
+                    try:
+                        remote_data = unwrap_from_remote(_json.loads(raw.decode("utf-8")))
+                    except ValueError:
+                        remote_data = None
+                if remote_data is None:
+                    # Ver el mismo comentario en
+                    # _push_category_stat_addition_to_ftp -- no fijar una
+                    # base nueva de la versión de escaneo actual con solo
+                    # este borrado, dejar que el bootstrap real la
+                    # establezca.
+                    return
+                merged = remove_folder(remote_data, category_id, folder_name)
+                data = _json.dumps(wrap_for_remote(merged), ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_stats_path)
+                if up_ok:
+                    _log.info("Estadísticas: %r quitado del recuento por categoría", folder_name)
+                    self.after(0, lambda: self._apply_synced_category_stats(merged))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_category_stats(self, merged: dict):
+        from core.category_stats import save_local_cache as _save_category_stats_cache
+        self._shared_category_stats = merged
+        _save_category_stats_cache(merged)
+        if self._stats_visible:
+            self._stats_view.refresh_from_cache()
+
+    _CATEGORY_STATS_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_category_stats_from_ftp
+
+    def _sync_category_stats_from_ftp(self):
+        """Refresca el mirror local del recuento/tamaño por categoría desde
+        el FTP en segundo plano -- mismo patrón y mismo freno que
+        _sync_upload_stats_from_ftp. Se llama al entrar en Estadísticas.
+
+        Si el archivo remoto todavía no existe, está corrupto, O es de una
+        versión de escaneo antigua (ver core.category_stats.SCAN_VERSION --
+        sube cuando un fix cambia cómo se cuenta/agrupa, para que datos ya
+        calculados con la lógica vieja no se sigan aplicando tal cual para
+        siempre), y el bootstrap no se ha intentado todavía en esta sesión,
+        en vez de dejar el panel vacío o con datos desactualizados se
+        recorre el árbol completo del FTP UNA vez para sembrarlo de nuevo
+        con lo que ya hay en el servidor (ver _bootstrap_category_stats) --
+        después de eso, todo es incremental
+        (_push_category_stat_addition_to_ftp/_push_category_stat_removal_to_ftp)
+        y nunca se vuelve a recorrer el árbol entero."""
+        now = _time.time()
+        if now - self._last_category_stats_sync_ts < self._CATEGORY_STATS_SYNC_MIN_INTERVAL:
+            return
+        self._last_category_stats_sync_ts = now
+
+        remote_path = self._category_stats_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.category_stats import unwrap_from_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                remote_data = None
+                if raw:
+                    try:
+                        remote_data = unwrap_from_remote(_json.loads(raw.decode("utf-8")))
+                    except ValueError:
+                        remote_data = None
+                if not remote_data and not self._category_stats_bootstrap_done:
+                    remote_data = self._bootstrap_category_stats(own_ftp)
+                if remote_data:
+                    self.after(0, lambda: self._apply_synced_category_stats(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _bootstrap_category_stats(self, own_ftp) -> dict:
+        """Recorre el árbol completo del FTP UNA sola vez (nunca más
+        después de esto) para sembrar el archivo compartido de recuento/
+        tamaño por categoría -- mismo patrón que tenía
+        gui/stats_view.py antes de pasar a datos incrementales
+        (list_tree_recursive + sizes_by_top_level_folder por cada raíz de
+        ftp_categories, con fallback a list_dirs+get_folder_size si el
+        servidor no soporta LIST -R), MÁS los archivos sueltos directamente
+        en la raíz de cada categoría (típico de películas guardadas sin
+        carpeta propia) agrupados por nombre base -- mismo criterio que
+        _start_cleanup_scan en Liberar espacio (group_loose_files_by_name).
+        Sin esto, cualquier categoría organizada así (archivo por
+        archivo, no carpeta por carpeta) se contaría como vacía. Se llama
+        con una conexión YA abierta (own_ftp, reutilizada de
+        _sync_category_stats_from_ftp) -- no abre una segunda. Sube el
+        resultado al FTP antes de devolverlo.
+
+        Marca self._category_stats_bootstrap_done en True como primer
+        paso, con éxito o no, para no reintentar este escaneo caro en cada
+        sincronización si algo falla a mitad.
+
+        Todo el escaneo corre con el timeout del socket de control
+        ampliado (ver FTPClient.widened_timeout) -- el fijo de 15s puesto
+        en connect() basta para comandos sueltos, pero listar una
+        categoría con miles de archivos (películas sueltas, sin carpeta
+        propia) en un NAS lento puede tardar bastante más, y ese timeout
+        se comía el listado a mitad SIN avisar (ftplib.all_errors lo
+        atrapa igual que cualquier otro fallo de red), dejando la
+        categoría contada de menos o directamente vacía -- justo el
+        síntoma reportado ("hay cerca de 3000 películas, solo cuenta 3";
+        categorías enteras sin aparecer)."""
+        self._category_stats_bootstrap_done = True
+        from core.cleanup_candidates import group_loose_files_by_name
+        data = {}
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+        with own_ftp.widened_timeout(300):
+            for cat_list in cats.values():
+                for cat in cat_list:
+                    root = (cat.get("root") or "").rstrip("/")
+                    if not root:
+                        continue
+                    tree = own_ftp.list_tree_recursive(root)
+                    if tree is not None:
+                        sizes = sizes_by_top_level_folder(tree, root)
+                        root_files = tree.get(root, [])
+                        via = "LIST -R"
+                    else:
+                        sizes = {name: own_ftp.get_folder_size(f"{root}/{name}")
+                                 for name in own_ftp.list_dirs(root)}
+                        root_files = own_ftp.list_files_with_sizes(root)
+                        via = "list_dirs (sin soporte LIST -R)"
+                    loose_groups = group_loose_files_by_name(root_files)
+                    for base_name, group in loose_groups.items():
+                        sizes[base_name] = sizes.get(base_name, 0) + group["size_bytes"]
+                    _log.info(
+                        "Estadísticas: bootstrap categoría %r (%s) vía %s -- "
+                        "%d carpeta(s), %d archivo(s) suelto(s) en la raíz -> "
+                        "%d agrupado(s), %d elemento(s) en total",
+                        cat.get("name", root), root, via,
+                        len(sizes) - len(loose_groups), len(root_files), len(loose_groups), len(sizes))
+                    if sizes:
+                        data[cat.get("id", root)] = {"category_name": cat.get("name", root), "folders": sizes}
+        if not data:
+            return {}
+        from core.category_stats import wrap_for_remote
+        import json as _json
+        raw = _json.dumps(wrap_for_remote(data), ensure_ascii=False, indent=2).encode("utf-8")
+        own_ftp.upload_bytes(raw, self._category_stats_remote_path())
+        return data
 
     def _check_for_updates_at_startup(self):
         """Comprueba en segundo plano si hay una versión más nueva publicada
@@ -10288,6 +10992,17 @@ class App(_AppBase):
                 pass
             self._history_dirty = True
         self._push_activity_entry_to_ftp(entry, "subida")
+        if status == "ok":
+            # Ranking de subidas (ver core/upload_stats.py) -- solo
+            # subidas que de verdad terminaron bien, nunca errores.
+            self._push_upload_stat_to_ftp(entry["person"], size, entry["ts"])
+            # Recuento/tamaño por categoría (ver core/category_stats.py) --
+            # mismo criterio, solo subidas OK.
+            self._push_category_stat_addition_to_ftp(remote, size)
+            # Ranking de subidores DE ESA CATEGORÍA (ver
+            # core/category_upload_stats.py) -- un panel "Top subidores"
+            # por categoría en Estadísticas, aparte del ranking global.
+            self._push_category_upload_stat_to_ftp(remote, entry["person"], size, entry["ts"])
 
     # ── Historial de borrados ("Liberar espacio") -- mismo patrón que el
     # historial de subidas de arriba, en un archivo aparte para no
@@ -10334,6 +11049,13 @@ class App(_AppBase):
             except Exception:
                 pass
         self._push_activity_entry_to_ftp(entry, "borrado")
+        if status == "ok":
+            # Recuento/tamaño por categoría (ver core/category_stats.py) --
+            # solo borrados que de verdad terminaron bien.
+            self._push_category_stat_removal_to_ftp(ftp_path, size_bytes)
+            # Ranking de "limpiadores" (ver core/deletion_stats.py) --
+            # mismo criterio, solo borrados OK.
+            self._push_deletion_stat_to_ftp(entry["person"], size_bytes, entry["ts"])
 
     def _build_history_tab(self, parent):
         """Vista de historial integrada (igual que Episodios/Configuración,
