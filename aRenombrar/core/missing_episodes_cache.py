@@ -7,8 +7,8 @@ comprobar qué ha cambiado de verdad, en vez de repetir todo el trabajo cada
 vez.
 
 Formato: {tmdb_id_como_texto: {"name", "source", "server_id",
-"last_episode_id", "expected", "missing", "ai_verdict"}, "_meta":
-{"last_scan_ts": float}}
+"last_episode_id", "expected", "missing", "ignored", "ai_verdict"},
+"_meta": {"last_scan_ts": float, "scanned_by": str}}
 
 "ai_verdict" ({"veredicto", "motivo", "doblaje_castellano"?}, ver
 core/missing_episodes_ai.py) se guarda aparte, en gui/app.py::
@@ -17,7 +17,18 @@ parte del escaneo normal: un reescaneo completo reconstruye la entrada
 entera de cada serie (sin ai_verdict, para no arrastrar un veredicto que
 podría haber quedado desactualizado si el hueco real cambió), así que
 solo sobrevive entre sesiones si nadie ha vuelto a escanear esa serie a
-fondo desde que se preguntó."""
+fondo desde que se preguntó.
+
+Compartido entre clientes vía FTP (ver gui/app.py::
+_push_missing_episodes_to_ftp/_sync_missing_episodes_from_ftp), igual que
+"Liberar espacio" -- pero aquí SÍ hay dos campos por serie que son
+personales y NUNCA viajan por la red: "ignored" (que esta serie concreta
+no le interesa a ESTE cliente -- otro cliente puede tener una opinión
+distinta) y "ai_verdict" (que ya tiene su propio canal de compartición
+aparte, ver core/shared_dub_verdicts.py -- incluirlo aquí también
+duplicaría esa sincronización). strip_personal_fields()/
+merge_remote_into_local() son las dos funciones puras que separan esos
+campos personales del resto al subir/bajar."""
 
 import json
 
@@ -90,6 +101,49 @@ def remove_series_from_cache(cache: dict, tmdb_id: int) -> bool:
         return False
     del cache[key]
     return True
+
+
+_PERSONAL_FIELDS = ("ignored", "ai_verdict")
+
+
+def strip_personal_fields(cache: dict) -> dict:
+    """Copia de *cache* sin los campos personales de cada serie (ver el
+    docstring del módulo) -- lo que de verdad se sube al FTP compartido.
+    "_meta" se conserva tal cual (no es una serie, no tiene campos
+    personales)."""
+    result = {}
+    for key, entry in cache.items():
+        if key == "_meta":
+            result[key] = entry
+            continue
+        result[key] = {k: v for k, v in entry.items() if k not in _PERSONAL_FIELDS}
+    return result
+
+
+def merge_remote_into_local(local_cache: dict, remote_cache: dict) -> dict:
+    """Aplica *remote_cache* (ya sin campos personales, ver
+    strip_personal_fields) sobre *local_cache* -- cada serie se reemplaza
+    con los datos remotos, pero conservando "ignored"/"ai_verdict" de la
+    entrada LOCAL si ya existían (esos dos campos nunca viajan por la
+    red). Las series que ya no aparecen en remote_cache se quitan: lo
+    remoto es la fuente de verdad de "qué series se están vigilando" --
+    si ya no está ahí es porque se borró en otro cliente (ver
+    remove_series_from_cache). "_meta" se toma tal cual de remote_cache."""
+    result = {}
+    for key, remote_entry in remote_cache.items():
+        if key == "_meta":
+            result[key] = remote_entry
+            continue
+        merged = dict(remote_entry)
+        local_entry = local_cache.get(key)
+        if local_entry:
+            for field in _PERSONAL_FIELDS:
+                if field in local_entry:
+                    merged[field] = local_entry[field]
+        merged.setdefault("ignored", False)
+        merged.setdefault("ai_verdict", None)
+        result[key] = merged
+    return result
 
 
 def _reset_cache_for_tests() -> None:

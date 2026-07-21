@@ -395,13 +395,13 @@ def get_plex_machine_identifier(host: str, token: str, timeout: int = 10) -> Opt
         return None
 
 
-def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
+def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 120,
                              username: str = "") -> Optional[dict]:
     """Datos de uso real (vista/no vista, veces reproducida, fecha del
     último visionado, fecha de añadido) por serie y película en Jellyfin
-    -- para la herramienta de liberar espacio (core/cleanup_candidates.py),
-    que necesita saber qué contenido lleva mucho sin tocarse para
-    proponerlo como candidato a borrar.
+    -- para la herramienta de liberar espacio (core/cleanup_candidates.py)
+    y para la puntuación de tendencia (core/trending.py), que necesitan
+    saber qué contenido lleva mucho sin tocarse / cuánto se ha visto.
 
     UserData es por usuario, no global -- en un servidor familiar/
     compartido (varios usuarios), lo que importa para decidir qué borrar
@@ -419,7 +419,20 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
     "size_bytes"}, ...} o None si falla o no está configurado. size_bytes
     y date_added no dependen del usuario (son propiedades del archivo),
     así que se piden una sola vez, no una vez por usuario -- solo el
-    visionado en sí necesita consultarse por usuario."""
+    visionado en sí necesita consultarse por usuario.
+
+    timeout=120 (antes 20s): en un servidor con biblioteca grande y
+    muchos usuarios, la consulta recursiva de TODOS los episodios (sin
+    filtrar por serie) puede tardar bastante más de 20s por sí sola --
+    medido de verdad contra un servidor real con ~1400 series/películas y
+    ~14000 episodios: 45s la consulta principal, 23s la de episodios, EN
+    UN SOLO HILO SIN CONTENCIÓN (esta función lanza hasta 8 en paralelo,
+    uno por usuario, así que la contención real puede ser peor). Con 20s,
+    estas consultas fallaban con "Read timed out" para TODOS los
+    usuarios, esta función devolvía None, y toda la puntuación de
+    tendencia se quedaba vacía como si no hubiera datos de visionado en
+    absoluto -- aunque sí los hubiera y en abundancia (bug real: una
+    serie marcada como vista no aparecía con ninguna tendencia)."""
     if not host or not api_key:
         return None
     base = host.rstrip("/")
@@ -603,15 +616,18 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 20,
     return stats
 
 
-def get_plex_usage_stats(host: str, token: str, timeout: int = 20) -> Optional[dict]:
+def get_plex_usage_stats(host: str, token: str, timeout: int = 120) -> Optional[dict]:
     """Equivalente a get_jellyfin_usage_stats() pero para Plex -- datos de
     uso real (vista/no vista, veces reproducida, fecha del último
     visionado, fecha de añadido) por serie y película, para la
     herramienta de liberar espacio. Devuelve {rating_key: {"name",
     "tmdb_id", "media_type", "fully_watched", "play_count", "last_played",
     "date_added", "size_bytes"}, ...} o None si falla o no está
-    configurado. Las películas traen su tamaño directamente en el mismo
-    listado; para series hace falta una llamada extra por sección (no
+    configurado. timeout=120 (antes 20s) por el mismo motivo medido en
+    get_jellyfin_usage_stats -- una biblioteca grande puede tardar más de
+    20s en responder a un listado recursivo. Las películas traen su
+    tamaño directamente en el mismo listado; para series hace falta una
+    llamada extra por sección (no
     por serie) pidiendo los episodios, ya que Plex no agrega el tamaño
     total a nivel de serie -- sigue siendo mucho más rápido que calcularlo
     recorriendo el FTP carpeta por carpeta."""

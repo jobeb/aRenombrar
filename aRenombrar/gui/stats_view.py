@@ -78,6 +78,7 @@ class StatsView:
         self._build_contribution_panel(body)
         self._build_timeline_panel(body)
         self._build_recent_panel(body)
+        self._build_recent_deletions_panel(body)
 
     def _panel_frame(self, parent, title):
         frame = ctk.CTkFrame(parent, fg_color=("gray95", "gray17"), corner_radius=8)
@@ -156,6 +157,12 @@ class StatsView:
         self._recent_rows_fr = ctk.CTkFrame(self._recent_frame, fg_color="transparent", height=1)
         self._recent_rows_fr.pack(fill="x", padx=14, pady=(0, 12))
 
+    def _build_recent_deletions_panel(self, parent):
+        self._recent_deletions_frame = self._panel_frame(parent, "🗑 Últimos borrados")
+        self._recent_deletions_rows_fr = ctk.CTkFrame(self._recent_deletions_frame, fg_color="transparent",
+                                                        height=1)
+        self._recent_deletions_rows_fr.pack(fill="x", padx=14, pady=(0, 12))
+
     # --------------------------------------------------- datos en vivo --
 
     def refresh_from_cache(self):
@@ -171,6 +178,7 @@ class StatsView:
         self._refresh_contribution()
         self._refresh_timeline()
         self._refresh_recent()
+        self._refresh_recent_deletions()
 
     def _refresh_size_by_disk(self):
         from gui.app import PENDING_COLOR, _fmt_size
@@ -478,3 +486,25 @@ class StatsView:
             name = e.get("filename", "?")
             text = f"{person} subió {name} ({_fmt_size(e.get('size', 0))}) {_fmt_ago(e.get('ts', 0))}"
             ctk.CTkLabel(self._recent_rows_fr, text=text, anchor="w").pack(fill="x", pady=1)
+
+    def _refresh_recent_deletions(self):
+        """Mismo patrón que _refresh_recent, pero para borrados -- los
+        registros de borrado usan "name" (no "filename", ver
+        App._save_deletion_history_entry) para el nombre del elemento."""
+        from gui.app import PENDING_COLOR, _fmt_size
+
+        for w in self._recent_deletions_rows_fr.winfo_children():
+            w.destroy()
+        entries = [e for e in self.app._shared_activity_history
+                   if e.get("kind") == "borrado" and e.get("status", "ok") == "ok"]
+        entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
+        recent = entries[:8]
+        if not recent:
+            ctk.CTkLabel(self._recent_deletions_rows_fr, text="Sin borrados recientes.",
+                         text_color=PENDING_COLOR).pack(pady=8)
+            return
+        for e in recent:
+            person = e.get("person", "?")
+            name = e.get("name", "?")
+            text = f"{person} borró {name} ({_fmt_size(e.get('size', 0))}) {_fmt_ago(e.get('ts', 0))}"
+            ctk.CTkLabel(self._recent_deletions_rows_fr, text=text, anchor="w").pack(fill="x", pady=1)

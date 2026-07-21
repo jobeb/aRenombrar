@@ -607,6 +607,14 @@ class FileEntry:
             "confidence": self.confidence,
             "media_info": _mediainfo_to_dict(self.media_info) if self.media_info else None,
             "remote_dir_override": self.remote_dir_override,
+            # Ver App._file_size_text -- sin esto, un archivo ya procesado
+            # (movido a "procesados/" o borrado tras subir, según "Acción
+            # tras subir") se queda con la columna "Peso" en blanco justo
+            # tras reiniciar la app: entry.path ya no existe en disco, y
+            # sin el último tamaño conocido guardado aquí no hay nada que
+            # mostrar en su lugar (el caché en memoria no sobrevive un
+            # reinicio si no se persiste).
+            "last_known_size_bytes": self._last_known_size_bytes,
         }
 
     @classmethod
@@ -616,6 +624,9 @@ class FileEntry:
         entry.status     = d.get("status", "pendiente")
         entry.confidence = d.get("confidence", 0)
         entry.remote_dir_override = d.get("remote_dir_override")
+        entry._last_known_size_bytes = d.get("last_known_size_bytes")
+        if entry._last_known_size_bytes is not None:
+            entry._last_known_size_text = _fmt_size(entry._last_known_size_bytes)
         mi = d.get("media_info")
         if mi:
             from core.api_client import MediaInfo
@@ -994,6 +1005,8 @@ class App(_AppBase):
         self._last_category_stats_sync_ts = 0.0
         self._last_deletion_stats_sync_ts = 0.0
         self._last_category_upload_stats_sync_ts = 0.0
+        self._last_cleanup_candidates_sync_ts = 0.0
+        self._last_missing_episodes_sync_ts = 0.0
 
         # Mirror local de los veredictos de doblaje compartidos (ver
         # core/shared_dub_verdicts.py) -- último estado conocido antes de
@@ -1576,6 +1589,7 @@ class App(_AppBase):
             self._missing_ep_visible = True
             self._sync_favorites_from_ftp()
             self._sync_shared_dub_verdicts_from_ftp()
+            self._sync_missing_episodes_from_ftp()
         elif view_key == "history":
             self._history_frame.grid(row=0, column=0, sticky="nsew")
             self._history_visible = True
@@ -1586,6 +1600,7 @@ class App(_AppBase):
             self._cleanup_visible = True
             self._sync_favorites_from_ftp()
             self._sync_reservations_from_ftp()
+            self._sync_cleanup_candidates_from_ftp()
         elif view_key == "protected":
             self._protected_frame.grid(row=0, column=0, sticky="nsew")
             self._protected_visible = True
@@ -2321,6 +2336,20 @@ class App(_AppBase):
         archivo propio dentro de la misma carpeta compartida, mismo
         motivo que _reservations_remote_path."""
         return self._shared_data_path("aRenombrar_estadisticas_subidores_categoria.json")
+
+    def _cleanup_candidates_remote_path(self) -> str:
+        """Ruta remota de la lista compartida de "Liberar espacio" (ver
+        core/cleanup_candidates_cache.py) -- archivo propio dentro de la
+        misma carpeta compartida, mismo motivo que
+        _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_liberar_espacio.json")
+
+    def _missing_episodes_remote_path(self) -> str:
+        """Ruta remota de la caché compartida de "Episodios que faltan"
+        (ver core/missing_episodes_cache.py) -- archivo propio dentro de
+        la misma carpeta compartida, mismo motivo que
+        _reservations_remote_path."""
+        return self._shared_data_path("aRenombrar_episodios_que_faltan.json")
 
     def _sync_server_config_from_ftp(self):
         """Descarga la configuración compartida del servidor y la aplica en
@@ -3155,6 +3184,284 @@ class App(_AppBase):
                 if not isinstance(remote_data, dict):
                     return
                 self.after(0, lambda: self._apply_synced_category_upload_stats(remote_data))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_cleanup_candidates_to_ftp(self, items: list, last_scan_ts: float):
+        """Comparte el resultado de un análisis completo de "Liberar
+        espacio" (ver core/cleanup_candidates_cache.py) -- llamado tras
+        "Analizar servidor", para que el resto de clientes del mismo
+        servidor vean este resultado sin tener que repetir el análisis
+        (que puede tardar más de un minuto). A diferencia del recuento
+        por categoría (que suma/resta incrementalmente), un análisis
+        fresco SIEMPRE reemplaza la lista compartida entera -- acaba de
+        consultar el estado real del servidor, es la fuente más fiable
+        posible."""
+        remote_path = self._cleanup_candidates_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.cleanup_candidates_cache import wrap_for_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning("Liberar espacio: no se pudo conectar al FTP para compartir el análisis (%s)",
+                                 _msg)
+                    return
+                payload = wrap_for_remote(items, last_scan_ts, self.config_data.get("app_user_name", ""))
+                data = _json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    _log.info("Liberar espacio: análisis compartido con %d elemento(s)", len(items))
+                else:
+                    _log.warning("Liberar espacio: no se pudo subir el análisis compartido (%s)", _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_cleanup_deletion_to_ftp(self, ftp_path: str):
+        """Quita el elemento borrado de la lista compartida de "Liberar
+        espacio" -- llamado tras un borrado con éxito. A diferencia de
+        _push_cleanup_candidates_to_ftp (que reemplaza la lista entera
+        tras un análisis fresco), aquí solo hace falta descargar la lista
+        compartida actual, quitar ese elemento por su ftp_path, y volver
+        a subir -- no hace falta repetir el análisis completo solo para
+        reflejar un borrado."""
+        remote_path = self._cleanup_candidates_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.cleanup_candidates_cache import wrap_for_remote, unwrap_from_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                remote_data = None
+                if raw:
+                    try:
+                        remote_data = unwrap_from_remote(_json.loads(raw.decode("utf-8")))
+                    except ValueError:
+                        remote_data = None
+                if remote_data is None:
+                    return   # nada compartido todavía (o corrupto) -- nada que actualizar
+                remaining = [it for it in remote_data["items"] if it.ftp_path != ftp_path]
+                if len(remaining) == len(remote_data["items"]):
+                    return   # no estaba en la lista compartida -- nada que hacer
+                payload = wrap_for_remote(remaining, remote_data.get("last_scan_ts"),
+                                          remote_data.get("scanned_by", ""))
+                data = _json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    self.after(0, lambda: self._apply_synced_cleanup_candidates(
+                        {"items": remaining, "last_scan_ts": remote_data.get("last_scan_ts"),
+                         "scanned_by": remote_data.get("scanned_by", "")}, force=True))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_cleanup_candidates(self, payload: dict, force: bool = False):
+        """Aplica una lista de "Liberar espacio" ya sincronizada (de
+        _sync_cleanup_candidates_from_ftp o _push_cleanup_deletion_to_ftp)
+        -- guarda el mirror local y repinta si la pestaña está visible.
+        force=True se usa tras un borrado propio: ese resultado siempre
+        es el más fresco posible (se acaba de aplicar aquí mismo), así
+        que no tiene sentido comparar marcas de tiempo contra él."""
+        from core.cleanup_candidates_cache import save_cache
+        if not force:
+            current_ts = getattr(self, "_cleanup_last_scan_ts", None) or 0
+            if (payload.get("last_scan_ts") or 0) <= current_ts:
+                return   # lo que ya teníamos es igual de reciente o más -- no pisarlo
+        self._cleanup_raw_items = payload["items"]
+        self._cleanup_last_scan_ts = payload.get("last_scan_ts")
+        self._cleanup_scanned_by = payload.get("scanned_by", "")
+        try:
+            save_cache(self._cleanup_raw_items, self._cleanup_last_scan_ts, self._cleanup_scanned_by)
+        except Exception:
+            _log.warning("Liberar espacio: no se pudo guardar el mirror local tras sincronizar", exc_info=True)
+        if getattr(self, "_cleanup_visible", False):
+            self._populate_cleanup_category_filters()
+            self._apply_cleanup_filters()
+            age = _time.time() - self._cleanup_last_scan_ts if self._cleanup_last_scan_ts else None
+            when_txt = self._fmt_cleanup_scan_age(age)
+            by_txt = f" (por {self._cleanup_scanned_by})" if self._cleanup_scanned_by else ""
+            self._cleanup_status_lbl.configure(
+                text=f"Último análisis: {when_txt}{by_txt} -- pulsa \"Analizar servidor\" para actualizar")
+
+    _CLEANUP_CANDIDATES_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_cleanup_candidates_from_ftp
+
+    def _sync_cleanup_candidates_from_ftp(self):
+        """Refresca el mirror local de "Liberar espacio" desde el FTP en
+        segundo plano -- mismo patrón y mismo freno que
+        _sync_upload_stats_from_ftp. Se llama al entrar en Liberar
+        espacio. Solo se aplica si el resultado compartido es MÁS
+        RECIENTE que el que ya tenemos (ver _apply_synced_cleanup_candidates)
+        -- un análisis remoto viejo nunca pisa uno local más fresco."""
+        now = _time.time()
+        if now - self._last_cleanup_candidates_sync_ts < self._CLEANUP_CANDIDATES_SYNC_MIN_INTERVAL:
+            return
+        self._last_cleanup_candidates_sync_ts = now
+
+        remote_path = self._cleanup_candidates_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.cleanup_candidates_cache import unwrap_from_remote
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    payload = unwrap_from_remote(_json.loads(raw.decode("utf-8")))
+                except ValueError:
+                    return
+                if payload is None:
+                    return
+                self.after(0, lambda: self._apply_synced_cleanup_candidates(payload))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _push_missing_episodes_to_ftp(self):
+        """Comparte la caché ACTUAL de "Episodios que faltan" (ver
+        core/missing_episodes_cache.py) -- llamado tras cualquier cambio
+        local que la deje al día (escaneo completo, reescaneo de una
+        serie, quitar un episodio ya subido, quitar una serie borrada).
+        Reemplaza la lista compartida entera con lo que hay en local en
+        ESE momento, ya sin los campos personales ("ignored"/
+        "ai_verdict", ver strip_personal_fields) -- igual que Liberar
+        espacio, un resultado local recién actualizado es la fuente más
+        fiable posible, no hace falta fusionar nada aquí; la parte
+        delicada (no perder aportaciones de otros clientes) ya la cubre
+        strip_personal_fields/merge_remote_into_local en el lado de
+        aplicar, no en el de subir."""
+        remote_path = self._missing_episodes_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.missing_episodes_cache import load_cache, strip_personal_fields
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning(
+                        "Episodios que faltan: no se pudo conectar al FTP para compartir la caché (%s)", _msg)
+                    return
+                payload = strip_personal_fields(load_cache())
+                data = _json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    _log.info("Episodios que faltan: caché compartida con %d serie(s)",
+                              len([k for k in payload if k != "_meta"]))
+                else:
+                    _log.warning("Episodios que faltan: no se pudo subir la caché compartida (%s)", _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_synced_missing_episodes(self, remote_cache: dict):
+        """Aplica una caché de "Episodios que faltan" ya sincronizada
+        (de _sync_missing_episodes_from_ftp) -- fusiona sobre el mirror
+        local (conservando "ignored"/"ai_verdict" propios, ver
+        merge_remote_into_local), la guarda, y reconstruye
+        self._missing_ep_results con la MISMA función que ya usa el
+        arranque (_load_missing_episodes_from_cache), para no duplicar
+        esa derivación."""
+        from core.missing_episodes_cache import load_cache, save_cache, merge_remote_into_local
+        merged = merge_remote_into_local(load_cache(), remote_cache)
+        try:
+            save_cache(merged)
+        except Exception:
+            _log.warning("Episodios que faltan: no se pudo guardar el mirror local tras sincronizar",
+                         exc_info=True)
+            return
+        if getattr(self, "_missing_ep_visible", False):
+            self._missing_ep_results = self._load_missing_episodes_from_cache()
+            self._render_missing_episodes_table(reset_page=False)
+            self._update_missing_ep_status_text()
+
+    _MISSING_EPISODES_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_missing_episodes_from_ftp
+
+    def _sync_missing_episodes_from_ftp(self):
+        """Refresca el mirror local de "Episodios que faltan" desde el
+        FTP en segundo plano -- mismo patrón y mismo freno que
+        _sync_upload_stats_from_ftp. Se llama al entrar en Episodios que
+        faltan, justo antes de que el usuario pueda pulsar "Comprobar"/
+        "Reescaneo completo" -- así, un escaneo local siempre parte de la
+        base más reciente posible, sin arriesgarse a pisar con un
+        resultado desactualizado lo que ya hubiera compartido otro
+        cliente para una serie que este escaneo no llegue a tocar."""
+        now = _time.time()
+        if now - self._last_missing_episodes_sync_ts < self._MISSING_EPISODES_SYNC_MIN_INTERVAL:
+            return
+        self._last_missing_episodes_sync_ts = now
+
+        remote_path = self._missing_episodes_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_cache = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_cache, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_missing_episodes(remote_cache))
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
@@ -6298,6 +6605,7 @@ class App(_AppBase):
         cache = load_cache()
         if remove_missing_episode_from_cache(cache, tmdb_id, season, episode):
             save_cache(cache)
+            self._push_missing_episodes_to_ftp()
 
         self._render_missing_episodes_table(reset_page=False)
 
@@ -6320,6 +6628,7 @@ class App(_AppBase):
         cache = load_cache()
         if remove_series_from_cache(cache, tmdb_id):
             save_cache(cache)
+            self._push_missing_episodes_to_ftp()
 
         self._render_missing_episodes_table(reset_page=False)
 
@@ -7923,6 +8232,7 @@ class App(_AppBase):
 
         if not (missing or unknown_seasons):
             save_cache(cache)
+            self._push_missing_episodes_to_ftp()
             return []   # ya no le falta nada -- se quita de la lista
 
         # missing aquí es SOLO para mostrar -- cache_entry["missing"] se
@@ -7953,6 +8263,7 @@ class App(_AppBase):
         cache_entry["present_season_counts"] = {
             str(k): v for k, v in (new_row.get("server_season_counts") or {}).items()}
         save_cache(cache)
+        self._push_missing_episodes_to_ftp()
 
         if not (new_row["missing"] or new_row["unknown_seasons"]):
             return []
@@ -8375,8 +8686,12 @@ class App(_AppBase):
                         str(k): v for k, v in (r.get("server_season_counts") or {}).items()}
 
         import time as _time
-        cache["_meta"] = {"last_scan_ts": _time.time()}
+        cache["_meta"] = {"last_scan_ts": _time.time(), "scanned_by": self.config_data.get("app_user_name", "")}
         save_cache(cache)
+        # Compartir con el resto de clientes del mismo servidor -- ver
+        # _push_missing_episodes_to_ftp, para que no tengan que repetir
+        # este mismo escaneo (puede tardar minutos).
+        self._push_missing_episodes_to_ftp()
         return results
 
     def _build_ftp_episode_index(self, ftp_conn, cancel_event=None, progress_cb=None) -> dict:
@@ -11718,6 +12033,7 @@ class App(_AppBase):
         if cached.get("items"):
             self._cleanup_raw_items = cached["items"]
             self._cleanup_last_scan_ts = cached.get("last_scan_ts")
+            self._cleanup_scanned_by = cached.get("scanned_by", "")
             self._populate_cleanup_category_filters()
             # Diferido -- mismo motivo que en _build_missing_episodes_tab
             # y _build_history_tab: dibuja hasta 100 filas (paginado) de
@@ -11726,8 +12042,11 @@ class App(_AppBase):
             self.after(200, self._apply_cleanup_filters)
             age = _time.time() - self._cleanup_last_scan_ts if self._cleanup_last_scan_ts else None
             when_txt = self._fmt_cleanup_scan_age(age)
+            by_txt = f" (por {self._cleanup_scanned_by})" if self._cleanup_scanned_by else ""
             self._cleanup_status_lbl.configure(
-                text=f"Último análisis: {when_txt} -- pulsa \"Analizar servidor\" para actualizar")
+                text=f"Último análisis: {when_txt}{by_txt} -- pulsa \"Analizar servidor\" para actualizar")
+        else:
+            self._cleanup_scanned_by = ""
 
     @staticmethod
     def _fmt_cleanup_scan_age(age_seconds) -> str:
@@ -11789,6 +12108,7 @@ class App(_AppBase):
         self._cleanup_status_lbl.grid()
         self._cleanup_raw_items = items
         self._cleanup_last_scan_ts = _time.time()
+        self._cleanup_scanned_by = self.config_data.get("app_user_name", "")
         total_size = sum(it.size_bytes for it in items)
         ftp_count = getattr(self, "_cleanup_last_ftp_size_count", 0)
         extra = f" ({ftp_count} calculados por FTP, más lentos)" if ftp_count else ""
@@ -11799,9 +12119,13 @@ class App(_AppBase):
 
         from core.cleanup_candidates_cache import save_cache
         try:
-            save_cache(items, self._cleanup_last_scan_ts)
+            save_cache(items, self._cleanup_last_scan_ts, self._cleanup_scanned_by)
         except Exception:
             _log.warning("Liberar espacio: no se pudo guardar el caché del análisis", exc_info=True)
+        # Compartir con el resto de clientes del mismo servidor -- ver
+        # _push_cleanup_candidates_to_ftp, para que no tengan que repetir
+        # este mismo análisis (puede tardar más de un minuto).
+        self._push_cleanup_candidates_to_ftp(items, self._cleanup_last_scan_ts)
 
     def _scan_cleanup_candidates(self, progress_cb=None) -> list:
         """Combina Jellyfin/Plex (visionado) y FTP (tamaño, categoría) en
@@ -12518,9 +12842,14 @@ class App(_AppBase):
             # análisis guardado de antes del borrado).
             from core.cleanup_candidates_cache import save_cache
             try:
-                save_cache(self._cleanup_raw_items, getattr(self, "_cleanup_last_scan_ts", None) or _time.time())
+                save_cache(self._cleanup_raw_items, getattr(self, "_cleanup_last_scan_ts", None) or _time.time(),
+                          getattr(self, "_cleanup_scanned_by", ""))
             except Exception:
                 _log.warning("Liberar espacio: no se pudo actualizar el caché tras borrar", exc_info=True)
+            # Reflejarlo también en la lista compartida -- ver
+            # _push_cleanup_deletion_to_ftp (quita solo este elemento, no
+            # hace falta repetir el análisis completo).
+            self._push_cleanup_deletion_to_ftp(item.ftp_path)
             # Si la serie borrada también aparecía en "Episodios que
             # faltan" (con SOLO algunos episodios), esa fila ahora está
             # obsoleta -- ya no queda nada de ella en el servidor, así que
