@@ -105,6 +105,70 @@ def guess_title_via_ai(stem: str, api_key: str, model: str = DEFAULT_MODEL,
     return {"title": title, "junk_tokens": junk_tokens}
 
 
+COMIC_SYSTEM_PROMPT = (
+    "Eres un experto en comics y manga. Te doy el titulo de una coleccion/serie, "
+    "posiblemente traducido al castellano o mal formateado a partir de un nombre "
+    "de archivo. Responde con el titulo ORIGINAL tal cual se buscaria en "
+    "ComicVine (normalmente en ingles, o su romanizacion si es manga japones). "
+    "Responde SOLO con un JSON de una linea, sin texto adicional, con este "
+    "formato exacto:\n"
+    '{"original_title": "<titulo original>"}\n'
+    "Si no reconoces la serie, devuelve el mismo titulo que te di."
+)
+
+
+def guess_original_comic_title_via_ai(local_title: str, api_key: str, model: str = DEFAULT_MODEL,
+                                       timeout: int = 15) -> Optional[str]:
+    """Traduce *local_title* (título de cómic/manga detectado localmente,
+    a menudo en castellano) al título original con el que se buscaría en
+    ComicVine — su catálogo es mayoritariamente en inglés, así que buscar
+    con la traducción castellana falla casi siempre. Devuelve el título
+    original o None si falla cualquier cosa (sin key, red, formato
+    inesperado...). Nunca lanza — mismo contrato que guess_title_via_ai."""
+    if not api_key:
+        return None
+
+    _log.info("Consulta a Groq (modelo=%s) para traducir titulo de comic: %r", model, local_title)
+    try:
+        resp = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": COMIC_SYSTEM_PROMPT},
+                    {"role": "user", "content": local_title},
+                ],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {})
+    except Exception as e:
+        _log.warning("Fallo la consulta a Groq (traduccion de comic) para %r: %s", local_title, e)
+        return None
+
+    try:
+        parsed = json.loads(content)
+        original_title = (parsed.get("original_title") or "").strip()
+    except (ValueError, AttributeError) as e:
+        _log.warning("Respuesta de Groq (traduccion de comic) no parseable para %r: %s — %r",
+                     local_title, e, content)
+        return None
+
+    if not original_title:
+        _log.warning("Groq no devolvio original_title para %r — respuesta: %r", local_title, content)
+        return None
+
+    _log.info("Groq tradujo comic %r -> %r (tokens usados: %s)",
+              local_title, original_title, usage.get("total_tokens"))
+    return original_title
+
+
 def validate_api_key(api_key: str, timeout: int = 10) -> bool:
     """Comprueba que la API key de Groq es válida, sin gastar una consulta
     de verdad (solo pide el listado de modelos). Igual que guess_title_via_ai,

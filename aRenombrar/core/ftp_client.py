@@ -90,7 +90,7 @@ class FTPClient:
             "serie": _ftp_safe(serie),
             "temporada": season or 1,
             "año": year or "",
-            "tipo": "Series" if media_type == "tv" else "Películas",
+            "tipo": {"tv": "Series", "movie": "Películas", "libro": "Libros"}.get(media_type, "Películas"),
         }
         try:
             path = template.format(**replacements)

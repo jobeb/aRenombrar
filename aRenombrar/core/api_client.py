@@ -18,8 +18,14 @@ TMDB_IMAGE = "https://image.tmdb.org/t/p/w300"
 
 @dataclass
 class MediaInfo:
+    # Para libros/cómics (media_type="libro") esto aloja el id de Google
+    # Books o ComicVine (core/book_client.py, core/comicvine_client.py) --
+    # un string, no un int de TMDB. Reutilización deliberada: evita un
+    # campo nuevo solo para un tercer origen de datos, y el resto del
+    # código que lo toca (comparaciones de igualdad ya filtradas por
+    # media_type, serialización a JSON) no le importa el tipo real.
     tmdb_id: int
-    media_type: str          # "tv" | "movie"
+    media_type: str          # "tv" | "movie" | "libro"
     title: str               # nombre limpio
     original_title: str
     year: str
@@ -328,7 +334,8 @@ def _find_junk_start(text: str, extra_junk_terms: Optional[list] = None) -> int:
     return earliest
 
 
-def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> dict:
+def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
+                    is_book: bool = False, is_comic: bool = False) -> dict:
     """
     Extrae de un nombre de archivo: season, episode, título limpio, tipo.
 
@@ -336,6 +343,39 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
     en esta llamada concreta (sin persistir) — los usa el fallback de IA
     (core/ai_title_fallback.py) para probar si limpian el título antes de
     aprenderlos de verdad vía core/learned_terms.py.
+
+    is_book: el llamador (gui/app.py, vía core.renamer.is_book_file) ya
+    sabe por la extensión que esto es un libro/cómic, no un vídeo -- en
+    ese caso se evita POR COMPLETO la cadena EPISODE_PATTERNS (pensada
+    para nombres de episodio de TV/anime) y se devuelve media_type="libro"
+    directamente. Necesario porque esos patrones son puro texto: un cómic
+    como "One Piece - 1078.cbz" haría falso positivo con el patrón
+    numérico de anime y se le asignaría un "episodio" que no tiene sentido
+    para un libro.
+
+    is_comic: subcaso de is_book -- a diferencia de un ebook de texto, un
+    cómic SÍ suele traer un número de emisión fiable en el propio nombre
+    de archivo, normalmente con el formato "#NN" (confirmado contra cómics
+    reales: "Avatar - The Last Airbender - The Promise (2012) #01.cbr").
+    Si NO hay "#" (visto de verdad: escaneos que numeran el número suelto,
+    sin ningún símbolo -- "Avatar La Busqueda 01.cbr"), se prueba un
+    segundo patrón: un número de 1-4 dígitos, con CERO O MÁS grupos entre
+    corchetes/paréntesis opcionales detrás (créditos de escaneo/grupo, año...
+    puede haber varios seguidos, p.ej. "World War Hulk 2 [por UltronXII]
+    [CRG].cbr" -- dos grupos distintos tras el número) -- mismo criterio que
+    ya usa EPISODE_PATTERNS para anime sin indicador propio (última entrada
+    de la lista). Sin el "#" como ancla inequívoca, esto puede confundir un
+    año suelto de 4 dígitos con el número de emisión (mismo riesgo ya
+    aceptado para anime) -- pero sin él, CUALQUIER cómic numerado sin "#" se
+    quedaba siempre en el episodio 1 por defecto (ver
+    core/renamer.py::build_new_name, "episodio": info.episode or 1), bug
+    real visto primero con una trilogía completa subida tres veces como
+    "#1", y de nuevo con una colección (World War Hulk) donde CADA número
+    de grapa se perdía porque el patrón solo toleraba UN grupo final entre
+    corchetes, no varios seguidos. Si se encuentra cualquiera de los dos
+    patrones, se extrae como "episode" -- igual que ya se hace con el
+    episodio de una serie -- para poder renombrar con ese número real en
+    vez de perderlo.
 
     "extra_episodes": lista de episodios adicionales cuando el archivo
     empaqueta más de uno (p.ej. "Serie 7x21-7x22 Título.avi", un doble
@@ -345,6 +385,39 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None) -> di
     del archivo, así que el renombrado (que solo usa esos dos) no cambia.
     """
     stem = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)  # quitar extensión
+
+    if is_book:
+        if is_comic:
+            m = re.search(r"#\s*(\d{1,4})", stem)
+            if not m:
+                # "*" (no "?"): puede haber VARIOS grupos entre corchetes
+                # seguidos tras el número (créditos de escaneo/grupo, p.ej.
+                # "World War Hulk 2 [por UltronXII][CRG].cbr" -- dos grupos
+                # distintos, uno con el nombre del escaneador y otro con el
+                # grupo). Con "?" (como mucho uno) esto no encontraba nada
+                # en ningún archivo con más de un grupo final, y el número
+                # de grapa se perdía siempre (caía al 1 por defecto, ver
+                # core/renamer.py::build_new_name) aunque hubiera un número
+                # de verdad justo antes de esos corchetes.
+                m = re.search(r"[\s\-_](\d{1,4})(?:\s*[\[\(][^\]\)]*[\]\)])*\s*$", stem)
+            if m:
+                title = _clean_title(stem[:m.start()], extra_junk_terms)
+                return {
+                    "title": title,
+                    "season": None,
+                    "episode": int(m.group(1)),
+                    "media_type": "libro",
+                    "raw_match": m.group(),
+                    "extra_episodes": [],
+                }
+        return {
+            "title": _clean_title(stem, extra_junk_terms),
+            "season": None,
+            "episode": None,
+            "media_type": "libro",
+            "raw_match": None,
+            "extra_episodes": [],
+        }
 
     for pattern, media_type in EPISODE_PATTERNS:
         m = re.search(pattern, stem)

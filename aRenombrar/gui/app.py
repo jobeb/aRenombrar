@@ -24,7 +24,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import requests
 from io import BytesIO
 
@@ -36,14 +36,18 @@ except ImportError:
 
 from config import Config, CONFIG_EXPORT_SCHEMA_VERSION
 from core.api_client import TMDBClient, detect_episode, MediaInfo, TMDB_IMAGE
-from core.renamer import build_new_name, rename_file, is_video_file, get_extension
+from core.book_client import GoogleBooksClient
+from core.comicvine_client import ComicVineClient
+from core.openlibrary_client import OpenLibraryClient
+from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
+                           is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
 from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively
 from core.ftp_categories import choose_category, new_category_id
 from core.upload_slots import UploadSlotManager
 from gui.table_view import TableView, ColumnSpec
-from core.appdirs import app_data_dir, is_windows, is_macos
+from core.appdirs import app_data_dir, is_windows, is_macos, is_linux
 from core.applog import get_logger
 from core.version import __version__
 from core.trending import trending_score, format_trending_score
@@ -89,27 +93,6 @@ def _fit_text(text: str, px_width: int, font) -> str:
         else:
             hi = mid - 1
     return text[:lo] + ellipsis if lo > 0 else ellipsis
-
-
-def _truncate_dropdown_labels(labels: list, px_width: int, font) -> list:
-    """Recorta cada etiqueta a px_width con _fit_text, y desambigua las que
-    queden idénticas tras recortar (p.ej. dos series con el mismo prefijo
-    largo) añadiendo un contador — necesario porque el desplegable y las
-    búsquedas posteriores identifican el resultado elegido por el texto
-    exacto de la etiqueta (vals.index(value)), y dos etiquetas iguales
-    harían que siempre se eligiera la primera."""
-    seen = {}
-    result = []
-    for label in labels:
-        short = _fit_text(label, px_width, font)
-        if short in seen:
-            seen[short] += 1
-            suffix = f" ({seen[short]})"
-            short = _fit_text(label, max(px_width - font.measure(suffix), 0), font) + suffix
-        else:
-            seen[short] = 1
-        result.append(short)
-    return result
 
 
 def _fmt_speed(bps):
@@ -482,6 +465,54 @@ class _UnsavedSettingsDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class _ConfirmDialog(ctk.CTkToplevel):
+    """Diálogo modal de confirmación genérico Sí/No, mismo estilo que el
+    resto de la app (ver _ConfirmDeleteDialog/_UnsavedSettingsDialog) en
+    vez del messagebox nativo del sistema, que desentona con el tema
+    oscuro. Para confirmaciones con más de una acción posible o texto muy
+    a medida, sigue teniendo sentido una clase dedicada como esas dos --
+    esta es para el caso simple "¿continuar sí o no?" con un mensaje
+    largo, que se repetía copiado en varios sitios vía messagebox.askyesno."""
+    def __init__(self, parent, title: str, heading: str, body: str,
+                 confirm_text: str = "Continuar", confirm_color=None,
+                 cancel_text: str = "Cancelar"):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.result = False
+        self.title(title)
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+
+        ctk.CTkLabel(self, text=heading, font=ctk.CTkFont(size=14, weight="bold"),
+                     wraplength=440, justify="left").pack(padx=24, pady=(22, 6))
+        ctk.CTkLabel(self, text=body, font=ctk.CTkFont(size=12),
+                     text_color=PENDING_COLOR, wraplength=440, justify="left").pack(padx=24, pady=(0, 18))
+
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(padx=24, pady=(0, 20))
+        ctk.CTkButton(bf, text=cancel_text, width=120, fg_color="transparent", border_width=1,
+                      command=lambda: self._close(False)).pack(side="left", padx=6)
+        ctk.CTkButton(bf, text=confirm_text, width=180,
+                      fg_color=confirm_color or ACCENT, hover_color=ACCENT_HOVER,
+                      command=lambda: self._close(True)).pack(side="left", padx=6)
+
+        self.update_idletasks()
+        dw = max(490, self.winfo_reqwidth())
+        dh = self.winfo_reqheight()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._close(False))
+        self.wait_window()
+
+    def _close(self, result: bool):
+        self.result = result
+        self.destroy()
+
+
 class _ConfirmDeleteDialog(ctk.CTkToplevel):
     """Diálogo modal de confirmación antes de borrar algo del servidor de
     verdad -- la acción más peligrosa de toda la app. Deliberadamente sin
@@ -583,7 +614,9 @@ class FileEntry:
         self.path         = str(Path(path))
         self.name         = Path(path).name
         self.ext          = get_extension(path)
-        self.detected     = detect_episode(self.name)
+        self.is_book      = is_book_file(self.path)
+        self.is_comic     = is_comic_file(self.path)
+        self.detected     = detect_episode(self.name, is_book=self.is_book, is_comic=self.is_comic)
         self.media_info   = None
         self.new_name     = ""
         self.status       = "pendiente"
@@ -607,6 +640,11 @@ class FileEntry:
             "confidence": self.confidence,
             "media_info": _mediainfo_to_dict(self.media_info) if self.media_info else None,
             "remote_dir_override": self.remote_dir_override,
+            # Solo relevante para libros/cómics (self.is_book) -- persiste
+            # la elección manual de _set_book_comic_type, que si no se
+            # perdería al reiniciar la app (from_dict() recalcularía is_comic
+            # solo por extensión, como al añadir el archivo por primera vez).
+            "is_comic": self.is_comic,
             # Ver App._file_size_text -- sin esto, un archivo ya procesado
             # (movido a "procesados/" o borrado tras subir, según "Acción
             # tras subir") se queda con la columna "Peso" en blanco justo
@@ -624,6 +662,14 @@ class FileEntry:
         entry.status     = d.get("status", "pendiente")
         entry.confidence = d.get("confidence", 0)
         entry.remote_dir_override = d.get("remote_dir_override")
+        # Restaura la elección manual de _set_book_comic_type si difiere de
+        # la que ya sale por extensión (is_comic_file en core/renamer.py) --
+        # hay que recalcular entry.detected también, porque se calculó en
+        # cls(d["path"]) con el is_comic por defecto, no con el guardado.
+        saved_is_comic = d.get("is_comic")
+        if entry.is_book and saved_is_comic is not None and saved_is_comic != entry.is_comic:
+            entry.is_comic = saved_is_comic
+            entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic)
         entry._last_known_size_bytes = d.get("last_known_size_bytes")
         if entry._last_known_size_bytes is not None:
             entry._last_known_size_text = _fmt_size(entry._last_known_size_bytes)
@@ -723,6 +769,17 @@ class App(_AppBase):
         self.config_data = Config()
         _mark("Config()")
         self.tmdb = TMDBClient(self.config_data["tmdb_api_key"])
+        # Identificación de libros/cómics (ver core/book_client.py,
+        # core/comicvine_client.py, core/openlibrary_client.py) -- mismo
+        # patrón que self.tmdb. OpenLibrary es el proveedor PRINCIPAL para
+        # libros de texto (sin API Key nunca, y más fiable que Google Books
+        # desde que su backend empezó a fallar de forma intermitente y
+        # persistente) -- Google Books queda como apoyo automático (ver
+        # core/book_identify.py). google_books_api_key sigue siendo opcional,
+        # igual que comicvine_api_key.
+        self.book_client = GoogleBooksClient(self.config_data.get("google_books_api_key", ""))
+        self.comicvine = ComicVineClient(self.config_data.get("comicvine_api_key", ""))
+        self.openlibrary_client = OpenLibraryClient()
         self.ftp  = FTPClient()
         # self.ftp es una única conexión de control compartida con AutoWatcher
         # (ver _toggle_auto) y con varias comprobaciones de fondo de la propia
@@ -742,6 +799,13 @@ class App(_AppBase):
         self._reservations = _load_reservations_cache()
         self.files = []
         self._selected_entry = None
+        # Selección múltiple con Ctrl/Shift+clic (ver _on_row_click) --
+        # entradas ADICIONALES al ancla (self._selected_entry, que sigue
+        # siendo la única que alimenta el panel de detalles/búsqueda). Usado
+        # por "Asignar a la selección" para aplicar el mismo resultado a
+        # varios archivos a la vez, cada uno con su propio episodio/número
+        # ya detectado (ver _assign_to_selection_worker).
+        self._multi_selected = set()
 
         self._upload_queue          = []
         self._upload_cancel         = threading.Event()
@@ -1341,7 +1405,9 @@ class App(_AppBase):
             self._watcher = AutoWatcher(
                 folder, self.config_data, self.tmdb, self.ftp,
                 self._on_auto_event, self._on_auto_file_event,
-                upload_slots=self._upload_slots, ftp_lock=self._ftp_cmd_lock)
+                upload_slots=self._upload_slots, ftp_lock=self._ftp_cmd_lock,
+                comicvine_client=self.comicvine, book_client=self.book_client,
+                openlibrary_client=self.openlibrary_client)
             self._watcher.start()
             self._auto_btn.configure(
                 text="⏹ Detener", width=90, fg_color="#c0392b", hover_color="#96281b",
@@ -1939,6 +2005,23 @@ class App(_AppBase):
         self._autosize_textbox(self._detail_overview)
         self._autosize_textbox(self._detail_error)
 
+    @staticmethod
+    def _make_uk_flag_image(w=20, h=14):
+        """Bandera del Reino Unido dibujada a mano con PIL (simplificada,
+        sin pretensión de exactitud heráldica) -- ver _build_detail_panel
+        para por qué no se usa el emoji 🇬🇧."""
+        img = Image.new("RGB", (w, h), (0, 36, 125))          # azul marino
+        draw = ImageDraw.Draw(img)
+        draw.line([(0, 0), (w, h)], fill=(255, 255, 255), width=3)     # aspas blancas
+        draw.line([(0, h), (w, 0)], fill=(255, 255, 255), width=3)
+        draw.line([(0, 0), (w, h)], fill=(200, 16, 46), width=1)       # aspas rojas, más finas
+        draw.line([(0, h), (w, 0)], fill=(200, 16, 46), width=1)
+        draw.rectangle([0, h // 2 - 3, w, h // 2 + 2], fill=(255, 255, 255))   # cruz blanca
+        draw.rectangle([w // 2 - 3, 0, w // 2 + 2, h], fill=(255, 255, 255))
+        draw.rectangle([0, h // 2 - 1, w, h // 2 + 1], fill=(200, 16, 46))     # cruz roja
+        draw.rectangle([w // 2 - 1, 0, w // 2 + 1, h], fill=(200, 16, 46))
+        return img
+
     def _build_detail_panel(self, parent):
         panel = ctk.CTkFrame(parent, width=255)
         panel.grid_propagate(False)
@@ -1950,9 +2033,22 @@ class App(_AppBase):
         search_top.grid(row=0, column=0, sticky="ew", padx=8, pady=(10, 4))
         search_top.columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(search_top, text="Buscar en TMDB:",
-                     font=ctk.CTkFont(size=11), anchor="w").grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        search_label_row = ctk.CTkFrame(search_top, fg_color="transparent")
+        search_label_row.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        self._search_label = ctk.CTkLabel(search_label_row, text="Buscar en TMDB:",
+                     font=ctk.CTkFont(size=11), anchor="w")
+        self._search_label.pack(side="left")
+        # Bandera del Reino Unido -- indica que ComicVine hay que buscarlo
+        # en inglés (ver core/comicvine_client.py, project_comicvine_original_
+        # title_search en memoria). Dibujada con PIL en vez de un emoji de
+        # bandera (🇬🇧): los emoji de bandera son secuencias de dos
+        # "regional indicator" que Tk no compone en este sistema -- se ven
+        # como un recuadro/letras sueltas en vez de una bandera (mismo tipo
+        # de artefacto ya visto con ▶◀▼, ver memoria del proyecto).
+        self._uk_flag_image = ctk.CTkImage(self._make_uk_flag_image(), size=(20, 14))
+        self._search_lang_flag = ctk.CTkLabel(search_label_row, image=self._uk_flag_image, text="")
+        self._search_lang_flag.pack(side="left", padx=(5, 0))
+        self._search_lang_flag.pack_forget()   # oculta salvo para cómics -- ver _reset_search_panel
         # Un único campo hace de buscador y de desplegable de resultados:
         # se escribe el título y se pulsa Enter/"Buscar", y el propio campo
         # se convierte en el desplegable para elegir entre los resultados
@@ -1960,22 +2056,62 @@ class App(_AppBase):
         # CTkComboBox aparte para el resultado). Elegir un resultado del
         # desplegable solo lo PREVISUALIZA (póster, sinopsis...) — no se
         # aplica a la entrada hasta pulsar "Asignar".
-        self._search_dropdown_font = ctk.CTkFont()   # usada para recortar las etiquetas del desplegable a su ancho
+        # dropdown_font: el desplegable es un menú nativo del SO que se
+        # autoajusta solo al título más largo que se le pase (no al ancho
+        # del campo de texto) -- por eso ya no hace falta recortar las
+        # etiquetas antes de pasarlas, ver _apply_search_results.
+        self._search_dropdown_font = ctk.CTkFont()
         self._result_combo = ctk.CTkComboBox(search_top, values=[],
-                                              command=self._on_result_preview)
+                                              command=self._on_result_preview,
+                                              dropdown_font=self._search_dropdown_font)
         self._result_combo.set("")
         self._result_combo.grid(row=1, column=0, sticky="ew")
         self._result_combo.bind("<Return>", lambda _: self._manual_search(use_ai_fallback=True))
         # Búsqueda automática mientras se escribe (con un pequeño retardo
         # para no lanzar una petición a TMDB en cada pulsación).
         self._result_combo.bind("<KeyRelease>", self._on_search_key_release)
+        # Flechas arriba/abajo: recorren los resultados ya obtenidos con
+        # vista previa en vivo (póster/sinopsis/título), sin necesidad de
+        # abrir el desplegable -- ver _cycle_search_result.
+        self._result_combo.bind("<Down>", lambda e: self._cycle_search_result(1))
+        self._result_combo.bind("<Up>", lambda e: self._cycle_search_result(-1))
         self._search_debounce_id = None
         ctk.CTkButton(search_top, text="Buscar", width=60,
                       command=lambda: self._manual_search(use_ai_fallback=True)).grid(row=1, column=1, padx=(4, 0))
-        ctk.CTkButton(search_top, text="Asignar", width=200,
-                      command=self._assign_selected_result).grid(
+        # Texto dinámico: "Asignar" con un solo archivo (ancla), "Asignar a
+        # la selección (N)" con varios marcados vía Ctrl/Shift+clic -- ver
+        # _update_assign_button_label/_current_selection.
+        self._assign_btn = ctk.CTkButton(search_top, text="Asignar", width=200,
+                      command=self._assign_selected_result)
+        self._assign_btn.grid(
             row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        # Solo para cómics (ver _reset_search_panel, que la muestra/oculta
+        # al cambiar de selección) -- ComicVine falla casi siempre con el
+        # título detectado localmente en castellano, este botón pide a la
+        # IA el título original y reintenta (ver _manual_ai_translate_comic).
+        self._ai_translate_comic_btn = ctk.CTkButton(
+            search_top, text="🪄 IA: título original", width=200,
+            fg_color="transparent", border_width=1,
+            command=self._manual_ai_translate_comic)
+        self._ai_translate_comic_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self._ai_translate_comic_btn.grid_remove()
         self._tmdb_results = []
+        # Qué cliente produjo self._tmdb_results -- "tmdb" | "book" | "comic"
+        # (ver _manual_search_worker) -- necesario porque cada uno devuelve
+        # resultados con forma distinta, así que construir el MediaInfo
+        # final (_build_info_from_result) o la etiqueta del desplegable
+        # (_apply_search_results) tiene que saber a cuál preguntar.
+        self._results_kind = "tmdb"
+        # Índice del resultado que se ve AHORA MISMO en el panel de
+        # detalles (póster, sinopsis...) -- ver _preview_result. "Asignar"
+        # lo usa como último recurso si el texto del desplegable no
+        # coincide con ningún valor (ver _assign_selected_result): tras
+        # buscar, el primer resultado se previsualiza solo, pero el campo
+        # se deja con lo que el usuario escribió (para poder seguir
+        # afinando la búsqueda) -- sin este índice, "Asignar" no
+        # encontraba ninguna coincidencia y no hacía nada, en silencio,
+        # aunque la portada y la info YA estuvieran a la vista.
+        self._previewed_result_idx = -1
 
         # -- Zona inferior: detalles con scroll --
         scroll = ctk.CTkScrollableFrame(panel, fg_color="transparent", label_text="")
@@ -1984,6 +2120,18 @@ class App(_AppBase):
 
         self._poster_label = ctk.CTkLabel(scroll, text="", width=180, height=220)
         self._poster_label.pack(pady=(4, 2))
+        # Imagen 1x1 transparente real -- CTkLabel.configure(image=None) NO
+        # limpia una imagen ya puesta (bug de customtkinter 5.2.2::
+        # CTkLabel._update_image: si self._image queda en None, ni la rama
+        # de CTkImage ni la de "elif self._image is not None" se ejecutan,
+        # así que el tkinter.Label interno se queda con la imagen anterior
+        # detrás del texto nuevo -- visto de verdad: "Sin carátula" escrito
+        # encima de la portada del resultado anterior al cambiar de
+        # selección). Pasar esta imagen transparente en vez de None fuerza
+        # el borrado real -- ver _set_poster.
+        self._blank_poster_image = ctk.CTkImage(
+            Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(180, 260))
+        self._overview_token = None   # token de la carga en curso de sinopsis de OpenLibrary (ver _load_openlibrary_description)
         # CTkTextbox (no CTkLabel) para el título, la sinopsis y el error: de
         # solo lectura (state="disabled") pero seleccionable y copiable con
         # ratón/teclado, a diferencia de un CTkLabel normal.
@@ -2049,7 +2197,7 @@ class App(_AppBase):
         "datos2" en "/datos2/series/") -- así, si varias categorías comparten
         disco (Series y SeriesPeques bajo /datos2/), no se consulta ni se
         muestra dos veces. Devuelve {nombre_disco: root_representativo}."""
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         roots = [c.get("root", "") for c in cats.get("tv", []) + cats.get("movie", [])]
         disks = {}
         for root in roots:
@@ -2413,6 +2561,70 @@ class App(_AppBase):
         self._set_status(
             f"Configuración de servidor actualizada ({len(updates)} parámetro(s))", PENDING_COLOR)
 
+    def _discard_local_server_config(self):
+        """Botón "Descartar cambios y recuperar del servidor" en Ajustes →
+        Servidor -- a diferencia de _sync_server_config_from_ftp (que se
+        llama en silencio al arrancar y no dice nada si falla, para no
+        molestar con un error en cada inicio), esto es una acción
+        explícita del usuario: SIEMPRE informa del resultado, éxito o
+        error, incluyendo el caso de que nadie haya publicado nunca una
+        configuración."""
+        remote_path = self._server_config_remote_path()
+        if not remote_path:
+            messagebox.showwarning(
+                "Falta la carpeta compartida",
+                "Configura \"Carpeta compartida (datos)\" en Ajustes → Cliente → Conexión FTP "
+                "antes de recuperar la configuración del servidor.")
+            return
+        if not _ConfirmDialog(
+                self, "Descartar configuración local",
+                "¿Descartar tu configuración local y recuperar la del servidor?",
+                "Esto sustituirá tu configuración local de esta pestaña (TMDB/IA -- incluidas las "
+                "claves de API --, plantillas de nombre, categorías FTP, Plex/Jellyfin -- incluidos "
+                "sus tokens --, enlaces y la cuota de reservas) por la última publicada en el "
+                "servidor, descartando cualquier cambio sin publicar que tengas aquí.",
+                confirm_text="Sí, descartar y recuperar", confirm_color=ERROR_COLOR).result:
+            return
+
+        self._set_status("Recuperando configuración del servidor...", PENDING_COLOR)
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.server_config import filter_shared_config
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    self.after(0, lambda: self._set_status(f"No se pudo conectar: {msg}", ERROR_COLOR))
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    self.after(0, lambda: self._set_status(
+                        "Nadie ha publicado todavía una configuración de servidor", WARNING_COLOR))
+                    return
+                try:
+                    remote_data = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    self.after(0, lambda: self._set_status(
+                        "El archivo de configuración del servidor está corrupto", ERROR_COLOR))
+                    return
+                if not isinstance(remote_data, dict):
+                    self.after(0, lambda: self._set_status(
+                        "El archivo de configuración del servidor tiene un formato inesperado", ERROR_COLOR))
+                    return
+                updates = filter_shared_config(remote_data)
+                learned_terms = remote_data.get("learned_junk_terms")
+                self.after(0, lambda: self._apply_synced_server_config(updates, learned_terms))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
     def _publish_server_config(self):
         """Sube la configuración de ESTE equipo como la configuración
         compartida del servidor -- a diferencia de favoritos/reservas
@@ -2430,13 +2642,14 @@ class App(_AppBase):
                 "Configura \"Carpeta compartida (datos)\" en Ajustes → Cliente → Conexión FTP "
                 "antes de publicar la configuración del servidor.")
             return
-        if not messagebox.askyesno(
-                "Publicar configuración del servidor",
+        if not _ConfirmDialog(
+                self, "Publicar configuración del servidor",
+                "¿Publicar la configuración de este equipo como la del servidor?",
                 "Esto sobrescribirá la configuración compartida (TMDB/IA -- incluidas las claves de "
                 "API --, plantillas de nombre, categorías FTP, Plex/Jellyfin -- incluidos sus tokens --, "
                 "enlaces y la cuota de reservas) con la de este equipo. Cualquier otra persona que use "
-                "aRenombrar contra este servidor la adoptará la próxima vez que abra la app. "
-                "¿Continuar?"):
+                "aRenombrar contra este servidor la adoptará la próxima vez que abra la app.",
+                confirm_text="Sí, publicar").result:
             return
 
         from core.server_config import extract_shared_config
@@ -3091,7 +3304,7 @@ class App(_AppBase):
         de subida, igual que core/upload_stats.py."""
         from core.category_stats import resolve_category_and_folder
         resolved = resolve_category_and_folder(
-            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}))
+            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}))
         if resolved is None:
             return
         category_id, category_name, _folder_name = resolved
@@ -3475,7 +3688,7 @@ class App(_AppBase):
         exclusión que sizes_by_top_level_folder)."""
         from core.category_stats import resolve_category_and_folder
         resolved = resolve_category_and_folder(
-            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}))
+            remote_path, self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}))
         if resolved is None:
             _log.info(
                 "Estadísticas: %r no encaja con ninguna categoría configurada (ftp_categories) -- "
@@ -3553,7 +3766,7 @@ class App(_AppBase):
         suelto); se recibe por simetría con el resto de hooks de borrado."""
         from core.category_stats import resolve_category_and_folder
         resolved = resolve_category_and_folder(
-            ftp_path, self.config_data.get("ftp_categories", {"tv": [], "movie": []}), is_folder_path=True)
+            ftp_path, self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}), is_folder_path=True)
         if resolved is None:
             _log.info(
                 "Estadísticas: %r no encaja con ninguna categoría configurada -- "
@@ -3700,7 +3913,7 @@ class App(_AppBase):
         self._category_stats_bootstrap_done = True
         from core.cleanup_candidates import group_loose_files_by_name
         data = {}
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         with own_ftp.widened_timeout(300):
             for cat_list in cats.values():
                 for cat in cat_list:
@@ -3798,7 +4011,7 @@ class App(_AppBase):
                     self.config_data.get("ftp_use_tls", False))
                 if not ok:
                     return
-                cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+                cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
                 roots = {c.get("root", "") for cs in cats.values() for c in cs if c.get("root")}
                 changed = False
                 for root in roots:
@@ -3935,7 +4148,7 @@ class App(_AppBase):
         """Elige la categoría FTP (nombre/géneros/rutas/plantilla) que le
         corresponde a *info* según sus géneros de TMDB. None si no hay
         ninguna categoría configurada aplicable."""
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         return choose_category(info.genre_ids, cats.get(info.media_type, []))
 
     def _find_category_with_existing_folder(self, ftp_conn, info, use_cache_only=False, force_refresh=False):
@@ -3982,7 +4195,7 @@ class App(_AppBase):
         compartido con AutoWatcher (ver core/auto_watcher.py) -- aquí solo
         queda la parte de CÓMO listar/cachear cada raíz, que sí es propia
         de la GUI (use_cache_only para no bloquear la interfaz)."""
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get(info.media_type, [])
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get(info.media_type, [])
         known_folder_name = getattr(info, "folder_name", None)
 
         def dir_lookup(root):
@@ -4084,16 +4297,19 @@ class App(_AppBase):
             if auto_status == "subido":
                 entry.status = "subido"
                 self._ftp_row_set(entry, "Subido (automático)", 1, 0)
+                self.after(0, lambda e=entry: self._update_row(e))
                 return True, "ya_subido_por_auto"
             entry.status    = "error"
             entry.error_msg = "Archivo local no encontrado (¿se movió, se renombró o lo procesó el modo automático?)"
             self._ftp_row_set(entry, "No encontrado", 0, 0)
+            self.after(0, lambda e=entry: self._update_row(e))
             _log.warning("Subida: archivo local no encontrado %r", entry.path)
             return False, "archivo_no_encontrado"
 
         info = entry.media_info
         if not info:
             self._ftp_row_set(entry, "Sin info TMDB", 0, 0)
+            self.after(0, lambda e=entry: self._update_row(e))
             return True, "sin_info"
 
         if entry.remote_dir_override:
@@ -4134,12 +4350,14 @@ class App(_AppBase):
                 entry.status    = "error"
                 entry.error_msg = "Sin categoría FTP configurada"
                 self._ftp_row_set(entry, "Sin categoría", 0, 0)
+                self.after(0, lambda e=entry: self._update_row(e))
                 return False, "sin_categoria"
             root = category.get("root", "")
             if not root:
                 entry.status    = "error"
                 entry.error_msg = f"Categoría '{category.get('name')}' sin ruta configurada"
                 self._ftp_row_set(entry, "Sin ruta", 0, 0)
+                self.after(0, lambda e=entry: self._update_row(e))
                 return False, "sin_ruta"
 
             if info.media_type == "tv":
@@ -4296,7 +4514,10 @@ class App(_AppBase):
 
         free = self._get_free_space_with_jellyfin_fallback(ftp_conn, root)
         if free is not None and free < local_size:
+            entry.status    = "error"
+            entry.error_msg = "Disco lleno en el servidor"
             self._ftp_row_set(entry, "Sin espacio", 0, 0)
+            self.after(0, lambda e=entry: self._update_row(e))
             self.after(0, lambda gb=free/(1024**3): self._set_status(
                 f"Disco lleno — libre: {gb:.1f} GB", ERROR_COLOR))
             self._upload_cancel.set()
@@ -4365,6 +4586,7 @@ class App(_AppBase):
             # corre dentro de self.after), aquí sí hay que agendarlo.
             self.after(0, lambda mi=entry.media_info: self._remove_uploaded_episode_from_missing_list(mi))
             self.after(0, self._refresh_ftp_space)
+            self._apply_manual_post_process_action(entry)
         elif msg == "cancelado":
             entry.status = "listo"
             self._ftp_row_set(entry, "Cancelado", entry.ftp_progress, 0)
@@ -4407,6 +4629,50 @@ class App(_AppBase):
 
         self.after(0, lambda e=entry: self._update_row(e))
         return ok or msg in ("omitido", "saltado", "sin_info"), msg
+
+    def _apply_manual_action_to_path(self, path: Path):
+        """Aplica "manual_action" (Ajustes: mantener/mover a "procesados"/
+        eliminar) a *path* -- compartido entre _apply_manual_post_process_action
+        (tras una subida manual) y la descompresión de archivos añadidos a
+        mano (ver _add_paths_extracting_archives), que no tienen una
+        FileEntry cuyo .path actualizar, solo una ruta suelta. Devuelve la
+        ruta resultante (la misma si se mantiene, la nueva si se mueve, o
+        None si se elimina)."""
+        action = self.config_data.get("manual_action", "Mantener original")
+        if action == "Mover a subcarpeta 'procesados'":
+            try:
+                dest_dir = path.parent / "procesados"
+                dest_dir.mkdir(exist_ok=True)
+                import shutil
+                dest_path = dest_dir / path.name
+                shutil.move(str(path), str(dest_path))
+                _log.info("Movido a procesados: %s", path.name)
+                return dest_path
+            except Exception as e:
+                _log.error("No se pudo mover: %s", e)
+                self.after(0, lambda: self._set_status(f"No se pudo mover archivo: {e}", WARNING_COLOR))
+                return path
+        elif action == "Eliminar original":
+            try:
+                if path.exists():
+                    path.unlink()
+                    _log.info("Eliminado: %s", path.name)
+                return None
+            except Exception as e:
+                _log.error("No se pudo eliminar: %s", e)
+                self.after(0, lambda: self._set_status(f"No se pudo eliminar archivo: {e}", WARNING_COLOR))
+                return path
+        return path
+
+    def _apply_manual_post_process_action(self, entry):
+        """Acción post-proceso tras una subida MANUAL exitosa (pestaña
+        Archivos) -- "manual_action" en Ajustes, independiente de
+        "auto_action" (que solo aplica al modo automático, ver
+        core/auto_watcher.py). Corre en el hilo de subida, no en el de la
+        GUI, igual que el resto de _upload_entry_with."""
+        result_path = self._apply_manual_action_to_path(Path(entry.path))
+        if result_path is not None:
+            entry.path = str(result_path)
 
     def _queue_worker(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -4750,7 +5016,7 @@ class App(_AppBase):
         self._poll_interval_entry.insert(0, str(self.config_data.get("poll_interval", 10)))
         self._poll_interval_entry.grid(row=3, column=1, sticky="w", padx=(0, 8), pady=8)
 
-        ctk.CTkLabel(auto_fr, text="Acción tras procesar:").grid(
+        ctk.CTkLabel(auto_fr, text="Acción tras procesar (automático):").grid(
             row=4, column=0, sticky="e", padx=(16, 8), pady=8)
         self._auto_action_combo = ctk.CTkComboBox(auto_fr, width=280, values=[
             "Mantener original",
@@ -4777,21 +5043,22 @@ class App(_AppBase):
         ctk.CTkLabel(conf_fr, text="(0 = aceptar todo)", font=self._cfg_font_desc,
                      text_color=PENDING_COLOR).pack(side="left", padx=(8, 0))
 
-        # Iniciar con el sistema (registro de Windows / LaunchAgent de macOS
-        # — ver _set_autostart). En Linux no hay una convención única
-        # (systemd user unit vs. .desktop en autostart/), así que el switch
-        # se deshabilita ahí en vez de aparentar que hace algo.
+        # Iniciar con el sistema (registro de Windows / LaunchAgent de
+        # macOS / .desktop de autoarranque XDG en Linux -- ver
+        # _set_autostart).
         if is_windows():
             _autostart_text = "Iniciar con Windows (minimizado en bandeja)"
         elif is_macos():
             _autostart_text = "Iniciar con macOS (minimizado en bandeja)"
+        elif is_linux():
+            _autostart_text = "Iniciar con Linux (minimizado en bandeja)"
         else:
-            _autostart_text = "Iniciar con el sistema (no disponible en Linux)"
+            _autostart_text = "Iniciar con el sistema (no disponible aquí)"
         self._autostart_switch = ctk.CTkSwitch(auto_fr, text=_autostart_text)
         self._autostart_switch.grid(row=6, column=0, columnspan=4, pady=(4, 4))
         if self.config_data.get("start_with_windows", False):
             self._autostart_switch.select()
-        if not (is_windows() or is_macos()):
+        if not (is_windows() or is_macos() or is_linux()):
             self._autostart_switch.configure(state="disabled")
 
         # Notificaciones de escritorio
@@ -4818,6 +5085,45 @@ class App(_AppBase):
                           "en Servidor → Plantillas.",
                      font=self._cfg_font_desc, text_color=PENDING_COLOR, justify="center").grid(
             row=9, column=0, columnspan=4, pady=(0, 12))
+
+        # Descomprimir archivos comprimidos (ver core/archive_extract.py) --
+        # desactivado por defecto: a diferencia de solo identificar, esto
+        # crea/mueve/borra archivos en la carpeta vigilada sin confirmación.
+        self._auto_extract_switch = ctk.CTkSwitch(
+            auto_fr, text="Descomprimir archivos comprimidos automáticamente (.zip, .7z, .rar, .tar...)")
+        self._auto_extract_switch.grid(row=10, column=0, columnspan=4, pady=(4, 2))
+        if self.config_data.get("auto_extract_archives", False):
+            self._auto_extract_switch.select()
+
+        ctk.CTkLabel(auto_fr,
+                     text="La carpeta vigilada ya recorre subcarpetas. .zip, .7z y .tar (incluidos\n"
+                          ".tar.gz/.tgz, .tar.bz2/.tbz2, .tar.xz/.txz) funcionan siempre; .rar necesita\n"
+                          "tener \"unrar\" (o unar/bsdtar) instalado en el sistema.",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, justify="center").grid(
+            row=11, column=0, columnspan=4, pady=(0, 12))
+
+        # ── Subida manual ──
+        manual_fr = ctk.CTkFrame(scroll)
+        manual_fr.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+        manual_fr.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(manual_fr, text="Subida manual",
+                     font=self._cfg_font_title).grid(
+            row=0, column=0, columnspan=2, pady=(12, 6))
+        ctk.CTkLabel(manual_fr,
+                     text="Se aplica cuando subes archivos a mano desde la pestaña Archivos.",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=600).grid(
+            row=1, column=0, columnspan=2, pady=(0, 10))
+
+        ctk.CTkLabel(manual_fr, text="Acción tras procesar (manual):").grid(
+            row=2, column=0, sticky="e", padx=(16, 8), pady=(0, 12))
+        self._manual_action_combo = ctk.CTkComboBox(manual_fr, width=280, values=[
+            "Mantener original",
+            "Mover a subcarpeta 'procesados'",
+            "Eliminar original",
+        ])
+        self._manual_action_combo.set(self.config_data.get(
+            "manual_action", "Mantener original"))
+        self._manual_action_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(0, 12))
 
     def _build_ftp_connection_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -4914,12 +5220,19 @@ class App(_AppBase):
         arrancar; publicar es la única acción manual, y deliberadamente
         lo es -- sobrescribe lo de todos, no algo para hacer sin querer
         al guardar Ajustes normales."""
-        ctk.CTkButton(parent, text="📤 Publicar como configuración del servidor", width=280,
+        btns = ctk.CTkFrame(parent, fg_color="transparent")
+        btns.pack(pady=(8, 0))
+        ctk.CTkButton(btns, text="📤 Publicar como configuración del servidor", width=280,
                       fg_color="transparent", border_width=1,
-                      command=self._publish_server_config).pack(pady=(8, 0))
+                      command=self._publish_server_config).pack(side="left", padx=4)
+        ctk.CTkButton(btns, text="📥 Descartar cambios y recuperar del servidor", width=280,
+                      fg_color="transparent", border_width=1,
+                      command=self._discard_local_server_config).pack(side="left", padx=4)
         ctk.CTkLabel(parent, text="Sube TMDB/IA, plantillas, categorías FTP, Plex/Jellyfin, enlaces "
                                   "y la cuota de reservas de este equipo (con sus claves y tokens) "
-                                  "para que los adopten los otros clientes de este mismo servidor.",
+                                  "para que los adopten los otros clientes de este mismo servidor, o "
+                                  "descarta lo que tengas aquí sin publicar y recupera lo último que "
+                                  "se haya publicado.",
                      font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=380).pack(pady=(0, 8))
 
     def _build_reservation_quota_tab(self, tab):
@@ -5973,14 +6286,18 @@ class App(_AppBase):
             row=5, column=0, columnspan=2, pady=8)
 
         # ── Fallback de IA (opcional) ──
-        # Último recurso solo cuando TMDB no encuentra nada con el título
-        # limpiado localmente — desactivado por defecto, no se envía nada a
-        # terceros hasta que el usuario lo active explícitamente aquí.
+        # Último recurso cuando TMDB no encuentra nada con el título
+        # limpiado localmente, y también cuando ComicVine no encuentra nada
+        # (o da mal resultado, vía el botón "🪄 IA: título original" del
+        # panel de búsqueda, ver _manual_ai_translate_comic) con el título
+        # detectado en castellano -- mismo interruptor/key para las dos
+        # cosas, desactivado por defecto, no se envía nada a terceros hasta
+        # que el usuario lo active explícitamente aquí.
         ctk.CTkLabel(tmdb, text="IA como último recurso",
                      font=self._cfg_font_subtitle).grid(
             row=6, column=0, columnspan=2, pady=(16, 4))
         self._ai_fallback_switch = ctk.CTkSwitch(
-            tmdb, text="Usar IA si TMDB no encuentra resultados")
+            tmdb, text="Usar IA como último recurso (TMDB / ComicVine)")
         if self.config_data.get("ai_fallback_enabled"):
             self._ai_fallback_switch.select()
         self._ai_fallback_switch.grid(row=7, column=0, columnspan=2, pady=4)
@@ -5997,9 +6314,60 @@ class App(_AppBase):
                       command=self._open_learned_terms_dialog).pack(side="left", padx=4)
         self._ai_key_status = ctk.CTkLabel(tmdb, text="", text_color=PENDING_COLOR)
         self._ai_key_status.grid(row=10, column=0, columnspan=2, pady=4)
-        ctk.CTkLabel(tmdb, text="Solo se consulta cuando TMDB falla — cada consulta\nqueda registrada en ai_fallback.log",
+        ctk.CTkLabel(tmdb, text="Solo se consulta cuando TMDB/ComicVine falla — cada consulta\nqueda registrada en ai_fallback.log",
                      text_color=PENDING_COLOR, font=self._cfg_font_desc, justify="left").grid(
             row=11, column=0, columnspan=2, pady=(4, 8))
+
+        # ── ComicVine (identificación de cómics/manga) ──
+        ctk.CTkLabel(tmdb, text="ComicVine (cómics/manga)",
+                     font=self._cfg_font_subtitle).grid(
+            row=12, column=0, columnspan=2, pady=(16, 4))
+        ctk.CTkLabel(tmdb, text="API Key:").grid(row=13, column=0, sticky="e", padx=10, pady=6)
+        self._comicvine_key_entry = ctk.CTkEntry(
+            tmdb, width=240, show="*",
+            placeholder_text="Gratis en comicvine.gamespot.com/api")
+        self._comicvine_key_entry.insert(0, self.config_data.get("comicvine_api_key", ""))
+        self._comicvine_key_entry.grid(row=13, column=1, padx=10, pady=6, sticky="ew")
+        self._comicvine_key_status = ctk.CTkLabel(tmdb, text="", text_color=PENDING_COLOR)
+        self._comicvine_key_status.grid(row=14, column=0, columnspan=2, pady=4)
+        bf4 = ctk.CTkFrame(tmdb, fg_color="transparent")
+        bf4.grid(row=15, column=0, columnspan=2, pady=8)
+        ctk.CTkButton(bf4, text="Validar API Key", command=self._validate_comicvine_key).pack(side="left", padx=4)
+        ctk.CTkLabel(tmdb, text="comicvine.gamespot.com/api → solicitar key",
+                     text_color=PENDING_COLOR, font=self._cfg_font_desc).grid(
+            row=16, column=0, columnspan=2, pady=(0, 8))
+
+        # ── Google Books (ebooks) ──
+        # Google Books ya NO es el proveedor principal de libros de texto --
+        # OpenLibrary lo es (core/openlibrary_client.py, sin ninguna key,
+        # más fiable desde que el backend de Google Books empezó a fallar de
+        # forma intermitente y persistente). Google Books se sigue probando
+        # automáticamente como APOYO si OpenLibrary no encuentra nada o
+        # falla (ver core/book_identify.py) -- esta key sigue siendo
+        # opcional, mismo motivo de siempre: sin ella, su cuota anónima es
+        # compartida globalmente entre TODO el mundo que llame sin una (no
+        # es un cupo por IP/equipo) -- puede devolver 429 aunque esta app no
+        # haya hecho ninguna otra petición antes (ver core/book_client.py).
+        ctk.CTkLabel(tmdb, text="Google Books (ebooks, apoyo de OpenLibrary) -- opcional",
+                     font=self._cfg_font_subtitle).grid(
+            row=17, column=0, columnspan=2, pady=(16, 4))
+        ctk.CTkLabel(tmdb, text="API Key:").grid(row=18, column=0, sticky="e", padx=10, pady=6)
+        self._google_books_key_entry = ctk.CTkEntry(
+            tmdb, width=240, show="*",
+            placeholder_text="Opcional -- gratis en console.cloud.google.com")
+        self._google_books_key_entry.insert(0, self.config_data.get("google_books_api_key", ""))
+        self._google_books_key_entry.grid(row=18, column=1, padx=10, pady=6, sticky="ew")
+        self._google_books_key_status = ctk.CTkLabel(tmdb, text="", text_color=PENDING_COLOR)
+        self._google_books_key_status.grid(row=19, column=0, columnspan=2, pady=4)
+        bf5 = ctk.CTkFrame(tmdb, fg_color="transparent")
+        bf5.grid(row=20, column=0, columnspan=2, pady=8)
+        ctk.CTkButton(bf5, text="Validar API Key", command=self._validate_google_books_key).pack(side="left", padx=4)
+        ctk.CTkLabel(tmdb,
+                     text="console.cloud.google.com → crear proyecto → activar \"Books API\" → credenciales\n"
+                          "OpenLibrary (sin key, sin ajustes) se prueba primero -- esta key solo se usa\n"
+                          "de apoyo, si OpenLibrary no encuentra el libro o falla.",
+                     text_color=PENDING_COLOR, font=self._cfg_font_desc, justify="center").grid(
+            row=21, column=0, columnspan=2, pady=(0, 8))
 
     def _build_templates_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -6035,12 +6403,22 @@ class App(_AppBase):
                 "[{serie}] {episodio:04d} {titulo}{ext}",
                 "{serie} EP{episodio:04d}{ext}",
             ],
+            "libro_template": [
+                "{serie}{ext}",
+                "{serie} ({año}){ext}",
+            ],
+            "comic_template": [
+                "{serie} ({año}) #{episodio:02d}{ext}",
+                "{serie} #{episodio:02d}{ext}",
+            ],
         }
         self._tpl_entries = {}
         for i, (label, key) in enumerate([
             ("TV / Series:", "tv_template"),
             ("Películas:",   "movie_template"),
             ("Anime:",       "anime_template"),
+            ("Libros:",      "libro_template"),
+            ("Cómics:",      "comic_template"),
         ], start=1):
             ctk.CTkLabel(tpl, text=label).grid(row=i, column=0, sticky="e", padx=10, pady=8)
             combo = ctk.CTkComboBox(tpl, values=PRESETS[key], width=310)
@@ -6055,7 +6433,7 @@ class App(_AppBase):
         # que queda en el servidor compartido, no solo a este equipo (el
         # renombrado en origen/local es de Cliente -> General).
         self._rename_remote_switch = ctk.CTkSwitch(tpl, text="Renombrar archivos en destino (FTP)")
-        self._rename_remote_switch.grid(row=4, column=0, columnspan=2, pady=(4, 10))
+        self._rename_remote_switch.grid(row=6, column=0, columnspan=2, pady=(4, 10))
         if self.config_data.get("rename_remote", True):
             self._rename_remote_switch.select()
 
@@ -7713,7 +8091,7 @@ class App(_AppBase):
             # caché" y nunca se vuelve a intentar, aunque use_cache_only
             # diga que sí se puede conectar de verdad. Se limpian aquí las
             # raíces vacías para forzar un listado fresco de verdad.
-            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get("tv", [])
+            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get("tv", [])
             for cat in cats:
                 root = cat.get("root", "")
                 if root and not self._ftp_dir_cache.get(root):
@@ -8322,7 +8700,7 @@ class App(_AppBase):
                 # FTP no lo encontró de todas formas -- dos causas muy
                 # distintas que un mismo mensaje en pantalla no distingue.
                 cats_checked = [c.get("root", "") for c in
-                               self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get("tv", [])]
+                               self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get("tv", [])]
                 _log.warning(
                     "Borrar serie: '%s' (tmdb_id=%s, source=%s) no encontrada -- "
                     "folder_name conocido=%r, categorías comprobadas=%s",
@@ -8718,7 +9096,7 @@ class App(_AppBase):
         usuario veía el escaneo "parado" y no tenía forma de saber que en
         realidad seguía cruzando datos con el FTP, ni que la lista que
         estaba mirando todavía podía cambiar cuando terminara de verdad."""
-        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []}).get("tv", [])
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get("tv", [])
         index = {}
         for cat in cats:
             if cancel_event and cancel_event.is_set():
@@ -9271,6 +9649,12 @@ class App(_AppBase):
         self.tmdb.set_api_key(self.config_data.get("tmdb_api_key", ""))
         self.tmdb.set_language(self.config_data.get("language", "es-ES"))
 
+        _set_entry(self._comicvine_key_entry, self.config_data.get("comicvine_api_key", ""))
+        self.comicvine.set_api_key(self.config_data.get("comicvine_api_key", ""))
+
+        _set_entry(self._google_books_key_entry, self.config_data.get("google_books_api_key", ""))
+        self.book_client.set_api_key(self.config_data.get("google_books_api_key", ""))
+
         if self.config_data.get("ai_fallback_enabled"):
             self._ai_fallback_switch.select()
         else:
@@ -9297,6 +9681,11 @@ class App(_AppBase):
         _set_entry(self._watch_folder_entry, self.config_data.get("watch_folder", ""))
         _set_entry(self._poll_interval_entry, self.config_data.get("poll_interval", 10))
         self._auto_action_combo.set(self.config_data.get("auto_action", "Mantener original"))
+        self._manual_action_combo.set(self.config_data.get("manual_action", "Mantener original"))
+        if self.config_data.get("auto_extract_archives", False):
+            self._auto_extract_switch.select()
+        else:
+            self._auto_extract_switch.deselect()
         conf = int(self.config_data.get("min_confidence", 70))
         self._conf_slider.set(conf)
         self._conf_label.configure(text=f"{conf}%")
@@ -9317,29 +9706,35 @@ class App(_AppBase):
         else:
             self._rename_remote_switch.deselect()
 
-        saved = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
-        self._tv_categories    = [dict(c) for c in saved.get("tv", [])]
-        self._movie_categories = [dict(c) for c in saved.get("movie", [])]
-        self._render_category_list("tv")
-        self._render_category_list("movie")
+        saved = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
+        self._categories = {mt: [dict(c) for c in saved.get(mt, [])] for mt in self._CATEGORY_TYPES}
+        for mt in self._CATEGORY_TYPES:
+            self._render_category_list(mt)
 
     # ── Categorías FTP (rutas raíz + clasificación automática por género) ──
 
+    # Tipos de categoría, en el orden en que se pintan sus columnas. "libro"
+    # no tiene géneros de TMDB (no existe un TMDB de libros) -- ver
+    # _genre_options_for, que le da una lista fija en vez de pedirla a TMDB.
+    _CATEGORY_TYPES = ("tv", "movie", "libro")
+    _CATEGORY_TYPE_LABELS = {"tv": "Series", "movie": "Películas", "libro": "Libros/Cómics"}
+    _LIBRO_GENRE_OPTIONS = [("ebook", "Ebook"), ("comic", "Cómic")]
+
     def _build_ftp_categories_section(self, tab):
-        saved = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
-        self._tv_categories    = [dict(c) for c in saved.get("tv", [])]
-        self._movie_categories = [dict(c) for c in saved.get("movie", [])]
+        saved = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
+        self._categories = {mt: [dict(c) for c in saved.get(mt, [])] for mt in self._CATEGORY_TYPES}
         self._genres_cache     = {"tv": [], "movie": []}
+        self._cats_containers  = {}
 
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
         cats_fr = ctk.CTkFrame(scroll)
         cats_fr.pack(fill="both", expand=True, padx=0, pady=(0, 8))
-        cats_fr.grid_columnconfigure(0, weight=1)
-        cats_fr.grid_columnconfigure(1, weight=1)
+        for col in range(len(self._CATEGORY_TYPES)):
+            cats_fr.grid_columnconfigure(col, weight=1)
 
         hdr_cats = ctk.CTkFrame(cats_fr, fg_color="transparent")
-        hdr_cats.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(12, 4))
+        hdr_cats.grid(row=0, column=0, columnspan=len(self._CATEGORY_TYPES), sticky="ew", pady=(12, 4))
         hdr_cats.grid_columnconfigure(0, weight=1)
         hdr_cats.grid_columnconfigure(2, weight=1)
         ctk.CTkLabel(hdr_cats, text="Categorías FTP",
@@ -9348,19 +9743,21 @@ class App(_AppBase):
                       command=self._load_genres_async).grid(row=0, column=2, sticky="e", padx=12)
         ctk.CTkLabel(cats_fr,
                      text="Cada categoría busca y sube contenido en su propia ruta del servidor. "
-                          "La app elige la categoría sola según el género de TMDB — el orden importa "
-                          "(la primera que coincida gana); una categoría sin géneros marcados actúa "
-                          "como categoría por defecto para lo que no encaje en ninguna otra.",
+                          "La app elige la categoría sola según el género de TMDB (o, para Libros/"
+                          "Cómics, según sea ebook o cómic) — el orden importa (la primera que "
+                          "coincida gana); una categoría sin géneros marcados actúa como categoría "
+                          "por defecto para lo que no encaje en ninguna otra.",
                      font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=900).grid(
-            row=1, column=0, columnspan=2, padx=12, pady=(0, 10))
+            row=1, column=0, columnspan=len(self._CATEGORY_TYPES), padx=12, pady=(0, 10))
 
-        self._tv_cats_container = ctk.CTkFrame(cats_fr, fg_color="transparent")
-        self._tv_cats_container.grid(row=2, column=0, sticky="nsew", padx=(12, 6), pady=(0, 12))
-        self._movie_cats_container = ctk.CTkFrame(cats_fr, fg_color="transparent")
-        self._movie_cats_container.grid(row=2, column=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
+        for col, mt in enumerate(self._CATEGORY_TYPES):
+            pad = (12, 6) if col == 0 else ((6, 12) if col == len(self._CATEGORY_TYPES) - 1 else (6, 6))
+            container = ctk.CTkFrame(cats_fr, fg_color="transparent")
+            container.grid(row=2, column=col, sticky="nsew", padx=pad, pady=(0, 12))
+            self._cats_containers[mt] = container
 
-        self._render_category_list("tv")
-        self._render_category_list("movie")
+        for mt in self._CATEGORY_TYPES:
+            self._render_category_list(mt)
 
     def _new_ftp_category(self) -> dict:
         return {
@@ -9372,12 +9769,17 @@ class App(_AppBase):
         }
 
     def _categories_list(self, media_type: str) -> list:
-        return self._tv_categories if media_type == "tv" else self._movie_categories
+        return self._categories[media_type]
 
     def _genre_options_for(self, media_type: str, cat: dict):
         """[(id, nombre), ...] a partir de los géneros TMDB ya cargados; si aún
         no han cargado, muestra al menos los ids que la categoría ya tuviera
-        guardados (como "ID {n}") para no perder datos existentes."""
+        guardados (como "ID {n}") para no perder datos existentes.
+        "libro" no tiene géneros de TMDB -- opciones fijas (ebook/cómic),
+        rellenadas por core/book_client.py / core/comicvine_client.py en
+        MediaInfo.genre_ids, no por una carga asíncrona como tv/movie."""
+        if media_type == "libro":
+            return self._LIBRO_GENRE_OPTIONS
         loaded = self._genres_cache.get(media_type) or []
         if loaded:
             return [(g["id"], g["name"]) for g in loaded]
@@ -9396,11 +9798,11 @@ class App(_AppBase):
             cat["genre_ids"] = sorted(gid for gid, var in cat["_genre_vars"].items() if var.get())
 
     def _render_category_list(self, media_type: str):
-        container  = self._tv_cats_container if media_type == "tv" else self._movie_cats_container
+        container  = self._cats_containers[media_type]
         categories = self._categories_list(media_type)
         for w in container.winfo_children():
             w.destroy()
-        label = "Series" if media_type == "tv" else "Películas"
+        label = self._CATEGORY_TYPE_LABELS[media_type]
         ctk.CTkLabel(container, text=f"Categorías de {label}",
                      font=self._cfg_font_small_bold).pack(anchor="w", pady=(0, 4))
         n = len(categories)
@@ -9563,15 +9965,16 @@ class App(_AppBase):
     def _on_drop(self, event):
         """Maneja archivos soltados por drag & drop."""
         paths = self._parse_drop_data(event.data)
-        videos = [p for p in paths if os.path.isfile(p) and is_video_file(p)]
+        files = [p for p in paths
+                 if os.path.isfile(p) and (is_video_file(p) or is_book_file(p) or is_archive_file(p))]
         folders = [p for p in paths if os.path.isdir(p)]
         for folder in folders:
-            videos += [str(f) for f in Path(folder).rglob("*")
-                       if f.is_file() and is_video_file(str(f))]
-        if videos:
-            self._add_entries(videos)
+            files += [str(f) for f in Path(folder).rglob("*")
+                      if f.is_file() and (is_video_file(str(f)) or is_book_file(str(f)) or is_archive_file(str(f)))]
+        if files:
+            self._add_paths_extracting_archives(files)
         elif paths:
-            self._set_status("No se encontraron archivos de vídeo en lo que soltaste", WARNING_COLOR)
+            self._set_status("No se encontraron archivos de vídeo, libro o comprimidos en lo que soltaste", WARNING_COLOR)
 
     @staticmethod
     def _parse_drop_data(data):
@@ -9595,14 +9998,16 @@ class App(_AppBase):
 
     def _add_files(self):
         paths = filedialog.askopenfilenames(
-            title="Seleccionar archivos de video",
+            title="Seleccionar archivos de video, libro o comprimido",
             filetypes=[("Video", "*.mkv *.mp4 *.avi *.mov *.m4v *.wmv *.flv *.ts *.m2ts *.webm"),
+                       ("Libros/Cómics", "*.pdf *.epub *.mobi *.azw3 *.cbz *.cbr"),
+                       ("Archivos comprimidos", "*.zip *.7z *.rar *.tar *.tgz *.tbz2 *.txz"),
                        ("Todos", "*.*")],
             initialdir=self.config_data.get("last_dir") or os.path.expanduser("~"),
         )
         if paths:
             self.config_data["last_dir"] = str(Path(paths[0]).parent)
-            self._add_entries(list(paths))
+            self._add_paths_extracting_archives(list(paths))
 
     def _add_folder(self):
         folder = filedialog.askdirectory(
@@ -9611,9 +10016,63 @@ class App(_AppBase):
         )
         if folder:
             self.config_data["last_dir"] = folder
-            videos = [str(f) for f in Path(folder).rglob("*")
-                      if f.is_file() and is_video_file(str(f))]
-            self._add_entries(videos)
+            files = [str(f) for f in Path(folder).rglob("*")
+                     if f.is_file() and (is_video_file(str(f)) or is_book_file(str(f)) or is_archive_file(str(f)))]
+            self._add_paths_extracting_archives(files)
+
+    def _add_paths_extracting_archives(self, paths: list):
+        """Punto de entrada común para _add_files/_on_drop/_add_folder --
+        separa archivos comprimidos (.zip/.7z/.rar/.tar y variantes) del
+        resto y los descomprime antes de añadirlos (ver
+        core/archive_extract.py). A diferencia del Modo Automático, esto se
+        hace SIEMPRE aquí, sin depender de "auto_extract_archives" en
+        Ajustes -- es una acción explícita del usuario, presente
+        confirmándola, no la vigilancia desatendida que ese interruptor
+        protege."""
+        archives = [p for p in paths if is_archive_file(p)]
+        others   = [p for p in paths if p not in archives]
+        if not archives:
+            self._add_entries(others)
+            return
+        self._set_status(f"Descomprimiendo {len(archives)} archivo(s)...", WARNING_COLOR)
+        threading.Thread(target=self._extract_archives_worker, args=(archives, others), daemon=True).start()
+
+    def _extract_archives_worker(self, archives, others):
+        """Descomprime *archives* (uno por uno, incluidos los anidados que
+        aparezcan dentro -- a diferencia del Modo Automático, que los deja
+        para el siguiente ciclo de escaneo, aquí no hay "siguiente ciclo":
+        es una sola acción que debe resolverlos todos ya) y junta el
+        resultado con *others* antes de añadirlo a la tabla. El archivo
+        comprimido original recibe la misma "Acción tras procesar" que ya
+        se usa para la subida manual (ver _apply_manual_action_to_path)."""
+        from core.archive_extract import extract_archive
+        resolved = list(others)
+        failed = []
+        pending = list(archives)
+        while pending:
+            archive_path = pending.pop(0)
+            ok, dest_or_msg = extract_archive(archive_path)
+            if not ok:
+                failed.append((Path(archive_path).name, dest_or_msg))
+                _log.warning("No se pudo descomprimir %s: %s", archive_path, dest_or_msg)
+                continue
+            dest_dir = Path(dest_or_msg)
+            for f in sorted(dest_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                fs = str(f)
+                if is_archive_file(fs):
+                    pending.append(fs)
+                elif is_video_file(fs) or is_book_file(fs):
+                    resolved.append(fs)
+            self._apply_manual_action_to_path(Path(archive_path))
+
+        def _finish(res=resolved, fail=failed):
+            if fail:
+                names = ", ".join(n for n, _ in fail)
+                self._set_status(f"No se pudo descomprimir: {names}", ERROR_COLOR)
+            self._add_entries(res)
+        self.after(0, _finish)
 
     def _add_entries(self, paths):
         existing = {e.path for e in self.files}
@@ -9647,12 +10106,16 @@ class App(_AppBase):
                     self.files.clear()
                 else:
                     return   # diálogo cerrado sin elegir -> no tocar la lista
+                self._multi_selected.clear()
                 self._refresh_table()   # destruye widgets usando _file_rows antes de vaciarlo
                 self._clear_detail()
+                self._update_assign_button_label()
                 return
         self.files.clear()
+        self._multi_selected.clear()
         self._refresh_table()   # destruye widgets usando _file_rows antes de vaciarlo
         self._clear_detail()
+        self._update_assign_button_label()
 
     def _files_change_page(self, delta: int):
         n_pages = max(1, -(-len(self.files) // self._file_table.page_size))
@@ -9706,7 +10169,8 @@ class App(_AppBase):
         for i, entry in enumerate(page_files):
             rf = ctk.CTkFrame(
                 self._file_list_frame,
-                fg_color=SELECTED_ROW_COLOR if entry is self._selected_entry else "transparent")
+                fg_color=SELECTED_ROW_COLOR
+                    if (entry is self._selected_entry or entry in self._multi_selected) else "transparent")
             rf.pack(fill="x", pady=1)
 
             det = entry.detected
@@ -9805,7 +10269,7 @@ class App(_AppBase):
             del_btn.pack(side="left", padx=(2, 2), pady=2)
 
             for w in (rf, name_lbl, det_lbl, nn_lbl, dest_lbl, st_lbl):
-                w.bind("<Button-1>", lambda ev, e=entry: self._select_entry(e))
+                w.bind("<Button-1>", lambda ev, e=entry: self._on_row_click(ev, e))
                 w.bind("<Button-3>", lambda ev, e=entry: self._show_row_menu(ev, e))
 
             self._file_rows.append({
@@ -9943,9 +10407,11 @@ class App(_AppBase):
 
     def _remove_entry(self, entry):
         self.files = [e for e in self.files if e is not entry]
+        self._multi_selected.discard(entry)
         self._refresh_table()
         if self._selected_entry is entry:
             self._clear_detail()
+        self._update_assign_button_label()
 
     def _select_entry(self, entry):
         prev = self._selected_entry
@@ -9955,14 +10421,124 @@ class App(_AppBase):
                 row["frame"].configure(fg_color="transparent")
             if row["entry"] is entry:
                 row["frame"].configure(fg_color=SELECTED_ROW_COLOR)
+        if entry is not prev:
+            self._reset_search_panel(entry)
         self._update_detail(entry)
         self._update_status_bar()
+        self._update_assign_button_label()
+
+    def _on_row_click(self, event, entry):
+        """Clic en una fila de la tabla de Archivos -- con Ctrl/Shift se
+        comporta como el Explorador de Windows (selección múltiple), un
+        clic normal reemplaza la selección entera por esta única fila. El
+        "ancla" (self._selected_entry) es la única que alimenta el panel
+        de detalles/búsqueda; el resto de self._multi_selected solo cuenta
+        para "Asignar a la selección" (ver _assign_selected_result)."""
+        ctrl  = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        if shift and self._selected_entry is not None:
+            self._select_range(self._selected_entry, entry)
+        elif ctrl:
+            self._toggle_multi_select(entry)
+        else:
+            if self._multi_selected:
+                self._multi_selected.clear()
+                self._refresh_table()   # limpia el resaltado de las filas que ya no están seleccionadas
+            self._select_entry(entry)
+
+    def _toggle_multi_select(self, entry):
+        """Ctrl+clic -- añade/quita *entry* de la selección múltiple sin
+        tocar el ancla. Actualiza solo el color de esa fila (igual que
+        _select_entry), no reconstruye toda la tabla."""
+        if entry is self._selected_entry:
+            return   # el ancla ya cuenta como seleccionada, nada que alternar
+        if entry in self._multi_selected:
+            self._multi_selected.discard(entry)
+        else:
+            self._multi_selected.add(entry)
+        is_selected = entry in self._multi_selected
+        for row in self._file_rows:
+            if row["entry"] is entry:
+                row["frame"].configure(fg_color=SELECTED_ROW_COLOR if is_selected else "transparent")
+                break
+        self._update_assign_button_label()
+
+    def _select_range(self, anchor, entry):
+        """Shift+clic -- selecciona el rango contiguo entre *anchor* (el
+        ancla, que NO se mueve -- sucesivos Shift+clic siguen calculando el
+        rango desde el mismo punto de partida, igual que el Explorador) y
+        *entry*, por posición real en self.files (no por lo que se ve en la
+        página actual, que puede no incluir todo el rango)."""
+        try:
+            i1 = self.files.index(anchor)
+            i2 = self.files.index(entry)
+        except ValueError:
+            return
+        lo, hi = sorted((i1, i2))
+        self._multi_selected = set(self.files[lo:hi + 1]) - {anchor}
+        for row in self._file_rows:
+            e = row["entry"]
+            is_selected = e is anchor or e in self._multi_selected
+            row["frame"].configure(fg_color=SELECTED_ROW_COLOR if is_selected else "transparent")
+        self._update_assign_button_label()
+
+    def _current_selection(self) -> list:
+        """Ancla + selección múltiple, en el orden en que aparecen de
+        verdad en self.files (no el orden en que se fueron marcando)."""
+        if self._selected_entry is None:
+            return []
+        sel = [self._selected_entry] + [e for e in self._multi_selected if e is not self._selected_entry]
+        order = {id(e): i for i, e in enumerate(self.files)}
+        sel.sort(key=lambda e: order.get(id(e), 0))
+        return sel
+
+    def _update_assign_button_label(self):
+        n = len(self._current_selection())
+        self._assign_btn.configure(text=f"Asignar a la selección ({n})" if n > 1 else "Asignar")
+
+    def _reset_search_panel(self, entry=None):
+        """Limpia el buscador manual (texto, desplegable de resultados y
+        estado de previsualización) al cambiar de archivo seleccionado --
+        sin esto, el texto/resultados de la búsqueda del archivo ANTERIOR
+        se quedaban pegados al seleccionar otro (aunque el panel de
+        detalles sí mostrara la info correcta del nuevo, vía
+        _update_detail), y al borrar ese texto sobrante el auto-buscador
+        (_manual_search) rellenaba el campo con el título detectado
+        localmente del archivo NUEVO -- dando la sensación de un
+        comportamiento errático en vez de, simplemente, un campo que
+        nunca se había limpiado al cambiar de fila."""
+        if self._search_debounce_id is not None:
+            self.after_cancel(self._search_debounce_id)
+            self._search_debounce_id = None
+        self._result_combo.configure(values=[])
+        self._result_combo.set("")
+        self._tmdb_results = []
+        self._results_kind = "tmdb"
+        self._previewed_result_idx = -1
+        # La etiqueta debe reflejar el servicio real que va a usarse --
+        # "Buscar en TMDB" no tiene sentido para un libro/cómic (ver
+        # _search_source_name).
+        self._search_label.configure(text=f"Buscar en {self._search_source_name(entry)}:")
+        # El botón de traducción vía IA y la bandera de "busca en inglés"
+        # solo tienen sentido para cómics (ComicVine) -- ocultos para
+        # vídeo/libros de texto (ver _manual_ai_translate_comic).
+        if entry is not None and entry.is_comic:
+            self._ai_translate_comic_btn.grid()
+            self._search_lang_flag.pack(side="left", padx=(5, 0))
+        else:
+            self._ai_translate_comic_btn.grid_remove()
+            self._search_lang_flag.pack_forget()
 
     # --------------------------------------------------------- TMDB search
 
     def _search_new_entries(self, entries: list):
-        """Lanza búsqueda TMDB solo para los archivos recién añadidos."""
-        if not self.config_data.get("tmdb_api_key"):
+        """Lanza búsqueda para los archivos recién añadidos (o
+        reidentificados a mano, ver _set_book_comic_type) -- TMDB para
+        vídeo, Google Books/ComicVine para libros/cómics (ver
+        _search_entry). La API Key de TMDB solo hace falta si hay ALGÚN
+        archivo de vídeo en el lote -- exigirla siempre bloqueaba
+        identificar libros/cómics sin ninguna key de TMDB configurada."""
+        if any(not e.is_book for e in entries) and not self.config_data.get("tmdb_api_key"):
             self._set_status("Configura tu API Key de TMDB en Configuración", WARNING_COLOR)
             return
         threading.Thread(
@@ -10038,7 +10614,59 @@ class App(_AppBase):
         add_learned_terms(ai_result["junk_tokens"])
         return retry_results, retry_query, retry_det
 
+    @staticmethod
+    def _search_source_name(entry) -> str:
+        """Nombre del servicio que identificaría *entry* -- ComicVine para
+        cómics, OpenLibrary (proveedor principal, con Google Books de apoyo
+        automático -- ver core/book_identify.py) para ebooks de texto, TMDB
+        para el resto (o si entry es None, p.ej. sin nada seleccionado
+        todavía). Usado para que las etiquetas de "Buscar..." reflejen el
+        servicio real en vez de decir siempre "TMDB" también para
+        libros/cómics (ver _search_book_entry, que despacha a uno u otro
+        según el tipo)."""
+        if entry is None:
+            return "TMDB"
+        if entry.is_comic:
+            return "ComicVine"
+        if entry.is_book:
+            return "OpenLibrary"
+        return "TMDB"
+
+    def _set_book_comic_type(self, entry, is_comic: bool):
+        """Cambia a mano si *entry* se trata como libro de texto (OpenLibrary/
+        Google Books) o cómic/manga (ComicVine) -- la extensión sola no basta
+        para decidirlo (un .pdf/.epub/.cbz/.cbr puede ser cualquiera de los dos
+        en la práctica, p.ej. un cómic escaneado en PDF), así que es una
+        elección del usuario por archivo (ver menú contextual en
+        _show_row_menu), no una detección automática. Por defecto
+        (is_comic_file en core/renamer.py) .pdf/.epub/.mobi/.azw3 se tratan
+        como libro y .cbz/.cbr como cómic -- esto solo anula esa
+        clasificación por defecto para ESTE archivo.
+
+        Recalcula entry.detected (is_comic cambia si detect_episode busca
+        el patrón "#NN" del número de emisión, ver core/api_client.py) y
+        limpia cualquier identificación previa -- viniera de OpenLibrary,
+        Google Books o de ComicVine, ya no vale para el servicio nuevo --
+        antes de relanzar la búsqueda con el servicio correcto."""
+        if not entry.is_book or entry.is_comic == is_comic:
+            return
+        entry.is_comic = is_comic
+        entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic)
+        entry.media_info = None
+        entry.new_name   = ""
+        entry.status     = "pendiente"
+        entry.confidence = 0
+        entry.error_msg  = ""
+        self._update_row(entry)
+        if self._selected_entry is entry:
+            self._reset_search_panel(entry)
+            self._update_detail(entry)
+        self._search_new_entries([entry])
+
     def _search_entry(self, entry, tmdb=None):
+        if entry.is_book:
+            self._search_book_entry(entry)
+            return
         if tmdb is None:
             tmdb = self.tmdb
         det   = entry.detected
@@ -10078,17 +10706,49 @@ class App(_AppBase):
         # la carpeta vigilada y seguía fallando por su cuenta.
         self._mark_auto_processed(entry.path, "identificado_manual", entry.new_name)
 
+    def _search_book_entry(self, entry):
+        """Equivalente de _search_entry para libros/cómics -- despacha a
+        OpenLibrary/Google Books o ComicVine según la extensión en vez de a
+        TMDB (ver entry.is_book/is_comic, calculados una vez en
+        FileEntry.__init__). La identificación en sí (incluida OpenLibrary
+        como proveedor principal de libros con Google Books de apoyo, y la
+        traducción de título vía IA para ComicVine con su caché) vive en
+        core/book_identify.py, compartida con AutoWatcher (Modo Automático)
+        -- aquí solo se asigna el resultado a la fila y se registra en el
+        log de la GUI."""
+        from core.book_identify import identify_book_or_comic
+        result = identify_book_or_comic(
+            entry.detected, entry.is_comic, self.comicvine, self.book_client,
+            openlibrary_client=self.openlibrary_client,
+            ai_fallback_enabled=self.config_data.get("ai_fallback_enabled", False),
+            ai_api_key=self.config_data.get("ai_api_key", ""))
+        if result.error:
+            entry.status    = "error"
+            entry.error_msg = result.error
+            _log.warning("Busqueda: %s para '%s' (%r)", result.error, result.used_query, entry.name)
+            return
+        entry.confidence = result.confidence
+        entry.media_info = result.media_info
+        entry.new_name   = self._build_name(result.media_info, entry.ext)
+        entry.status     = "listo"
+        entry.error_msg  = ""
+        if result.provider and not entry.is_comic:
+            _log.info("Busqueda: identificado vía %s para %r", result.provider, entry.name)
+        if result.translated_via_ai:
+            _log.info("Busqueda: sin resultados en ComicVine, la IA tradujo a '%s' para %r",
+                      result.used_query, entry.name)
+        _log.info("Busqueda: %r -> '%s' (confianza %d%%)", entry.name, entry.new_name, entry.confidence)
+        self._mark_auto_processed(entry.path, "identificado_manual", entry.new_name)
+
     def _build_name(self, info, ext):
-        if info.media_type == "movie":
-            tpl = self.config_data.get("movie_template")
-        elif info.media_type == "anime":
-            tpl = self.config_data.get("anime_template")
-        else:
-            tpl = self.config_data.get("tv_template")
-        return build_new_name(info, tpl, ext)
+        templates = {k: self.config_data.get(k) for k in (
+            "movie_template", "anime_template", "comic_template",
+            "libro_template", "tv_template")}
+        return build_name_for_media_info(info, ext, templates)
 
     _SEARCH_DEBOUNCE_MS = 500   # espera tras la última tecla antes de buscar sola
     _SEARCH_MIN_CHARS   = 2     # no buscar con una sola letra
+    _SEARCH_RESULTS_CAP = 30    # tope de resultados mostrados/navegables por búsqueda
 
     def _on_search_key_release(self, event=None):
         """Programa una búsqueda automática tras una pausa al escribir.
@@ -10122,28 +10782,40 @@ class App(_AppBase):
         threading.Thread(target=self._manual_search_worker, args=(query, use_ai_fallback), daemon=True).start()
 
     def _manual_search_worker(self, query, use_ai_fallback=False):
+        entry = self._selected_entry
+        is_comic = bool(entry and entry.is_comic)
+        is_book_only = bool(entry and entry.is_book and not entry.is_comic)
         try:
-            results = self.tmdb.search_multi(query)
+            if is_comic:
+                self._results_kind = "comic"
+                results = self.comicvine.search_volumes(query)
+            elif is_book_only:
+                # OpenLibrary primero (sin key, más fiable ahora mismo que
+                # Google Books, ver core/book_identify.py) -- Google Books de
+                # apoyo si no encuentra nada o falla.
+                self._results_kind = "openlibrary"
+                try:
+                    results = self.openlibrary_client.search_volumes(query)
+                except Exception:
+                    results = []
+                if not results:
+                    self._results_kind = "book"
+                    results = self.book_client.search_volumes(query)
+            else:
+                self._results_kind = "tmdb"
+                results = self.tmdb.search_multi(query)
             # Si mientras tanto el usuario ya escribió algo distinto, esta
             # respuesta ha quedado obsoleta -- no pisar lo que hay ahora.
             if self._result_combo.get().strip() != query:
                 return
-            if not results and use_ai_fallback and self._selected_entry:
+            if not results and use_ai_fallback and self._results_kind == "tmdb" and self._selected_entry:
                 fallback = self._try_ai_fallback(self._selected_entry, self.tmdb)
                 if fallback:
                     results, ai_query, _det = fallback
                     query = ai_query
                     self.after(0, lambda q=ai_query: self._result_combo.set(q))
-            self._tmdb_results = results
-            labels = []
-            for r in results[:10]:
-                if r.get("media_type") == "tv":
-                    name = r.get("name", "")
-                    year = (r.get("first_air_date", "") or "")[:4]
-                else:
-                    name = r.get("title", "")
-                    year = (r.get("release_date", "") or "")[:4]
-                labels.append(f"{name} ({year}) [{r.get('media_type', '')}]")
+            self._tmdb_results = results[:self._SEARCH_RESULTS_CAP]
+            labels = [self._label_for_result(r) for r in self._tmdb_results]
             self.after(0, lambda: self._apply_search_results(labels))
         except Exception as e:
             # Ver _fire_background_link: "e" se borra al salir del except,
@@ -10152,20 +10824,112 @@ class App(_AppBase):
             msg = str(e)
             self.after(0, lambda m=msg: self._set_status(f"Error: {m}", ERROR_COLOR))
 
+    def _manual_ai_translate_comic(self):
+        """Botón "🪄 IA: título original" del panel de búsqueda (solo
+        visible para cómics, ver _reset_search_panel) -- a diferencia del
+        fallback automático de _search_book_entry (que solo se activa si
+        ComicVine no devuelve NADA), este botón es explícito: pedido por el
+        usuario, cubre también el caso más habitual según el feedback real
+        -- ComicVine SÍ encuentra algo, pero está mal por buscar con el
+        título detectado en castellano."""
+        entry = self._selected_entry
+        if not entry or not entry.is_comic:
+            self._set_status("Selecciona un cómic para traducir su título", WARNING_COLOR)
+            return
+        if not self.config_data.get("ai_fallback_enabled"):
+            self._set_status('Activa "Usar IA como último recurso" en Ajustes', WARNING_COLOR)
+            return
+        api_key = self.config_data.get("ai_api_key", "")
+        if not api_key:
+            self._set_status("Configura tu API Key de Groq en Ajustes", WARNING_COLOR)
+            return
+        local_title = self._result_combo.get().strip() or entry.detected.get("title", "")
+        if not local_title:
+            self._set_status("No hay título que traducir", WARNING_COLOR)
+            return
+        self._set_status("Traduciendo título con IA...", WARNING_COLOR)
+        threading.Thread(target=self._manual_ai_translate_comic_worker,
+                          args=(local_title, api_key), daemon=True).start()
+
+    def _manual_ai_translate_comic_worker(self, local_title, api_key):
+        from core.ai_title_fallback import guess_original_comic_title_via_ai
+        translated = guess_original_comic_title_via_ai(local_title, api_key)
+        if not translated:
+            self.after(0, lambda: self._set_status(
+                "La IA no pudo determinar el título original", ERROR_COLOR))
+            return
+        try:
+            results = self.comicvine.search_volumes(translated)
+        except Exception as e:
+            msg = str(e)
+            self.after(0, lambda m=msg: self._set_status(f"Error de ComicVine: {m}", ERROR_COLOR))
+            return
+        self._results_kind = "comic"
+        self.after(0, lambda t=translated: self._result_combo.set(t))
+        if not results:
+            self.after(0, lambda t=translated: self._set_status(
+                f'IA tradujo a "{t}" pero ComicVine sigue sin resultados', WARNING_COLOR))
+            return
+        from core.learned_comic_titles import add_comic_title_translation
+        add_comic_title_translation(local_title, translated)
+        self._tmdb_results = results[:self._SEARCH_RESULTS_CAP]
+        labels = [self._label_for_result(r) for r in self._tmdb_results]
+        self.after(0, lambda: self._apply_search_results(labels))
+        self.after(0, lambda t=translated: self._set_status(f'IA tradujo a "{t}"', SUCCESS_COLOR))
+
+    def _label_for_result(self, r: dict) -> str:
+        """Etiqueta del desplegable de resultados -- cada origen
+        (TMDB/OpenLibrary/Google Books/ComicVine, ver self._results_kind)
+        devuelve el título/año en un sitio distinto de su JSON."""
+        if self._results_kind == "openlibrary":
+            name = r.get("title", "")
+            year = str(r.get("first_publish_year", "") or "")
+            return f"{name} ({year}) [libro-OL]"
+        if self._results_kind == "book":
+            info = r.get("volumeInfo", {}) or {}
+            name = info.get("title", "")
+            year = (info.get("publishedDate", "") or "")[:4]
+            return f"{name} ({year}) [libro]"
+        if self._results_kind == "comic":
+            name = (r.get("volume") or {}).get("name") or r.get("name", "")
+            year = str(r.get("start_year", "") or "")
+            return f"{name} ({year}) [cómic]"
+        if r.get("media_type") == "tv":
+            name = r.get("name", "")
+            year = (r.get("first_air_date", "") or "")[:4]
+        else:
+            name = r.get("title", "")
+            year = (r.get("release_date", "") or "")[:4]
+        return f"{name} ({year}) [{r.get('media_type', '')}]"
+
+    def _build_info_from_result(self, result: dict, det: dict) -> MediaInfo:
+        """Construye el MediaInfo a partir de un resultado crudo, según qué
+        cliente lo produjo (self._results_kind) -- usado tanto al
+        previsualizar (_preview_result) como al asignar
+        (_assign_selected_result)."""
+        if self._results_kind == "openlibrary":
+            return self.openlibrary_client.build_book_info(result)
+        if self._results_kind == "book":
+            return self.book_client.build_book_info(result)
+        if self._results_kind == "comic":
+            return self.comicvine.build_comic_info(result, episode=det.get("episode"))
+        return self.tmdb.build_media_info(result, season=det.get("season"), episode=det.get("episode"))
+
     def _apply_search_results(self, labels):
-        # Recortar las etiquetas al ancho real del combobox: el desplegable
-        # es un menú nativo del SO que se autoajusta a la etiqueta más larga,
-        # así que sin esto se sale del ancho del cuadro de texto con títulos
-        # largos ("El Nombre Larguísimo De La Serie (2024) [tv]").
-        px_width = max(self._result_combo.winfo_width() - 34, 80)
-        shown = _truncate_dropdown_labels(labels, px_width, self._search_dropdown_font)
-        self._result_combo.configure(values=shown)
+        # Sin recortar: el desplegable es un menú nativo del SO que se
+        # autoajusta solo a la etiqueta más larga que se le pase, así que
+        # pasar el título completo no desborda nada -- al contrario que
+        # recortarlo, que dejaba el título truncado para siempre (ni
+        # ensanchar el panel lo arreglaba, porque el recorte se calculaba
+        # una sola vez aquí y no volvía a tocarse).
+        self._result_combo.configure(values=labels)
         # El texto que el usuario escribió se deja tal cual (no se
         # sobrescribe con el resultado) para poder seguir afinando la
         # búsqueda sin que el campo se lo trague cada vez.
         if labels:
             self._preview_result(0)
-            self._set_status(f"{len(labels)} resultado(s) — pulsa ▾ para elegir uno", SUCCESS_COLOR)
+            self._set_status(
+                f"{len(labels)} resultado(s) -- flechas arriba/abajo o ▾ para elegir uno", SUCCESS_COLOR)
             # Nota: se probó abrir el desplegable automáticamente aquí (para
             # no necesitar el clic en la flechita), pero el menú nativo que
             # usa CTkComboBox es modal/bloqueante al abrirse por código
@@ -10174,6 +10938,22 @@ class App(_AppBase):
             # despliega a mano.
         else:
             self._set_status("Sin resultados", WARNING_COLOR)
+
+    def _cycle_search_result(self, delta: int):
+        """Flecha arriba/abajo en el campo de búsqueda -- recorre
+        self._tmdb_results sin abrir el desplegable, actualizando la vista
+        previa (póster, sinopsis, título...) en cada paso, igual que ya
+        hace un clic en el desplegable (_on_result_preview). Se detiene en
+        los extremos en vez de dar la vuelta."""
+        n = len(self._tmdb_results)
+        if n == 0:
+            return "break"
+        idx = max(0, self._previewed_result_idx)
+        idx = max(0, min(n - 1, idx + delta))
+        self._result_combo.set(self._label_for_result(self._tmdb_results[idx]))
+        self._preview_result(idx)
+        self._set_status(f"{idx + 1} de {n} -- flechas para más, \"Asignar\" para elegir este", PENDING_COLOR)
+        return "break"
 
     def _on_result_preview(self, value):
         """Al elegir un resultado del desplegable: solo lo muestra en el
@@ -10185,43 +10965,70 @@ class App(_AppBase):
     def _preview_result(self, idx: int):
         if idx < 0 or idx >= len(self._tmdb_results):
             return
+        self._previewed_result_idx = idx
         result = self._tmdb_results[idx]
         entry  = self._selected_entry
         det    = entry.detected if entry else {}
-        info = self.tmdb.build_media_info(result, season=det.get("season"), episode=det.get("episode"))
+        info = self._build_info_from_result(result, det)
         self._set_textbox_text(self._detail_title, info.title)
-        ep_text = (f"S{info.season:02d}E{info.episode:02d} - {info.episode_title}"
-                   if info.season and info.episode else "")
+        if info.season and info.episode:
+            ep_text = f"S{info.season:02d}E{info.episode:02d} - {info.episode_title}"
+        elif info.media_type == "libro" and info.episode:
+            # Un cómic no tiene "temporada" -- solo número de emisión (ver
+            # detect_episode(is_comic=True)), así que el formato "SxxExx"
+            # de arriba no aplica.
+            ep_text = f"#{info.episode:02d}"
+        else:
+            ep_text = ""
         self._detail_episode.configure(text=ep_text)
         self._detail_year.configure(text=info.year or "")
         self._detail_confidence.configure(text="")
         self._set_textbox_text(self._detail_error, "")
-        self._set_overview_text(info.overview or "")
-        if info.poster_url:
-            token = object()
-            self._poster_token = token
-            self._poster_label.configure(image=None, text="…")
-            threading.Thread(target=self._load_poster, args=(info.poster_url, token), daemon=True).start()
-        else:
-            self._poster_token = None
-            self._poster_label.configure(image=None, text="Sin poster")
+        self._apply_overview_and_poster(info)
 
     def _assign_selected_result(self):
-        """Aplica a la entrada seleccionada el resultado actualmente elegido
-        en el desplegable — el paso explícito que faltaba entre "buscar" y
-        "aceptar", para no asignar automáticamente el primero que aparece."""
+        """Aplica a la entrada seleccionada (o a toda la selección múltiple,
+        ver _current_selection/_toggle_multi_select/_select_range) el
+        resultado actualmente elegido en el desplegable — el paso explícito
+        que faltaba entre "buscar" y "aceptar", para no asignar
+        automáticamente el primero que aparece."""
         entry = self._selected_entry
         if not entry:
             return
         value = self._result_combo.get()
         vals  = self._result_combo.cget("values")
-        idx   = vals.index(value) if value in vals else -1
+        if value in vals:
+            idx = vals.index(value)
+        else:
+            # El texto del campo no coincide con ningún valor del
+            # desplegable -- normal si el usuario sigue escribiendo para
+            # afinar la búsqueda (ver el comentario en
+            # _apply_search_results), pero también pasa justo tras
+            # buscar: el primer resultado se previsualiza solo (póster,
+            # sinopsis...) sin tocar el texto del campo. En ese caso
+            # "Asignar" debe aplicar lo que se ve AHORA en el panel de
+            # detalles, no quedarse callado solo porque el desplegable en
+            # sí no tiene nada "elegido" -- antes esto no hacía nada,
+            # confuso porque la info ya estaba a la vista.
+            idx = self._previewed_result_idx
         if idx < 0 or idx >= len(self._tmdb_results):
             self._set_status("Busca y elige un resultado primero", WARNING_COLOR)
             return
         result = self._tmdb_results[idx]
+
+        targets = self._current_selection()
+        if len(targets) > 1:
+            # Varios archivos marcados -- en segundo plano, puede hacer una
+            # llamada TMDB por archivo para enriquecer el título de episodio
+            # (ver _build_info_from_result) y no debe bloquear la interfaz
+            # con una tanda grande.
+            self._set_status(f"Asignando a {len(targets)} archivo(s)...", WARNING_COLOR)
+            threading.Thread(target=self._assign_to_selection_worker,
+                              args=(result, targets), daemon=True).start()
+            return
+
         det  = entry.detected
-        info = self.tmdb.build_media_info(result, season=det.get("season"), episode=det.get("episode"))
+        info = self._build_info_from_result(result, det)
         entry.media_info = info
         entry.new_name   = self._build_name(info, entry.ext)
         entry.status     = "listo"
@@ -10235,6 +11042,42 @@ class App(_AppBase):
         self._update_row(entry)
         self._update_detail(entry)
         self._set_status(f"Asignado: {info.title}", SUCCESS_COLOR)
+
+    def _assign_to_selection_worker(self, result, targets):
+        """Aplica *result* a cada archivo de *targets* (varios marcados con
+        Ctrl/Shift+clic) -- cada uno conserva su propio episodio/número de
+        capítulo ya detectado de su nombre (entry.detected), solo se
+        comparte la serie/título/portada. Omite (sin aplicar a la fuerza)
+        los archivos cuyo tipo no coincide con el del resultado elegido
+        (p.ej. un vídeo mezclado por error en una selección de cómics)."""
+        kind = self._results_kind
+        ok, skipped = 0, 0
+        for entry in targets:
+            matches = (
+                (kind == "comic" and entry.is_comic) or
+                (kind in ("openlibrary", "book") and entry.is_book and not entry.is_comic) or
+                (kind == "tmdb" and not entry.is_book)
+            )
+            if not matches:
+                skipped += 1
+                continue
+            info = self._build_info_from_result(result, entry.detected)
+            entry.media_info = info
+            entry.new_name   = self._build_name(info, entry.ext)
+            entry.status     = "listo"
+            entry.error_msg  = ""
+            self._mark_auto_processed(entry.path, "identificado_manual", entry.new_name)
+            ok += 1
+            self.after(0, lambda e=entry: self._update_row(e))
+
+        def _finish(ok=ok, skipped=skipped):
+            msg = f"Asignado a {ok} archivo(s)"
+            if skipped:
+                msg += f" -- {skipped} omitido(s) por tipo distinto"
+            self._set_status(msg, SUCCESS_COLOR if ok else WARNING_COLOR)
+            if self._selected_entry in targets:
+                self._update_detail(self._selected_entry)
+        self.after(0, _finish)
 
     # -------------------------------------------------------- Detail panel
 
@@ -10288,6 +11131,83 @@ class App(_AppBase):
     def _set_overview_text(self, text: str):
         self._set_textbox_text(self._detail_overview, text)
 
+    def _set_poster(self, text: str, image=None):
+        """Establece imagen+texto del póster (self._poster_label, compartido
+        entre la fila seleccionada de la tabla y la vista previa de
+        resultados de búsqueda) -- nunca pasar image=None directamente a
+        CTkLabel.configure, ver self._blank_poster_image."""
+        self._poster_label.configure(image=image or self._blank_poster_image, text=text)
+
+    def _is_openlibrary_work(self, info) -> bool:
+        """True si *info* vino de OpenLibrary -- se detecta por la forma de
+        su id (tmdb_id reutilizado como string, ver core/openlibrary_client.py
+        ::build_book_info), ya que MediaInfo no tiene un campo "proveedor"
+        propio y no hace falta añadir uno solo para esto."""
+        return info.media_type == "libro" and isinstance(info.tmdb_id, str) and info.tmdb_id.startswith("/works/")
+
+    def _apply_overview_and_poster(self, info):
+        """Sinopsis + carátula de *info* -- compartido entre _preview_result
+        (resultado del desplegable de búsqueda) y _update_detail (fila ya
+        asignada), ambos escriben en los mismos widgets."""
+        is_ol = self._is_openlibrary_work(info)
+        if info.overview:
+            self._set_overview_text(info.overview)
+        elif is_ol:
+            # OpenLibrary no trae sinopsis en la búsqueda -- se pide aparte
+            # en segundo plano (ver _maybe_load_openlibrary_description).
+            # Mostrar algo mientras tanto en vez de dejarlo en blanco (mismo
+            # motivo que el "Cargando…" de la carátula, más abajo).
+            self._set_overview_text("Cargando sinopsis…")
+        else:
+            self._set_overview_text("")
+        if is_ol:
+            self._maybe_load_openlibrary_description(info)
+        else:
+            # Invalida cualquier carga de sinopsis de OpenLibrary todavía en
+            # vuelo -- si no, una respuesta tardía de la selección ANTERIOR
+            # podía llegar después de cambiar a esta (que no es de
+            # OpenLibrary) y sobreescribir su sinopsis igualmente.
+            self._overview_token = None
+
+        if info.poster_url:
+            token = object()                    # token único por carga
+            self._poster_token = token
+            self._set_poster("Cargando carátula…")
+            threading.Thread(target=self._load_poster, args=(info.poster_url, token), daemon=True).start()
+        else:
+            self._poster_token = None
+            self._set_poster("Sin carátula")
+
+    def _maybe_load_openlibrary_description(self, info):
+        """/search.json de OpenLibrary no trae una sinopsis de verdad (ver
+        core/openlibrary_client.py::build_book_info) -- se pide aparte a
+        /works/{id}.json en segundo plano, con el mismo patrón de token que
+        ya usa _load_poster, para no pisar una selección más reciente si la
+        respuesta llega tarde."""
+        token = object()
+        self._overview_token = token
+        prefix = info.overview or ""
+        threading.Thread(target=self._load_openlibrary_description,
+                          args=(info.tmdb_id, token, prefix), daemon=True).start()
+
+    def _load_openlibrary_description(self, work_key, token, prefix):
+        description = ""
+        try:
+            description = self.openlibrary_client.get_work_description(work_key)
+        except Exception:
+            pass
+
+        def _apply(t=token, d=description, p=prefix):
+            if getattr(self, "_overview_token", None) != t:
+                return   # ya se seleccionó otra cosa mientras se esperaba
+            if d:
+                self._set_overview_text(f"{p}\n\n{d}".strip() if p else d)
+            elif not p:
+                self._set_overview_text("Sin sinopsis disponible")
+            # si ya había algo (autor/first_sentence) y no llegó descripción
+            # nueva, se deja tal cual -- no hace falta hacer nada.
+        self.after(0, _apply)
+
     def _update_detail(self, entry):
         info = entry.media_info
         reason = entry.error_msg if entry.status in ("error", "omitido") and entry.error_msg else ""
@@ -10298,12 +11218,18 @@ class App(_AppBase):
             self._detail_episode.configure(text="Sin informacion de TMDB")
             self._detail_year.configure(text="")
             self._detail_confidence.configure(text="")
+            self._overview_token = None
             self._set_overview_text("")
-            self._poster_label.configure(image=None, text="Sin poster")
+            self._poster_token = None
+            self._set_poster("Sin carátula")
             return
         self._set_textbox_text(self._detail_title, info.title)
-        ep_text = (f"S{info.season:02d}E{info.episode:02d} - {info.episode_title}"
-                   if info.season and info.episode else "")
+        if info.season and info.episode:
+            ep_text = f"S{info.season:02d}E{info.episode:02d} - {info.episode_title}"
+        elif info.media_type == "libro" and info.episode:
+            ep_text = f"#{info.episode:02d}"
+        else:
+            ep_text = ""
         self._detail_episode.configure(text=ep_text)
         self._detail_year.configure(text=info.year or "")
         # Confianza
@@ -10319,29 +11245,27 @@ class App(_AppBase):
                 text=f"Confianza: {conf}%", text_color=conf_color)
         else:
             self._detail_confidence.configure(text="")
-        self._set_overview_text(info.overview or "")
-        if info.poster_url:
-            token = object()                    # token único por carga
-            self._poster_token = token
-            self._poster_label.configure(image=None, text="…")
-            threading.Thread(target=self._load_poster, args=(info.poster_url, token), daemon=True).start()
-        else:
-            self._poster_token = None
-            self._poster_label.configure(image=None, text="Sin poster")
+        self._apply_overview_and_poster(info)
 
     def _load_poster(self, url, token):
         try:
             r   = requests.get(url, timeout=8)
             img = Image.open(BytesIO(r.content)).resize((180, 260), Image.LANCZOS)
             ctk_img = ctk.CTkImage(img, size=(180, 260))
-            # Solo aplicar si no se ha limpiado/cambiado de selección mientras cargaba
             def _apply(t=token, i=ctk_img):
+                # Solo aplicar si no se ha limpiado/cambiado de selección
+                # mientras cargaba.
                 if getattr(self, "_poster_token", None) == t:
-                    self._poster_label.configure(image=i, text="")
                     self._current_poster = i
+                    self._set_poster("", image=i)
             self.after(0, _apply)
         except Exception:
-            pass
+            # Sin esto, un fallo de red dejaba "Cargando carátula…" fijo
+            # para siempre en vez de resolverse en algo concreto.
+            def _apply_error(t=token):
+                if getattr(self, "_poster_token", None) == t:
+                    self._set_poster("Sin carátula")
+            self.after(0, _apply_error)
 
     def _clear_detail(self):
         if self._selected_entry is not None:
@@ -10350,15 +11274,21 @@ class App(_AppBase):
                     row["frame"].configure(fg_color="transparent")
                     break
         self._selected_entry = None
+        # Sin ancla no hay a quién aplicar "Asignar a la selección" -- se
+        # descarta también el resto de la selección múltiple para no dejar
+        # filas resaltadas huérfanas sin ningún efecto posible.
+        self._multi_selected.clear()
         self._poster_token = None          # cancela cualquier carga de póster en curso
+        self._overview_token = None        # cancela cualquier carga de sinopsis de OpenLibrary en curso
         self._current_poster = None
         for lbl in (self._detail_episode, self._detail_year, self._detail_confidence):
             lbl.configure(text="")
         self._set_textbox_text(self._detail_title, "")
         self._set_textbox_text(self._detail_error, "")
         self._set_overview_text("")
-        self._poster_label.configure(image=None, text="—")
+        self._set_poster("—")
         self._update_status_bar()
+        self._update_assign_button_label()
 
     # ----------------------------------------------------------- Rename
 
@@ -10370,7 +11300,7 @@ class App(_AppBase):
         # fallar en silencio otra vez (ver _rename_worker).
         ready = [e for e in self.files if e.status in ("listo", "error") and e.new_name]
         if not ready:
-            self._set_status("No hay archivos listos -- usa Buscar TMDB primero", WARNING_COLOR)
+            self._set_status("No hay archivos listos -- identifícalos primero (panel de búsqueda)", WARNING_COLOR)
             return
         if not messagebox.askyesno("Confirmar", f"Renombrar {len(ready)} archivo(s)?"):
             return
@@ -10438,29 +11368,37 @@ class App(_AppBase):
         """Estado registrado en auto_processed.json para original_path, o "" si no hay nada."""
         import json as _json
         try:
-            from core.auto_watcher import _processed_db_path
-            p = _processed_db_path()
-            if not p.exists():
-                return ""
-            db = _json.loads(p.read_text(encoding="utf-8"))
+            from core.auto_watcher import _processed_db_path, _DB_LOCK
+            with _DB_LOCK:
+                p = _processed_db_path()
+                if not p.exists():
+                    return ""
+                db = _json.loads(p.read_text(encoding="utf-8"))
             return db.get(original_path, {}).get("status", "")
         except Exception:
             return ""
 
     def _mark_auto_processed(self, original_path: str, status: str, new_name: str = ""):
-        """Marca un archivo como procesado en auto_processed.json para que el watcher lo ignore."""
+        """Marca un archivo como procesado en auto_processed.json para que el watcher lo ignore.
+        Usa _DB_LOCK (compartido con AutoWatcher, ver core/auto_watcher.py::
+        _save_entry) para que este leer-modificar-escribir no se pise con
+        otra subida manual en paralelo ni con el modo automático escribiendo
+        a la vez -- sin el lock, dos hilos podían basar su escritura en la
+        misma lectura desactualizada y uno de los dos perdía su marca
+        "subido", haciendo que ese archivo "reapareciera" como nuevo."""
         import json as _json, time as _t
         try:
-            from core.auto_watcher import _processed_db_path
-            p = _processed_db_path()
-            db = {}
-            if p.exists():
-                try:
-                    db = _json.loads(p.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
-            db[original_path] = {"status": status, "new_name": new_name, "ts": _t.time()}
-            p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+            from core.auto_watcher import _processed_db_path, _DB_LOCK
+            with _DB_LOCK:
+                p = _processed_db_path()
+                db = {}
+                if p.exists():
+                    try:
+                        db = _json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+                db[original_path] = {"status": status, "new_name": new_name, "ts": _t.time()}
+                p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -10471,14 +11409,15 @@ class App(_AppBase):
         AutoWatcher para siempre."""
         import json as _json
         try:
-            from core.auto_watcher import _processed_db_path
-            p = _processed_db_path()
-            if not p.exists():
-                return
-            db = _json.loads(p.read_text(encoding="utf-8"))
-            if original_path in db:
-                del db[original_path]
-                p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+            from core.auto_watcher import _processed_db_path, _DB_LOCK
+            with _DB_LOCK:
+                p = _processed_db_path()
+                if not p.exists():
+                    return
+                db = _json.loads(p.read_text(encoding="utf-8"))
+                if original_path in db:
+                    del db[original_path]
+                    p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -10491,17 +11430,18 @@ class App(_AppBase):
         siempre, porque nada más lo desmarcaría."""
         import json as _json
         try:
-            from core.auto_watcher import _processed_db_path
-            p = _processed_db_path()
-            if not p.exists():
-                return
-            db = _json.loads(p.read_text(encoding="utf-8"))
-            stale = [k for k, v in db.items() if v.get("status") == "subiendo"]
-            if not stale:
-                return
-            for k in stale:
-                del db[k]
-            p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+            from core.auto_watcher import _processed_db_path, _DB_LOCK
+            with _DB_LOCK:
+                p = _processed_db_path()
+                if not p.exists():
+                    return
+                db = _json.loads(p.read_text(encoding="utf-8"))
+                stale = [k for k, v in db.items() if v.get("status") == "subiendo"]
+                if not stale:
+                    return
+                for k in stale:
+                    del db[k]
+                p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
@@ -10617,6 +11557,34 @@ class App(_AppBase):
             ok  = validate_api_key(key)
             msg = "API Key válida" if ok else "API Key inválida"
             self.after(0, lambda: self._ai_key_status.configure(
+                text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _validate_comicvine_key(self):
+        key = self._comicvine_key_entry.get().strip()
+        if not key:
+            self._comicvine_key_status.configure(text="Ingresa una API Key", text_color=ERROR_COLOR)
+            return
+        self.comicvine.set_api_key(key)
+        self._comicvine_key_status.configure(text="Validando...", text_color=WARNING_COLOR)
+        def worker():
+            ok  = self.comicvine.validate_key()
+            msg = "API Key válida" if ok else "API Key inválida"
+            self.after(0, lambda: self._comicvine_key_status.configure(
+                text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _validate_google_books_key(self):
+        """A diferencia de _validate_comicvine_key, aquí la key es opcional
+        -- un campo vacío es válido (vuelve a la cuota anónima), no un
+        error, así que no hay caso "Ingresa una API Key"."""
+        key = self._google_books_key_entry.get().strip()
+        self.book_client.set_api_key(key)
+        self._google_books_key_status.configure(text="Validando...", text_color=WARNING_COLOR)
+        def worker():
+            ok  = self.book_client.validate_key()
+            msg = "API Key válida" if ok else "API Key inválida"
+            self.after(0, lambda: self._google_books_key_status.configure(
                 text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
         threading.Thread(target=worker, daemon=True).start()
 
@@ -10749,13 +11717,15 @@ class App(_AppBase):
         except ValueError:
             quota_gb = 100
 
-        self._sync_category_widgets_to_data("tv")
-        self._sync_category_widgets_to_data("movie")
+        for mt in self._CATEGORY_TYPES:
+            self._sync_category_widgets_to_data(mt)
 
         return {
             "watch_folder":          self._watch_folder_entry.get().strip(),
             "poll_interval":         poll,
             "auto_action":           self._auto_action_combo.get(),
+            "manual_action":         self._manual_action_combo.get(),
+            "auto_extract_archives": self._auto_extract_switch.get() in (True, "1", 1),
             "start_with_windows":    self._autostart_switch.get() in (True, "1", 1),
             "desktop_notifications": self._notif_switch.get() in (True, "1", 1),
             "min_confidence":        int(self._conf_slider.get()),
@@ -10779,6 +11749,9 @@ class App(_AppBase):
             "ai_fallback_enabled": self._ai_fallback_switch.get() in (True, "1", 1),
             "ai_api_key":          self._ai_key_entry.get().strip(),
 
+            "comicvine_api_key": self._comicvine_key_entry.get().strip(),
+            "google_books_api_key": self._google_books_key_entry.get().strip(),
+
             "plex_enabled": self._plex_switch.get() in (True, "1", 1),
             "plex_host":    self._plex_host_entry.get().strip(),
             "plex_token":   self._plex_token_entry.get().strip(),
@@ -10790,6 +11763,8 @@ class App(_AppBase):
             "tv_template":    self._tpl_entries["tv_template"].get().strip(),
             "movie_template": self._tpl_entries["movie_template"].get().strip(),
             "anime_template": self._tpl_entries["anime_template"].get().strip(),
+            "libro_template": self._tpl_entries["libro_template"].get().strip(),
+            "comic_template": self._tpl_entries["comic_template"].get().strip(),
 
             "custom_links_show": [
                 {"name": w["name"].get().strip(), "url_template": w["url"].get().strip(),
@@ -10813,8 +11788,8 @@ class App(_AppBase):
             "reservation_quota_gb": quota_gb,
 
             "ftp_categories": {
-                "tv":    [self._category_to_plain_dict(c) for c in self._tv_categories],
-                "movie": [self._category_to_plain_dict(c) for c in self._movie_categories],
+                mt: [self._category_to_plain_dict(c) for c in self._categories[mt]]
+                for mt in self._CATEGORY_TYPES
             },
         }
 
@@ -10873,6 +11848,16 @@ class App(_AppBase):
         self._set_autostart(data["start_with_windows"])
         self.tmdb.set_api_key(data["tmdb_api_key"])
         self.tmdb.set_language(data["language"])
+        # Sin esto, self.comicvine/self.book_client (creados una sola vez en
+        # __init__) se quedaban con la key vieja hasta reiniciar la app --
+        # el "Guardar" la persistía en config.json, pero el cliente en
+        # memoria seguía usando la de antes (vacía, para Google Books, hasta
+        # que el usuario configuraba una) durante toda la sesión. Bug real:
+        # tras poner una API Key de Google Books y guardar, las búsquedas
+        # seguían fallando por la cuota anónima porque la key nunca llegó
+        # al cliente ya en uso.
+        self.comicvine.set_api_key(data["comicvine_api_key"])
+        self.book_client.set_api_key(data["google_books_api_key"])
         if self._watcher and self._watcher.running:
             self._watcher.poll_interval = data["poll_interval"]
         self._invalidate_missing_ep_detail_frames()
@@ -10979,13 +11964,14 @@ class App(_AppBase):
 
     def _set_autostart(self, enabled: bool):
         """Añade o elimina el arranque automático al iniciar sesión —
-        registro de Windows o LaunchAgent de macOS según la plataforma."""
+        registro de Windows, LaunchAgent de macOS, o .desktop de
+        autoarranque XDG en Linux, según la plataforma."""
         if is_windows():
             self._set_autostart_windows(enabled)
         elif is_macos():
             self._set_autostart_macos(enabled)
-        # Linux: sin una convención única estándar (systemd user unit vs.
-        # .desktop en autostart/) — no implementado, el switch no hace nada.
+        elif is_linux():
+            self._set_autostart_linux(enabled)
 
     def _set_autostart_windows(self, enabled: bool):
         try:
@@ -11046,6 +12032,40 @@ class App(_AppBase):
                 plist_path.unlink()
         except Exception as e:
             self._set_status(f"Error LaunchAgent: {e}", ERROR_COLOR)
+
+    _LINUX_AUTOSTART_FILENAME = "arenombrar-autostart.desktop"
+
+    def _linux_autostart_path(self) -> Path:
+        return Path.home() / ".config" / "autostart" / self._LINUX_AUTOSTART_FILENAME
+
+    def _set_autostart_linux(self, enabled: bool):
+        """Equivalente Linux del registro de Windows/LaunchAgent de macOS:
+        un archivo .desktop en ~/.config/autostart/ -- la convención XDG
+        (freedesktop.org) que GNOME/KDE/XFCE y la mayoría de entornos de
+        escritorio ya respetan de fábrica, sin depender de una unidad de
+        systemd ni de nada específico de una distribución concreta."""
+        path = self._linux_autostart_path()
+        try:
+            if enabled:
+                if getattr(sys, "frozen", False):
+                    exec_cmd = f'"{sys.executable}" --minimized'
+                else:
+                    main_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))
+                    exec_cmd = f'"{sys.executable}" "{main_py}" --minimized'
+                content = (
+                    "[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=aRenombrar\n"
+                    f"Exec={exec_cmd}\n"
+                    "X-GNOME-Autostart-enabled=true\n"
+                    "Terminal=false\n"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            elif path.exists():
+                path.unlink()
+        except Exception as e:
+            self._set_status(f"Error autoarranque: {e}", ERROR_COLOR)
 
     # ──────────────────────────────────────────────────────────────────
 
@@ -11147,8 +12167,20 @@ class App(_AppBase):
 
         # -- Identificación / subida --
         if entry.status != "subido":
-            menu.add_command(label="🔍 Buscar de nuevo en TMDB",
+            menu.add_command(label=f"🔍 Buscar de nuevo en {self._search_source_name(entry)}",
                              command=lambda: self._search_new_entries([entry]))
+        if entry.is_book and entry.status != "subido":
+            # La extensión sola no basta para decidir libro de texto vs
+            # cómic -- un .pdf/.epub/.cbz/.cbr puede ser cualquiera de los
+            # dos en la práctica (p.ej. un cómic escaneado en PDF), así que
+            # esto es una elección del usuario por archivo, no una
+            # detección automática (ver _set_book_comic_type).
+            if entry.is_comic:
+                menu.add_command(label="📖 Tratar como libro de texto (Google Books)",
+                                 command=lambda: self._set_book_comic_type(entry, is_comic=False))
+            else:
+                menu.add_command(label="📕 Tratar como cómic/manga (ComicVine)",
+                                 command=lambda: self._set_book_comic_type(entry, is_comic=True))
         if entry.media_info and entry.status in ("listo", "renombrado", "error", "omitido"):
             menu.add_command(label="▲  Subir este archivo", command=lambda: self._upload_one(entry))
         menu.add_command(label="✎  Editar carpeta de destino…",
@@ -11256,6 +12288,16 @@ class App(_AppBase):
                 safe_msg   = msg.replace('"', "'")[:200]
                 script = f'display notification "{safe_msg}" with title "{safe_title}"'
                 subprocess.Popen(["osascript", "-e", script])
+            except Exception:
+                pass
+        # Fallback: notify-send (Linux) -- viene de libnotify, presente de
+        # fábrica en GNOME/KDE/XFCE y la mayoría de escritorios Linux
+        # normales, aunque no garantizado en un gestor de ventanas mínimo
+        # sin barra de notificaciones (i3, dwm...) -- ahí simplemente no
+        # hace nada, igual que si pystray tampoco estuviera disponible.
+        elif is_linux():
+            try:
+                subprocess.Popen(["notify-send", title[:100], msg[:200]])
             except Exception:
                 pass
 
@@ -12190,12 +13232,21 @@ class App(_AppBase):
                 progress_cb(0, 0, "Listando carpetas del FTP...")
             from core.cleanup_candidates import group_loose_files_by_name
 
-            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": []})
+            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
             folder_list = []       # [(media_type, categoria, root, carpeta), ...]
             loose_groups_list = []  # [(media_type, categoria, root, nombre_base, {"size_bytes","file_names"}), ...]
             ftp_tree_sizes = {}    # (root, carpeta) -> tamaño, solo si "LIST -R" funcionó para ese root
             dash_r_roots = 0
             for media_type, cat_list in cats.items():
+                # "Liberar espacio" decide qué borrar según el visionado en
+                # Plex/Jellyfin -- un dato que no existe para libros/cómics,
+                # así que "libro" queda fuera de este escaneo en esta
+                # primera versión (igual que se excluyó de AutoWatcher) en
+                # vez de generalizar todo este flujo (bucket de uso,
+                # icono, ficha de detalle vía TMDB...) para un tipo que
+                # nunca tendría datos que mostrar aquí.
+                if media_type not in ("tv", "movie"):
+                    continue
                 for cat in cat_list:
                     root = cat.get("root", "").rstrip("/")
                     if not root:

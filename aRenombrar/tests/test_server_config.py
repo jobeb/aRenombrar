@@ -42,8 +42,8 @@ def test_shared_config_keys_excludes_ftp_connection_and_personal_state():
                     "app_user_name", "shared_data_ftp_path",
                     "appearance", "color_theme", "last_dir", "table_col_widths",
                     "skipped_update_version", "watch_folder", "poll_interval",
-                    "auto_action", "min_confidence", "desktop_notifications",
-                    "start_with_windows", "rename_local"}
+                    "auto_action", "manual_action", "auto_extract_archives", "min_confidence",
+                    "desktop_notifications", "start_with_windows", "rename_local"}
     assert client_only.isdisjoint(SHARED_CONFIG_KEYS)
 
 
@@ -65,7 +65,8 @@ def test_shared_config_keys_includes_credentials_shared_by_group_choice():
     decidió compartir una única cuenta en vez de que cada persona
     registre la suya (ver la nota de seguridad en core/server_config.py:
     viajan en texto plano en el JSON del FTP, no en keyring)."""
-    shared_credentials = {"tmdb_api_key", "ai_api_key", "plex_token", "jellyfin_api_key"}
+    shared_credentials = {"tmdb_api_key", "ai_api_key", "plex_token", "jellyfin_api_key",
+                           "comicvine_api_key"}
     assert shared_credentials <= set(SHARED_CONFIG_KEYS)
 
 
@@ -76,7 +77,8 @@ def test_shared_config_keys_pins_the_exact_set():
     ser deliberado y pasar por este test, no colarse sin darse cuenta)."""
     assert set(SHARED_CONFIG_KEYS) == {
         "tmdb_api_key", "language", "ai_api_key", "ai_fallback_enabled",
-        "tv_template", "movie_template", "anime_template",
+        "comicvine_api_key", "google_books_api_key",
+        "tv_template", "movie_template", "anime_template", "libro_template", "comic_template",
         "ftp_categories",
         "rename_remote",
         "plex_enabled", "plex_host", "plex_token",

@@ -41,6 +41,17 @@ def test_add_ignores_blank_tokens(tmp_path, monkeypatch):
     assert result == ["Real"]
 
 
+def test_add_rejects_tokens_shorter_than_three_chars(tmp_path, monkeypatch):
+    # Bug real: la IA aprendió "LA" como termino basura -- al usarse como
+    # \b(LA)\b insensible a mayúsculas, truncaba el título de CUALQUIER
+    # archivo futuro con esa palabra suelta (p.ej. "Avatar LA Busqueda"
+    # quedaba en solo "Avatar"). Un token de 1-2 letras es demasiado
+    # genérico para aprenderse sin revisión humana.
+    mod = _isolated(monkeypatch, tmp_path)
+    result = mod.add_learned_terms(["LA", "X", "AC3", "DSNYP"])
+    assert result == ["AC3", "DSNYP"]
+
+
 def test_remove_learned_term(tmp_path, monkeypatch):
     mod = _isolated(monkeypatch, tmp_path)
     mod.add_learned_terms(["DSNYP", "Multi", "RUIDO"])

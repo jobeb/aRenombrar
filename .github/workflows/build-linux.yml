@@ -1,0 +1,37 @@
+name: Build Linux
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aRenombrar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias del sistema (Tk, para PyInstaller)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+      - name: Instalar dependencias
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Compilar con PyInstaller
+        run: pyinstaller aRenombrar.spec
+      - name: Leer versión de core/version.py
+        id: version
+        run: |
+          VERSION=$(python3 -c "import re; print(re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('core/version.py', encoding='utf-8').read()).group(1))")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Empaquetar en tar.gz
+        run: |
+          cp aRenombrar.desktop IconoSinFondo.png dist/aRenombrar/
+          tar -C dist -czf "aRenombrar_${{ steps.version.outputs.version }}_linux.tar.gz" aRenombrar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aRenombrar-linux
+          path: aRenombrar/aRenombrar_${{ steps.version.outputs.version }}_linux.tar.gz

@@ -3,9 +3,13 @@ import pytest
 from core.api_client import MediaInfo
 from core.renamer import (
     DEFAULT_ANIME_TEMPLATE,
+    DEFAULT_LIBRO_TEMPLATE,
     DEFAULT_MOVIE_TEMPLATE,
     DEFAULT_TV_TEMPLATE,
     build_new_name,
+    is_archive_file,
+    is_book_file,
+    is_comic_file,
     is_video_file,
     rename_file,
 )
@@ -128,3 +132,66 @@ def test_is_video_file_recognizes_known_extensions(ext):
 @pytest.mark.parametrize("ext", [".srt", ".ass", ".txt", ".nfo", ".jpg"])
 def test_is_video_file_rejects_non_video_extensions(ext):
     assert is_video_file(f"archivo{ext}") is False
+
+
+@pytest.mark.parametrize("ext", [".pdf", ".epub", ".mobi", ".azw3", ".cbz", ".cbr", ".PDF"])
+def test_is_book_file_recognizes_known_extensions(ext):
+    assert is_book_file(f"libro{ext}") is True
+
+
+@pytest.mark.parametrize("ext", [".mkv", ".srt", ".jpg"])
+def test_is_book_file_rejects_non_book_extensions(ext):
+    assert is_book_file(f"archivo{ext}") is False
+
+
+@pytest.mark.parametrize("ext", [".cbz", ".cbr"])
+def test_is_comic_file_recognizes_comic_extensions(ext):
+    assert is_comic_file(f"comic{ext}") is True
+
+
+@pytest.mark.parametrize("ext", [".pdf", ".epub", ".mobi", ".azw3"])
+def test_is_comic_file_rejects_plain_ebook_extensions(ext):
+    # Un ebook de texto es "libro" pero NO "cómic" -- is_book_file() es
+    # True para ambos, is_comic_file() distingue el subcaso.
+    assert is_comic_file(f"libro{ext}") is False
+
+
+def test_build_new_name_libro_default_template():
+    info = MediaInfo(
+        tmdb_id="zyTCAlFPjgYC", media_type="libro", title="El Nombre del Viento",
+        original_title="El Nombre del Viento", year="2007",
+    )
+    name = build_new_name(info, DEFAULT_LIBRO_TEMPLATE, ".epub")
+    assert name == "El Nombre del Viento.epub"
+
+
+def test_build_new_name_comic_with_issue_number():
+    info = MediaInfo(
+        tmdb_id="4050-12345", media_type="libro",
+        title="Avatar - The Last Airbender - The Promise",
+        original_title="Avatar - The Last Airbender - The Promise",
+        year="2012", episode=1, genre_ids=["comic"],
+    )
+    name = build_new_name(info, "{serie} ({año}) #{episodio:02d}{ext}", ".cbr")
+    assert name == "Avatar - The Last Airbender - The Promise (2012) #01.cbr"
+
+
+@pytest.mark.parametrize("ext", [".zip", ".7z", ".rar", ".tar", ".tgz", ".tbz2", ".txz", ".ZIP"])
+def test_is_archive_file_recognizes_single_suffix_extensions(ext):
+    assert is_archive_file(f"comprimido{ext}") is True
+
+
+@pytest.mark.parametrize("compound", [".tar.gz", ".tar.bz2", ".tar.xz", ".TAR.GZ"])
+def test_is_archive_file_recognizes_compound_tar_suffixes(compound):
+    # Path.suffix (get_extension) solo ve el último punto (".gz"), así que
+    # is_archive_file tiene que comprobar también los dos últimos sufijos
+    # juntos para reconocer estas variantes compuestas.
+    assert is_archive_file(f"Mi.Comic.Favorito{compound}") is True
+
+
+@pytest.mark.parametrize("ext", [".mkv", ".pdf", ".cbz", ".txt", ".gz"])
+def test_is_archive_file_rejects_non_archive_extensions(ext):
+    # ".gz" suelto (sin ".tar" delante) no es un archivo comprimido que
+    # sepamos descomprimir por sí solo (sería un único archivo comprimido,
+    # no un contenedor) -- solo cuenta la forma compuesta ".tar.gz".
+    assert is_archive_file(f"archivo{ext}") is False

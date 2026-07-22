@@ -47,12 +47,27 @@ def _save(terms: list[str]) -> None:
 def add_learned_terms(new_tokens: list[str]) -> list[str]:
     """Añade tokens nuevos (sin duplicar y descartando ruido obvio como
     extensiones de archivo coladas por error) y los persiste. Devuelve la
-    lista completa resultante."""
+    lista completa resultante.
+
+    Los tokens de menos de 3 caracteres se descartan -- bug real: la IA
+    aprendió "LA" como término basura (probablemente de un marcador de
+    idioma pegado, p.ej. "...LAT.mkv"), y como los términos aprendidos se
+    usan como \\b(termino)\\b insensible a mayúsculas (ver
+    core/api_client.py::_learned_junk_pattern), "LA" cortaba el título de
+    CUALQUIER archivo futuro que contuviera esa palabra suelta -- p.ej.
+    "Avatar LA Busqueda" se quedaba truncado en solo "Avatar", con
+    consecuencias serias (serie equivocada al buscar). Un término de 1-2
+    letras es casi siempre demasiado genérico para ser un marcador técnico
+    de verdad; los de 3+ (p.ej. "TS", "NF" YA están en la lista estática
+    JUNK_MARKERS, revisada a mano, no aquí) tienen muchas menos
+    probabilidades de coincidir por casualidad con parte de un título."""
     existing = load_learned_terms()
     existing_lower = {t.lower() for t in existing}
     for tok in new_tokens or []:
         tok = (tok or "").strip()
         if not tok:
+            continue
+        if len(tok) < 3:
             continue
         if re.fullmatch(r"\.[a-zA-Z0-9]{2,4}", tok):   # extensión colada por error (".mkv"...)
             continue

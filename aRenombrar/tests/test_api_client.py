@@ -398,3 +398,103 @@ def test_detect_movie_has_empty_extra_episodes():
     r = detect_episode("Inception (2010) 1080p.mkv")
     assert r["media_type"] == "movie"
     assert r["extra_episodes"] == []
+
+
+def test_detect_ebook_bypasses_episode_patterns():
+    r = detect_episode("El Nombre del Viento.epub", is_book=True)
+    assert r["media_type"] == "libro"
+    assert r["season"] is None
+    assert r["episode"] is None
+    assert r["title"] == "El Nombre Del Viento"
+
+
+def test_detect_comic_extracts_issue_number():
+    # Formato real confirmado contra cómics ya en el servidor del usuario.
+    r = detect_episode("Avatar - The Last Airbender - The Promise (2012) #01.cbr",
+                        is_book=True, is_comic=True)
+    assert r["media_type"] == "libro"
+    assert r["season"] is None
+    assert r["episode"] == 1
+    assert "#" not in r["title"]
+
+
+def test_detect_comic_without_issue_number_falls_back_to_no_episode():
+    r = detect_episode("Some Random Comic.cbz", is_book=True, is_comic=True)
+    assert r["media_type"] == "libro"
+    assert r["episode"] is None
+
+
+def test_detect_comic_regression_numeric_filename_without_is_book_flag_is_unaffected():
+    # Sin is_book=True (comportamiento por defecto, para archivos de
+    # vídeo), un nombre como este SIGUE cayendo en el patrón numérico de
+    # anime -- is_book/is_comic son estrictamente opt-in, el llamador
+    # (gui/app.py) decide según la extensión real del archivo.
+    r = detect_episode("One Piece - 1078.cbz")
+    assert r["media_type"] == "anime"
+    assert r["episode"] == 1078
+
+
+def _isolate_learned_terms(monkeypatch, tmp_path):
+    """Aísla core.learned_terms del auto_processed.json/learned_junk_terms.json
+    REAL del usuario -- sin esto, un término aprendido en una sesión real
+    anterior (p.ej. "LA" de un fallback de IA previo) puede colarse como
+    "ruido" en un título de prueba que por casualidad lo contenga."""
+    import core.learned_terms as lt
+    monkeypatch.setattr(lt, "app_data_dir", lambda: tmp_path)
+    lt._reset_cache_for_tests()
+
+
+def test_detect_comic_extracts_trailing_issue_number_without_hash(monkeypatch, tmp_path):
+    # Bug real: escaneos que numeran el número de emisión suelto, sin "#" --
+    # antes se quedaba siempre en el episodio 1 por defecto (ver
+    # core/renamer.py::build_new_name), y una trilogía entera se subió tres
+    # veces con el mismo nombre "#1".
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Avatar La Busqueda 01.cbr", is_book=True, is_comic=True)
+    assert r["media_type"] == "libro"
+    assert r["episode"] == 1
+    assert r["title"] == "Avatar La Busqueda"
+
+
+def test_detect_comic_extracts_trailing_issue_number_second_part(monkeypatch, tmp_path):
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Avatar La Busqueda 02.cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 2
+    assert r["title"] == "Avatar La Busqueda"
+
+
+def test_detect_comic_extracts_trailing_issue_number_with_year_after(monkeypatch, tmp_path):
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Avatar La Busqueda 01 (2012).cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 1
+    assert r["title"] == "Avatar La Busqueda"
+    assert "2012" not in r["title"]
+
+
+def test_detect_comic_hash_pattern_still_takes_priority_over_trailing_number(monkeypatch, tmp_path):
+    # Si hay "#NN", ese es el ancla inequívoca -- no debe interferir con el
+    # patrón de respaldo (por si el título también contuviera otro número).
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Volumen 2 - Avatar La Busqueda #01.cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 1
+
+
+def test_detect_comic_trailing_number_with_two_bracket_groups_after(monkeypatch, tmp_path):
+    # Bug real: "World War Hulk 2 [por UltronXII][CRG].cbr" -- DOS grupos
+    # entre corchetes seguidos tras el número (escaneador + grupo). Antes el
+    # patrón solo toleraba UNO, así que no encontraba nada y el número de
+    # grapa se perdía (caía siempre al episodio 1 por defecto) pese a estar
+    # ahí, justo antes de los corchetes.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("WWH 03 - World War Hulk 1 [por UltronXII][CRG].cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 1
+    r = detect_episode("WWH 08 - World War Hulk 2 [por UltronXII][CRG].cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 2
+    r = detect_episode("WWH 19 - World War Hulk 5 [por UltronXII][CRG].cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 5
+
+
+def test_detect_comic_trailing_number_with_two_bracket_groups_different_credit(monkeypatch, tmp_path):
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("WWH 01 - Hulka Vol4 - Tomo 6 [por Parche][CRG-FPJ].cbr", is_book=True, is_comic=True)
+    assert r["episode"] == 6

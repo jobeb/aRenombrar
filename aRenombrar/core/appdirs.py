@@ -22,6 +22,14 @@ def is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def is_linux() -> bool:
+    """Explícito en vez de inferir Linux por descarte (`else`/`not
+    (is_windows() or is_macos())`, como hacía antes cada sitio que
+    necesitaba distinguirlo) -- más claro de leer en gui/app.py donde ya
+    hay tres ramas por SO (autoarranque, notificaciones...)."""
+    return sys.platform.startswith("linux")
+
+
 def app_data_dir() -> Path:
     """Carpeta base de datos de la app, creada si no existe:
       Windows → %APPDATA%\\aRenombrar

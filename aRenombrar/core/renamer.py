@@ -11,6 +11,7 @@ from core.api_client import MediaInfo
 DEFAULT_TV_TEMPLATE = "{serie} {temporada}x{episodio:02d} {titulo}{ext}"
 DEFAULT_MOVIE_TEMPLATE = "{serie} ({año}){ext}"
 DEFAULT_ANIME_TEMPLATE = "{serie} {temporada}x{episodio:03d} {titulo}{ext}"
+DEFAULT_LIBRO_TEMPLATE = "{serie}{ext}"
 
 
 def build_new_name(info: MediaInfo, template: str, ext: str) -> str:
@@ -89,6 +90,65 @@ VIDEO_EXTENSIONS = {
     ".wmv", ".flv", ".ts", ".m2ts", ".webm",
 }
 
+# Ebooks de texto -- identificados vía Google Books (core/book_client.py).
+EBOOK_EXTENSIONS = {".pdf", ".epub", ".mobi", ".azw3"}
+# Cómics/manga escaneados -- identificados vía ComicVine
+# (core/comicvine_client.py), no Google Books: son imágenes empaquetadas,
+# no texto, y ComicVine tiene el catálogo real para esto.
+COMIC_EXTENSIONS = {".cbz", ".cbr"}
+BOOK_EXTENSIONS = EBOOK_EXTENSIONS | COMIC_EXTENSIONS
+
 
 def is_video_file(filepath: str) -> bool:
     return get_extension(filepath) in VIDEO_EXTENSIONS
+
+
+def is_book_file(filepath: str) -> bool:
+    return get_extension(filepath) in BOOK_EXTENSIONS
+
+
+def is_comic_file(filepath: str) -> bool:
+    return get_extension(filepath) in COMIC_EXTENSIONS
+
+
+# Archivos comprimidos -- muchos libros/cómics se descargan empaquetados así
+# en vez de sueltos (ver core/archive_extract.py, usado por AutoWatcher
+# cuando "auto_extract_archives" está activado en Ajustes). ".tgz"/".tbz2"/
+# ".txz" son alias de un solo sufijo (get_extension ya los reconoce tal
+# cual); ".tar.gz"/".tar.bz2"/".tar.xz" son sufijo COMPUESTO (dos puntos) --
+# Path.suffix (get_extension) solo ve el último (".gz"), así que
+# is_archive_file comprueba también los dos últimos sufijos juntos.
+ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar", ".tar", ".tgz", ".tbz2", ".txz"}
+ARCHIVE_COMPOUND_EXTENSIONS = {".tar.gz", ".tar.bz2", ".tar.xz"}
+
+
+def is_archive_file(filepath: str) -> bool:
+    if get_extension(filepath) in ARCHIVE_EXTENSIONS:
+        return True
+    suffixes = Path(filepath).suffixes
+    return len(suffixes) >= 2 and "".join(suffixes[-2:]).lower() in ARCHIVE_COMPOUND_EXTENSIONS
+
+
+def build_name_for_media_info(info: MediaInfo, ext: str, templates: dict) -> str:
+    """Elige la plantilla según info.media_type/genre_ids y construye el
+    nombre -- misma lógica que gui/app.py::_build_name, extraída aquí para
+    que core/auto_watcher.py (identificación de libros/cómics en el Modo
+    Automático) la reutilice sin duplicar el dispatch de 4 vías.
+
+    templates: dict con las claves "movie_template", "anime_template",
+    "comic_template", "libro_template", "tv_template" (mismos nombres que
+    las claves de Config, para poder pasar directamente
+    {k: config.get(k) for k in (...)} desde el llamador)."""
+    if info.media_type == "movie":
+        tpl = templates.get("movie_template")
+    elif info.media_type == "anime":
+        tpl = templates.get("anime_template")
+    elif info.media_type == "libro":
+        # "comic" en genre_ids viene de ComicVineClient.build_comic_info --
+        # distingue cómic de ebook dentro del mismo media_type "libro" (una
+        # sola categoría FTP, dos plantillas de nombre).
+        is_comic = "comic" in (info.genre_ids or [])
+        tpl = templates.get("comic_template" if is_comic else "libro_template")
+    else:
+        tpl = templates.get("tv_template")
+    return build_new_name(info, tpl, ext)

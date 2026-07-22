@@ -7,8 +7,15 @@ aRenombrar/**/__pycache__/
 *.pyo
 *.spec.bak
 
-# Logs de diagnóstico
+# Logs de diagnóstico y de ejecución local (contienen IPs/rutas del
+# equipo del usuario -- nunca deben acabar en el repo)
 aRenombrar/diagnostico.log
+/*.log
+/*.log.*
+
+# Artefactos de build ya descargados a mano (instaladores/.dmg de
+# prueba) -- no pertenecen al repo, son binarios grandes
+aRenombrar/macos_dl/
 
 # Marcador de lanzar.vbs -- evita reinstalar dependencias en cada
 # arranque si requirements.txt no ha cambiado

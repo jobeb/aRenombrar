@@ -6,6 +6,7 @@ insuficiente" seguía reapareciendo cada ciclo porque _save_db() volcaba
 TODO el _processed en memoria sin fusionar con la marca manual del disco."""
 
 import json
+import threading
 
 import pytest
 from unittest.mock import MagicMock
@@ -124,3 +125,59 @@ def test_already_protected_file_aborts_before_any_tmdb_call_or_event(tmp_path, d
     watcher.tmdb.search_multi.assert_not_called()
     assert events == [], f"no debería haberse disparado ningún evento, pero se disparó: {events}"
     assert key not in watcher._in_progress
+
+
+def test_marking_one_file_does_not_erase_a_different_files_manual_mark(tmp_path, db_path):
+    """Bug real: mientras _process() esperaba la estabilidad/TMDB de UN
+    archivo (varios segundos), la GUI marcaba a mano OTRO archivo distinto
+    (identificado/subido manualmente) directamente en el JSON. El _mark()
+    de este hilo, al terminar, volcaba TODO self._processed (desactualizado
+    desde el último _scan(), que es lo único que lo sincroniza con disco)
+    y borraba sin querer esa marca reciente de un archivo que ni siquiera
+    tocaba -- así que tras reiniciar la app, AutoWatcher volvía a detectar
+    como "nuevos" archivos que ya se habían subido a mano."""
+    original = tmp_path / "Serie Completamente Distinta 1x01.mkv"
+    original.write_bytes(b"contenido")
+    key = str(original)
+
+    watcher = _make_watcher(tmp_path)
+    # self._processed en memoria NO tiene todavía la marca del otro
+    # archivo -- solo se sincroniza con disco al principio de _scan(),
+    # no mientras _process() está en marcha.
+    assert watcher._processed == {}
+
+    other_key = str(tmp_path / "Otra Serie Ya Subida A Mano.mkv")
+    db_path.write_text(json.dumps({
+        other_key: {"status": "subido", "new_name": "Otra Serie.mkv", "ts": 0}
+    }), encoding="utf-8")
+
+    watcher._process(original)
+
+    db = json.loads(db_path.read_text(encoding="utf-8"))
+    assert db[key]["status"] == "baja_confianza"
+    assert db.get(other_key, {}).get("status") == "subido", \
+        "la marca 'subido' de un archivo distinto no debería haberse perdido"
+
+
+def test_concurrent_save_entry_does_not_lose_updates(tmp_path, db_path):
+    """Bug real: "Subidas simultáneas" > 1 hace que varias subidas manuales
+    (gui/app.py::_mark_auto_processed) o una subida manual y AutoWatcher
+    (_save_entry) terminen casi a la vez, cada una con su propio
+    leer-modificar-escribir sin coordinarse -- sin _DB_LOCK, la última en
+    escribir parte de una lectura ya desactualizada y borra las marcas que
+    las demás acababan de guardar. Con muchos hilos guardando cada uno su
+    propia clave a la vez, todas deben sobrevivir."""
+    watcher = _make_watcher(tmp_path)
+    n = 30
+    threads = [
+        threading.Thread(target=watcher._save_entry,
+                          args=(f"archivo_{i}.mkv", {"status": "subido", "new_name": "", "ts": 0}))
+        for i in range(n)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    db = json.loads(db_path.read_text(encoding="utf-8"))
+    assert len(db) == n, f"se perdieron marcas: esperaba {n}, quedaron {len(db)}"

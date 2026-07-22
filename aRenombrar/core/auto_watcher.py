@@ -1,11 +1,17 @@
 """
 Monitor automático de carpeta.
-Detecta nuevos archivos de vídeo, los identifica con TMDB, los renombra y los sube por FTP.
+Recorre la carpeta vigilada de forma recursiva (subcarpetas incluidas) y
+detecta vídeo (identificado con TMDB), libros/cómics (identificados con
+Google Books/ComicVine, ver core/book_identify.py) y, si
+"auto_extract_archives" está activado en Ajustes, archivos comprimidos
+(.zip/.7z/.rar/.tar, ver core/archive_extract.py) que descomprime antes de que
+el siguiente ciclo de escaneo identifique lo que haya salido de ahí. Todo
+lo identificado se renombra y se sube por FTP.
 
 Excepciones manejadas:
-  - Archivo no es vídeo       → ignorado silenciosamente
+  - Archivo no reconocido (ni vídeo, ni libro/cómic, ni comprimido) → ignorado silenciosamente
   - Ya procesado anteriormente → saltado
-  - No identificable por TMDB  → marcado como 'sin_resultados', notificado
+  - No identificable (TMDB/ComicVine/Google Books) → marcado como 'sin_resultados', notificado
   - FTP no configurado         → renombrado pero no subido, notificado
   - Archivo ya subido          → saltado
 """
@@ -13,13 +19,15 @@ Excepciones manejadas:
 import difflib
 import json
 import logging
+import os
 import re
 import threading
 import time
 from pathlib import Path
 
 from core.api_client import detect_episode
-from core.renamer import build_new_name, rename_file, is_video_file
+from core.renamer import (build_name_for_media_info, rename_file,
+                           is_video_file, is_book_file, is_comic_file, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe
 from core.series_match import best_match
 from core.ftp_categories import choose_category
@@ -36,6 +44,18 @@ def _processed_db_path() -> Path:
     return _app_dir() / "auto_processed.json"
 
 
+# Serializa TODAS las lecturas+escrituras de auto_processed.json, tanto las
+# de AutoWatcher (_save_entry/_delete_entry) como las de la GUI para subidas
+# manuales (gui/app.py::_mark_auto_processed/_unmark_auto_processed/
+# _cleanup_stale_uploading_marks, que importan este mismo lock) -- sin esto,
+# dos hilos que hacen su propio leer-modificar-escribir sin coordinarse (p.ej.
+# dos subidas manuales en paralelo terminando casi a la vez con "Subidas
+# simultáneas" > 1, o una subida manual y AutoWatcher a la vez) pueden pisarse:
+# el segundo en escribir parte de una lectura ya desactualizada y borra sin
+# querer la marca que el primero acababa de guardar. Visto de verdad: archivos
+# recién subidos a mano "reaparecían" como nuevos para AutoWatcher.
+_DB_LOCK = threading.Lock()
+
 _log = get_logger("aRenombrar.auto", "auto_watcher.log", level=logging.DEBUG)
 
 STABLE_WAIT  = 6    # segundos esperando que el archivo deje de crecer
@@ -44,8 +64,13 @@ DEFAULT_POLL = 10   # segundos entre escaneos (por defecto)
 # Estados que solo escribe la GUI cuando el usuario interviene a mano
 # (identificar, renombrar, subir manualmente -- ver
 # gui/app.py::_mark_auto_processed). AutoWatcher nunca debe pisarlos con un
-# resultado propio: ver _mark().
-_PROTECTED_STATUSES = ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado")
+# resultado propio: ver _mark(). "descomprimido" es la excepción -- lo
+# escribe el propio AutoWatcher (_process_archive), pero necesita el mismo
+# tratamiento: sin esto, un archivo comprimido con "Mantener original"
+# configurado (no se mueve ni se borra) se detectaría y descomprimiría de
+# nuevo en cada ciclo de escaneo.
+_PROTECTED_STATUSES = ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado",
+                       "descomprimido")
 
 # Fragmentos (en minúsculas) que delatan "archivo bloqueado por otro
 # proceso" en el mensaje de error de rename_file(), sea cual sea el SO:
@@ -59,7 +84,8 @@ _LOCKED_FILE_HINTS = (
 
 class AutoWatcher:
     def __init__(self, folder: str, config, tmdb_client, ftp_client, on_event, on_file_event=None,
-                 upload_slots=None, ftp_lock=None, ftp_factory=None):
+                 upload_slots=None, ftp_lock=None, ftp_factory=None,
+                 comicvine_client=None, book_client=None, openlibrary_client=None):
         """
         on_event(tipo, mensaje)
           tipo: "info" | "ok" | "skip" | "error"
@@ -82,20 +108,31 @@ class AutoWatcher:
           self.ftp, que es solo para comandos ligeros de control. Por
           defecto crea una FTPClient() nueva de verdad; los tests pasan un
           MagicMock aquí para no abrir conexiones reales.
+        comicvine_client/book_client/openlibrary_client: mismos
+          ComicVineClient/GoogleBooksClient/OpenLibraryClient que usa la
+          identificación manual (ver gui/app.py, core/book_identify.py).
+          Opcionales -- si no se pasa ninguno de los que corresponda al tipo
+          de archivo (comicvine_client para cómics; openlibrary_client y/o
+          book_client para ebooks -- OpenLibrary es el proveedor PRINCIPAL,
+          Google Books queda de apoyo automático), los archivos de ese tipo
+          se detectan pero no se pueden identificar (ver _process).
         """
-        self.folder         = Path(folder)
-        self.config         = config
-        self.tmdb           = tmdb_client
-        self.ftp            = ftp_client
-        self.on_event       = on_event
-        self.on_file_event  = on_file_event or (lambda *a, **kw: None)
-        self.upload_slots   = upload_slots or UploadSlotManager(config)
-        self._ftp_factory   = ftp_factory or FTPClient
-        self.poll_interval  = int(config.get("poll_interval", DEFAULT_POLL))
-        self._stop          = threading.Event()
-        self._thread        = None
-        self._processed     = self._load_db()
-        self._in_progress   = set()
+        self.folder             = Path(folder)
+        self.config             = config
+        self.tmdb               = tmdb_client
+        self.ftp                = ftp_client
+        self.comicvine          = comicvine_client
+        self.book_client        = book_client
+        self.openlibrary_client = openlibrary_client
+        self.on_event           = on_event
+        self.on_file_event      = on_file_event or (lambda *a, **kw: None)
+        self.upload_slots       = upload_slots or UploadSlotManager(config)
+        self._ftp_factory       = ftp_factory or FTPClient
+        self.poll_interval      = int(config.get("poll_interval", DEFAULT_POLL))
+        self._stop              = threading.Event()
+        self._thread            = None
+        self._processed         = self._load_db()
+        self._in_progress       = set()
         # Reutilización de carpetas de serie ya existentes en el FTP (evita
         # crear una carpeta duplicada por idioma/nombre corto distinto)
         self._series_folder_cache = {}
@@ -147,6 +184,56 @@ class AutoWatcher:
         _log.info("=== AutoWatcher detenido ===")
         self.on_event("info", "Modo automático detenido")
 
+    def _iter_watch_files(self):
+        """Recorre self.folder de forma recursiva (subcarpetas incluidas),
+        excluyendo cualquier subcarpeta llamada "procesados" a cualquier
+        profundidad -- ahí es donde acaban los archivos ya subidos o
+        descomprimidos (ver acción post-proceso en _upload_to_ftp/
+        _process_archive); sin esta exclusión, cada escaneo los volvería a
+        ver y reprocesar."""
+        for dirpath, dirnames, filenames in os.walk(self.folder):
+            dirnames[:] = [d for d in dirnames if d != "procesados"]
+            for name in filenames:
+                yield Path(dirpath) / name
+
+    def _should_process(self, key: str, name: str) -> bool:
+        """Comprueba _in_progress/_processed y decide si *key* debe
+        procesarse ahora -- mismo criterio para vídeo/libro/cómic
+        (_process) y para archivos comprimidos (_process_archive)."""
+        if key in self._in_progress:
+            _log.debug("Saltado (en proceso): %s", name)
+            return False
+        if key in self._processed:
+            status = self._processed[key].get("status", "")
+            if status in _PROTECTED_STATUSES:
+                # "renombrado", "identificado_manual" y "subiendo" los
+                # escribe la GUI cuando el usuario renombra/identifica/sube
+                # el archivo a mano (ver _mark_auto_processed) — justamente
+                # para que el watcher lo deje en paz. Si se reprocesara
+                # aquí, este hilo competiría por el mismo archivo con la
+                # acción manual del usuario: desde renombrarlo de nuevo
+                # mientras está abierto para subir ("WinError 32: en uso
+                # por otro proceso" en bucle) hasta pisar el estado
+                # "Listo"/"Omitido" o interrumpir una subida en marcha si
+                # el modo automático se activa a mitad. "subiendo" se
+                # quita solo si la subida manual no termina bien (ver
+                # _unmark_auto_processed), así que no se queda bloqueado
+                # para siempre si algo falla o se cierra la app a medias.
+                # "duplicado" (detectado por find_duplicate, ver más abajo)
+                # y "descomprimido" (ver _process_archive) son estados
+                # deliberados, no un fallo -- sin esto en la lista, cada
+                # escaneo lo trataba como "hay que reintentar" y volvía a
+                # detectar/marcar el mismo resultado sin parar (visto de
+                # verdad con Dr. Stone 4x32, que "reaparecía" cada vez que
+                # se activaba el automático).
+                _log.debug("Saltado (%s): %s", status, name)
+                return False
+            # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar
+            _log.info("Reprocesando (estado anterior=%s): %s", status, name)
+            del self._processed[key]
+            self._delete_entry(key)
+        return True
+
     def _scan(self):
         if not self.folder.exists():
             _log.error("Carpeta no encontrada: %s", self.folder)
@@ -156,56 +243,27 @@ class AutoWatcher:
         # Recargar DB de disco para incluir archivos marcados por la UI manual
         self._processed.update(self._load_db())
 
-        items_found = []
-        for item in sorted(self.folder.iterdir()):
+        extract_enabled = bool(self.config.get("auto_extract_archives", False))
+        media_items   = []
+        archive_items = []
+        for item in sorted(self._iter_watch_files()):
             if self._stop.is_set():
                 break
-            if not item.is_file():
-                _log.debug("Ignorando (no es fichero): %s", item.name)
-                continue
-            if not is_video_file(str(item)):
-                _log.debug("Ignorando (no es vídeo): %s", item.name)
-                continue
-            items_found.append(item)
+            path_str = str(item)
+            if is_video_file(path_str) or is_book_file(path_str):
+                media_items.append(item)
+            elif extract_enabled and is_archive_file(path_str):
+                archive_items.append(item)
+            else:
+                _log.debug("Ignorando (tipo no reconocido): %s", item.name)
 
-        _log.debug("Scan: %d vídeo(s) en carpeta | in_progress=%d | processed=%d",
-                   len(items_found), len(self._in_progress), len(self._processed))
+        _log.debug("Scan: %d archivo(s) de vídeo/libro/cómic, %d comprimido(s) | in_progress=%d | processed=%d",
+                   len(media_items), len(archive_items), len(self._in_progress), len(self._processed))
 
-        for item in items_found:
+        for item in media_items:
             key = str(item)
-            if key in self._in_progress:
-                _log.debug("Saltado (en proceso): %s", item.name)
+            if not self._should_process(key, item.name):
                 continue
-            if key in self._processed:
-                status = self._processed[key].get("status", "")
-                if status in _PROTECTED_STATUSES:
-                    # "renombrado", "identificado_manual" y "subiendo" los
-                    # escribe la GUI cuando el usuario renombra/identifica/sube
-                    # el archivo a mano (ver _mark_auto_processed) — justamente
-                    # para que el watcher lo deje en paz. Si se reprocesara
-                    # aquí, este hilo competiría por el mismo archivo con la
-                    # acción manual del usuario: desde renombrarlo de nuevo
-                    # mientras está abierto para subir ("WinError 32: en uso
-                    # por otro proceso" en bucle) hasta pisar el estado
-                    # "Listo"/"Omitido" o interrumpir una subida en marcha si
-                    # el modo automático se activa a mitad. "subiendo" se
-                    # quita solo si la subida manual no termina bien (ver
-                    # _unmark_auto_processed), así que no se queda bloqueado
-                    # para siempre si algo falla o se cierra la app a medias.
-                    # "duplicado" (detectado por find_duplicate, ver más abajo)
-                    # es una comprobación deliberada, no un fallo -- sin esto
-                    # en la lista, cada escaneo lo trataba como "hay que
-                    # reintentar" y volvía a detectar/marcar el mismo
-                    # duplicado sin parar (visto de verdad con Dr. Stone
-                    # 4x32, que "reaparecía" cada vez que se activaba el
-                    # automático).
-                    _log.debug("Saltado (%s): %s", status, item.name)
-                    continue
-                # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar
-                _log.info("Reprocesando (estado anterior=%s): %s", status, item.name)
-                del self._processed[key]
-                self._save_db()
-
             _log.info("NUEVO ARCHIVO DETECTADO: %s", item.name)
             self.on_event("info", f"Nuevo archivo detectado: {item.name}")
             self._in_progress.add(key)
@@ -219,10 +277,23 @@ class AutoWatcher:
             # vez podían terminarla en cualquier orden: visto de verdad,
             # un archivo detectado 4º subió antes que uno detectado 3º.
             # Aquí, en cambio, no hay hilos todavía -- el orden es el de
-            # items_found (ya ordenado más arriba), sin más.
+            # media_items (ya ordenado más arriba), sin más.
             ticket = self.upload_slots.reserve_ticket()
             threading.Thread(
                 target=self._process, args=(item, ticket), daemon=True
+            ).start()
+
+        for item in archive_items:
+            key = str(item)
+            if not self._should_process(key, item.name):
+                continue
+            # No reserva turno de "Subidas simultáneas" -- un archivo
+            # comprimido no se sube él mismo, solo se descomprime.
+            _log.info("ARCHIVO COMPRIMIDO DETECTADO: %s", item.name)
+            self.on_event("info", f"Archivo comprimido detectado: {item.name}")
+            self._in_progress.add(key)
+            threading.Thread(
+                target=self._process_archive, args=(item,), daemon=True
             ).start()
 
     def _is_stable(self, path: Path) -> bool:
@@ -236,6 +307,74 @@ class AutoWatcher:
             return s1 == s2 and s2 > 0
         except OSError:
             return False
+
+    def _apply_post_process_action(self, path: Path):
+        """Acción post-proceso configurada ("auto_action" en Ajustes) --
+        compartida entre una subida de vídeo/libro/cómic exitosa
+        (_upload_to_ftp) y una descompresión exitosa (_process_archive):
+        mantener el archivo, moverlo a la subcarpeta "procesados", o
+        eliminarlo."""
+        action = self.config.get("auto_action", "Mantener original")
+        _log.debug("Acción post-proceso: %s", action)
+        if action == "Mover a subcarpeta 'procesados'":
+            try:
+                dest_dir = path.parent / "procesados"
+                dest_dir.mkdir(exist_ok=True)
+                import shutil
+                shutil.move(str(path), str(dest_dir / path.name))
+                _log.info("Movido a procesados: %s", path.name)
+            except Exception as e:
+                _log.error("No se pudo mover: %s", e)
+                self.on_event("skip", f"No se pudo mover archivo: {e}")
+        elif action == "Eliminar original":
+            try:
+                if path.exists():
+                    path.unlink()
+                    _log.info("Eliminado: %s", path.name)
+            except Exception as e:
+                _log.error("No se pudo eliminar: %s", e)
+                self.on_event("skip", f"No se pudo eliminar archivo: {e}")
+
+    def _process_archive(self, path: Path):
+        """Descomprime un archivo comprimido encontrado en la carpeta
+        vigilada (ver "auto_extract_archives" en Ajustes) -- a diferencia
+        de _process, no reserva turno de "Subidas simultáneas": un archivo
+        comprimido no se sube él mismo, solo se descomprime. El contenido
+        extraído queda como una carpeta hermana normal (ver
+        core/archive_extract.py); el SIGUIENTE ciclo de escaneo recursivo
+        lo descubre solo -- incluidos archivos comprimidos anidados dentro,
+        que se resuelven en ciclos sucesivos sin ninguna lógica especial de
+        recursión-de-extracción."""
+        key = str(path)
+        _log.info("--- Descomprimiendo: %s ---", path.name)
+        try:
+            if not self._is_stable(path):
+                _log.warning("Archivo inestable o vacío, descartado: %s", path.name)
+                return
+            if not path.exists():
+                _log.warning("Archivo desaparecido tras espera: %s", path.name)
+                return
+            if self._load_db().get(key, {}).get("status", "") in _PROTECTED_STATUSES:
+                _log.info("Abandonando: %s ya se gestionó mientras se esperaba", path.name)
+                return
+
+            from core.archive_extract import extract_archive
+            ok, msg = extract_archive(path)
+            if not ok:
+                _log.error("No se pudo descomprimir %s: %s", path.name, msg)
+                self.on_event("error", f"No se pudo descomprimir {path.name}: {msg}")
+                self._mark(key, "error_descomprimir")
+                return
+
+            _log.info("Descomprimido OK: %s -> %s", path.name, msg)
+            self.on_event("ok", f"Descomprimido: {path.name}")
+            self._mark(key, "descomprimido")
+            self._apply_post_process_action(path)
+        except Exception as e:
+            _log.exception("Error inesperado descomprimiendo: %s", path.name)
+            self.on_event("error", f"Error inesperado descomprimiendo {path.name}: {e}")
+        finally:
+            self._in_progress.discard(key)
 
     def _try_ai_fallback(self, path: Path, detected: dict):
         """Igual que en gui/app.py::_try_ai_fallback -- último recurso
@@ -319,8 +458,11 @@ class AutoWatcher:
             self.on_file_event(key, "start")
             self.on_event("info", f"Identificando: {path.name}")
 
+            is_book  = is_book_file(str(path))
+            is_comic = is_comic_file(str(path)) if is_book else False
+
             # 1. Detección local (patrones de nombre)
-            detected = detect_episode(path.name)
+            detected = detect_episode(path.name, is_book=is_book, is_comic=is_comic)
             _log.debug("Detección local: %s", detected)
             if not detected.get("title"):
                 _log.warning("Sin patrón reconocible: %s", path.name)
@@ -330,70 +472,117 @@ class AutoWatcher:
                 self._mark(key, "no_identificado")
                 return
 
-            # 2. Búsqueda TMDB
-            lang = self.config.get("language", "es-ES")
-            media_type = detected.get("media_type", "tv")
-            _log.debug("Buscando en TMDB: '%s' (tipo=%s, lang=%s)", detected["title"], media_type, lang)
-            results = self.tmdb.search_multi(detected["title"])
-            if not results:
-                # Intentar búsqueda específica
-                if media_type == "tv":
-                    raw = self.tmdb.search_tv(detected["title"])
-                    results = [dict(r, media_type="tv") for r in raw]
-                else:
-                    raw = self.tmdb.search_movie(detected["title"])
-                    results = [dict(r, media_type="movie") for r in raw]
-
-            if not results:
-                fallback = self._try_ai_fallback(path, detected)
-                if fallback:
-                    results, detected = fallback
-                    media_type = detected.get("media_type", media_type)
-
-            if not results:
-                _log.warning("Sin resultados TMDB para: %s", path.name)
-                self.on_event("skip", f"Sin resultados TMDB: {path.name}")
-                self.on_file_event(key, "skip",
-                                    reason=f"Sin resultados en TMDB para '{detected['title']}'")
-                self._mark(key, "sin_resultados")
-                return
-
-            result    = results[0]
-            season    = detected.get("season")
-            episode   = detected.get("episode")
-
-            # Comprobar confianza mínima
-            result_title = (result.get("name", "") or result.get("title", "")).lower()
-            confidence   = round(difflib.SequenceMatcher(
-                None, detected["title"].lower(), result_title).ratio() * 100)
+            season  = detected.get("season")
+            episode = detected.get("episode")
             min_conf = int(self.config.get("min_confidence", 70))
-            _log.debug("TMDB match: '%s' | confianza=%d%% (mín=%d%%)", result_title, confidence, min_conf)
-            if min_conf > 0 and confidence < min_conf:
-                _log.warning("Confianza insuficiente (%d%% < %d%%): %s → '%s'",
-                             confidence, min_conf, path.name, result_title)
-                self.on_event("skip",
-                    f"Confianza insuficiente ({confidence}% < {min_conf}%): {path.name} → '{result_title}'")
-                self.on_file_event(key, "skip",
-                                    reason=f"Confianza insuficiente ({confidence}% < {min_conf}%) con '{result_title}'")
-                self._mark(key, "baja_confianza")
-                return
 
-            media_info = self.tmdb.build_media_info(result, season=season, episode=episode)
+            if is_book:
+                # 2. Identificación vía ComicVine (cómics) u OpenLibrary con
+                # Google Books de apoyo (ebooks de texto) -- misma lógica
+                # exacta que el panel manual de Archivos (incluida la
+                # traducción de título vía IA + caché para ComicVine), ver
+                # core/book_identify.py.
+                if is_comic and self.comicvine is None:
+                    _log.warning("Sin cliente de ComicVine configurado: %s", path.name)
+                    self.on_event("skip", f"Sin cliente de ComicVine configurado: {path.name}")
+                    self.on_file_event(key, "skip", reason="AutoWatcher no tiene configurado ComicVine")
+                    self._mark(key, "sin_resultados")
+                    return
+                if not is_comic and self.openlibrary_client is None and self.book_client is None:
+                    _log.warning("Sin cliente de OpenLibrary/Google Books configurado: %s", path.name)
+                    self.on_event("skip", f"Sin cliente de OpenLibrary/Google Books configurado: {path.name}")
+                    self.on_file_event(key, "skip",
+                                        reason="AutoWatcher no tiene configurado OpenLibrary/Google Books")
+                    self._mark(key, "sin_resultados")
+                    return
+                from core.book_identify import identify_book_or_comic
+                result = identify_book_or_comic(
+                    detected, is_comic, self.comicvine, self.book_client,
+                    openlibrary_client=self.openlibrary_client,
+                    ai_fallback_enabled=bool(self.config.get("ai_fallback_enabled")),
+                    ai_api_key=self.config.get("ai_api_key", ""))
+                if result.error:
+                    _log.warning("%s: %s (%r)", result.error, path.name, result.used_query)
+                    self.on_event("skip", f"{result.error}: {path.name}")
+                    self.on_file_event(key, "skip", reason=result.error)
+                    self._mark(key, "sin_resultados")
+                    return
+                confidence = result.confidence
+                _log.debug("%s match | confianza=%d%% (mín=%d%%)",
+                           "ComicVine" if is_comic else (result.provider or "libro"), confidence, min_conf)
+                if min_conf > 0 and confidence < min_conf:
+                    _log.warning("Confianza insuficiente (%d%% < %d%%): %s", confidence, min_conf, path.name)
+                    self.on_event("skip", f"Confianza insuficiente ({confidence}% < {min_conf}%): {path.name}")
+                    self.on_file_event(key, "skip",
+                                        reason=f"Confianza insuficiente ({confidence}% < {min_conf}%)")
+                    self._mark(key, "baja_confianza")
+                    return
+                media_info = result.media_info
+            else:
+                # 2. Búsqueda TMDB
+                lang = self.config.get("language", "es-ES")
+                media_type = detected.get("media_type", "tv")
+                _log.debug("Buscando en TMDB: '%s' (tipo=%s, lang=%s)", detected["title"], media_type, lang)
+                results = self.tmdb.search_multi(detected["title"])
+                if not results:
+                    # Intentar búsqueda específica
+                    if media_type == "tv":
+                        raw = self.tmdb.search_tv(detected["title"])
+                        results = [dict(r, media_type="tv") for r in raw]
+                    else:
+                        raw = self.tmdb.search_movie(detected["title"])
+                        results = [dict(r, media_type="movie") for r in raw]
 
-            # Enriquecer con info de episodio si es serie
-            if media_info.media_type == "tv" and season and episode:
-                try:
-                    ep_info = self.tmdb.get_episode_info(media_info.tmdb_id, season, episode)
-                    if ep_info.get("name"):
-                        from dataclasses import replace
-                        media_info = replace(media_info, episode_title=ep_info["name"])
-                except Exception:
-                    pass
+                if not results:
+                    fallback = self._try_ai_fallback(path, detected)
+                    if fallback:
+                        results, detected = fallback
+                        media_type = detected.get("media_type", media_type)
+                        season    = detected.get("season")
+                        episode   = detected.get("episode")
+
+                if not results:
+                    _log.warning("Sin resultados TMDB para: %s", path.name)
+                    self.on_event("skip", f"Sin resultados TMDB: {path.name}")
+                    self.on_file_event(key, "skip",
+                                        reason=f"Sin resultados en TMDB para '{detected['title']}'")
+                    self._mark(key, "sin_resultados")
+                    return
+
+                result = results[0]
+
+                # Comprobar confianza mínima
+                result_title = (result.get("name", "") or result.get("title", "")).lower()
+                confidence   = round(difflib.SequenceMatcher(
+                    None, detected["title"].lower(), result_title).ratio() * 100)
+                _log.debug("TMDB match: '%s' | confianza=%d%% (mín=%d%%)", result_title, confidence, min_conf)
+                if min_conf > 0 and confidence < min_conf:
+                    _log.warning("Confianza insuficiente (%d%% < %d%%): %s → '%s'",
+                                 confidence, min_conf, path.name, result_title)
+                    self.on_event("skip",
+                        f"Confianza insuficiente ({confidence}% < {min_conf}%): {path.name} → '{result_title}'")
+                    self.on_file_event(key, "skip",
+                                        reason=f"Confianza insuficiente ({confidence}% < {min_conf}%) con '{result_title}'")
+                    self._mark(key, "baja_confianza")
+                    return
+
+                media_info = self.tmdb.build_media_info(result, season=season, episode=episode)
+
+                # Enriquecer con info de episodio si es serie
+                if media_info.media_type == "tv" and season and episode:
+                    try:
+                        ep_info = self.tmdb.get_episode_info(media_info.tmdb_id, season, episode)
+                        if ep_info.get("name"):
+                            from dataclasses import replace
+                            media_info = replace(media_info, episode_title=ep_info["name"])
+                    except Exception:
+                        pass
 
             # 3. Construir nuevo nombre
-            tpl_key  = "tv_template" if media_info.media_type == "tv" else "movie_template"
-            template = self.config.get(tpl_key, "")
-            new_name = build_new_name(media_info, template, path.suffix)
+            templates = {k: self.config.get(k, "") for k in (
+                "movie_template", "anime_template", "comic_template",
+                "libro_template", "tv_template")}
+            new_name = build_name_for_media_info(media_info, path.suffix, templates)
             _log.debug("Nuevo nombre calculado: '%s'", new_name)
             if not new_name:
                 _log.error("No se pudo construir nombre para: %s", path.name)
@@ -530,7 +719,7 @@ class AutoWatcher:
                     return
                 _log.info("FTP conectado OK")
 
-            cats = self.config.get("ftp_categories", {"tv": [], "movie": []})
+            cats = self.config.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
             type_cats = cats.get(media_info.media_type, [])
             # La organización real del servidor prevalece sobre la
             # clasificación automática por género -- ver
@@ -710,27 +899,7 @@ class AutoWatcher:
             from core.media_server_refresh import trigger_refresh
             trigger_refresh(self.config)
             # Acción post-proceso: solo tras subida exitosa
-            action = self.config.get("auto_action", "Mantener original")
-            renamed_path = Path(new_path)
-            _log.debug("Acción post-proceso: %s", action)
-            if action == "Mover a subcarpeta 'procesados'":
-                try:
-                    dest_dir = renamed_path.parent / "procesados"
-                    dest_dir.mkdir(exist_ok=True)
-                    import shutil
-                    shutil.move(str(renamed_path), str(dest_dir / renamed_path.name))
-                    _log.info("Movido a procesados: %s", renamed_path.name)
-                except Exception as e:
-                    _log.error("No se pudo mover: %s", e)
-                    self.on_event("skip", f"No se pudo mover archivo: {e}")
-            elif action == "Eliminar original":
-                try:
-                    if renamed_path.exists():
-                        renamed_path.unlink()
-                        _log.info("Eliminado: %s", renamed_path.name)
-                except Exception as e:
-                    _log.error("No se pudo eliminar: %s", e)
-                    self.on_event("skip", f"No se pudo eliminar archivo: {e}")
+            self._apply_post_process_action(Path(new_path))
         elif msg3 == "cancelado":
             _log.info("Subida cancelada: %s", new_name)
             self.on_event("info", "Subida cancelada por parada del modo automático")
@@ -827,13 +996,14 @@ class AutoWatcher:
                 self._in_progress.discard(key)
                 return
         _log.debug("_mark: %s → %s", Path(key).name, status)
-        self._processed[key] = {
+        entry = {
             "status":   status,
             "new_name": new_name,
             "ts":       time.time(),
         }
+        self._processed[key] = entry
         self._in_progress.discard(key)
-        self._save_db()
+        self._save_entry(key, entry)
 
     def _load_db(self) -> dict:
         try:
@@ -844,11 +1014,37 @@ class AutoWatcher:
             pass
         return {}
 
-    def _save_db(self):
+    def _save_entry(self, key: str, entry: dict):
+        """Fusión leer-modificar-escribir con lo que haya AHORA MISMO en
+        disco -- no basta con volcar self._processed entero (lo que hacía
+        antes _save_db()): mientras este hilo esperaba la estabilidad del
+        archivo o la respuesta de TMDB (varios segundos), la GUI puede
+        haber marcado a mano OTRO archivo distinto (identificado/subido
+        manualmente) directamente en el JSON. Un volcado ciego de
+        self._processed -- desactualizado desde el último _scan(), que es
+        el único momento en que se sincroniza con disco -- borraba esa
+        marca reciente sin querer. Visto de verdad: archivos ya subidos a
+        mano volvían a aparecer como "nuevos" para AutoWatcher tras
+        reiniciar la app, porque el _save_db() de OTRO archivo procesado
+        casi a la vez pisaba el "subido" que la GUI acababa de escribir."""
         try:
-            _processed_db_path().write_text(
-                json.dumps(self._processed, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            with _DB_LOCK:
+                db = self._load_db()
+                db[key] = entry
+                _processed_db_path().write_text(
+                    json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _delete_entry(self, key: str):
+        """Mismo motivo que _save_entry -- fusión con disco en vez de
+        volcar self._processed entero."""
+        try:
+            with _DB_LOCK:
+                db = self._load_db()
+                if key in db:
+                    del db[key]
+                    _processed_db_path().write_text(
+                        json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass

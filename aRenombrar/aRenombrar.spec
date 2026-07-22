@@ -44,6 +44,22 @@ try:
 except Exception:
     pass
 
+# py7zr/rarfile son Python puro -- no empaquetan ningún binario externo
+# (rarfile solo shell-a "unrar"/"unar"/"bsdtar" en tiempo de ejecución SI ya
+# está instalado en el sistema; ver core/archive_extract.py). Mismo patrón
+# best-effort que tkinterdnd2/pystray arriba.
+try:
+    tmp_ret = collect_all('py7zr')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+except Exception:
+    pass
+
+try:
+    tmp_ret = collect_all('rarfile')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+except Exception:
+    pass
+
 
 a = Analysis(
     ['main.py'],
@@ -61,7 +77,18 @@ a = Analysis(
 pyz = PYZ(a.pure)
 
 _is_macos = sys.platform == 'darwin'
-_icon = 'iconoPrincipal.icns' if _is_macos else 'iconoPrincipal.ico'
+_is_linux = sys.platform.startswith('linux')
+# PyInstaller solo usa este icono para el propio ejecutable/bundle en
+# Windows y macOS -- en Linux no hay convención de "icono de ejecutable"
+# (el icono en tiempo de ejecución ya lo pone Tk vía iconphoto, ver
+# gui/app.py:_apply_icon, y el que ve el usuario en el menú/launcher lo da
+# el .desktop, no el binario), así que aquí no tiene sentido pasarle uno.
+if _is_macos:
+    _icon = 'iconoPrincipal.icns'
+elif _is_linux:
+    _icon = None
+else:
+    _icon = 'iconoPrincipal.ico'
 
 # upx=False a propósito: en un build onedir el espacio ahorrado no compensa
 # la descompresión en cada carga de DLL, y los binarios empaquetados con UPX
@@ -87,7 +114,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=[_icon],
+    icon=[_icon] if _icon else [],
 )
 coll = COLLECT(
     exe,

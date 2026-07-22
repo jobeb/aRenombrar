@@ -271,6 +271,35 @@ def test_blank_movie_template_migrates_to_wildcard_without_root(tmp_path, monkey
     assert cats["movie"] == []
 
 
+def test_migrate_does_not_create_libro_key(tmp_path, monkeypatch):
+    # A diferencia de tv/movie, "libro" no tiene ninguna plantilla legacy
+    # de la que migrar -- se queda ausente hasta que el usuario cree una
+    # categoría desde Ajustes → Servidor → Categorías, igual que "anime".
+    _isolated_config(tmp_path, monkeypatch)
+    cfg = Config()
+    assert "libro" not in cfg.get("ftp_categories")
+
+
+def test_libro_and_comic_template_defaults():
+    assert DEFAULTS["libro_template"] == "{serie}{ext}"
+    assert DEFAULTS["comic_template"] == "{serie} ({año}) #{episodio:02d}{ext}"
+
+
+def test_comicvine_api_key_default_is_empty_and_not_in_keyring_keys():
+    """comicvine_api_key es credencial compartida por el grupo (como
+    tmdb_api_key), no de keyring por máquina -- ver core/server_config.py."""
+    assert DEFAULTS["comicvine_api_key"] == ""
+    assert "comicvine_api_key" not in config_module._KEYRING_KEYS
+
+
+def test_google_books_api_key_default_is_empty_and_not_in_keyring_keys():
+    """google_books_api_key es opcional (Google Books funciona sin key) pero
+    mismo tratamiento que comicvine_api_key si se configura -- credencial de
+    grupo compartida vía servidor, no de keyring por máquina."""
+    assert DEFAULTS["google_books_api_key"] == ""
+    assert "google_books_api_key" not in config_module._KEYRING_KEYS
+
+
 def test_migrates_legacy_custom_episode_links_into_episode_level(tmp_path, monkeypatch):
     cfg_file, _ = _isolated_config(tmp_path, monkeypatch)
     old_links = [{"name": "Mi enlace", "url_template": "https://ejemplo.com/{serie}"}]

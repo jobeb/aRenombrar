@@ -54,6 +54,20 @@ def test_choose_category_returns_none_without_categories():
     assert choose_category([16], []) is None
 
 
+def test_choose_category_works_with_string_genre_ids():
+    # "libro" no tiene géneros de TMDB (ints) -- core/book_client.py y
+    # core/comicvine_client.py marcan MediaInfo.genre_ids con las
+    # etiquetas fijas "ebook"/"comic" en su lugar. choose_category() no
+    # debe asumir que son ints -- una intersección de listas funciona
+    # igual con strings.
+    categories = [
+        {"name": "Cómics", "genre_ids": ["comic"]},
+        {"name": "Libros",  "genre_ids": []},
+    ]
+    assert choose_category(["comic"], categories)["name"] == "Cómics"
+    assert choose_category(["ebook"], categories)["name"] == "Libros"
+
+
 def test_choose_category_returns_none_without_wildcard_and_no_match():
     categories = [{"name": "Documentales", "genre_ids": [99]}]
     assert choose_category([18], categories) is None

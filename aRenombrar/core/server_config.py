@@ -37,7 +37,18 @@ Categorías incluidas y por qué:
   local (_KEYRING_KEYS en config.py) y Config.save() sigue blanqueándola
   antes de escribir config.json -- el texto plano solo existe en el JSON
   compartido del FTP, nunca en el disco de cada cliente.
-- Plantillas de nombre (tv_template/movie_template/anime_template) y
+- comicvine_api_key: identificación de cómics/manga (ver
+  core/comicvine_client.py), mismo razonamiento y mismo tratamiento que
+  tmdb_api_key -- cuenta compartida del grupo, texto plano en el JSON del
+  FTP, nunca en _KEYRING_KEYS.
+- google_books_api_key: identificación de ebooks (ver core/book_client.py).
+  A diferencia de las anteriores, ES opcional -- Google Books funciona sin
+  key, pero su cuota anónima es compartida GLOBALMENTE (no por IP/equipo),
+  así que puede saturarse (429) por el uso de cualquier desconocido en
+  internet. Compartirla dentro del grupo evita que cada persona tenga que
+  registrar la suya solo para librarse de esa cuota compartida.
+- Plantillas de nombre (tv_template/movie_template/anime_template/
+  libro_template) y
   ftp_categories: para que todo el mundo suba con el mismo formato y a la
   misma estructura de carpetas, no una mezcla según quién subió cada
   archivo.
@@ -75,10 +86,11 @@ Excluido a propósito, y por qué (configuración de CLIENTE):
 - appearance, color_theme, last_dir, table_col_widths,
   skipped_update_version: preferencias de interfaz o estado de ESTE
   equipo, sin ningún efecto sobre el servidor.
-- watch_folder, poll_interval, auto_action, min_confidence,
-  desktop_notifications, start_with_windows, rename_local: comportamiento
-  del modo automático de CADA equipo -- forzarlo igual para todos no
-  tendría sentido (cada persona vigila su propia carpeta local).
+- watch_folder, poll_interval, auto_action, manual_action, auto_extract_archives,
+  min_confidence, desktop_notifications, start_with_windows, rename_local: comportamiento
+  del modo automático y de la subida manual de CADA equipo -- forzarlo
+  igual para todos no tendría sentido (cada persona vigila su propia
+  carpeta local, y puede querer un destino distinto tras subir a mano).
 - watch_sync_user_mappings, watch_sync_last_run_ts, watch_sync_schedule_enabled,
   watch_sync_schedule_time (ver core/watch_sync.py): el emparejamiento de
   usuarios Plex<->Jellyfin es conocimiento personal ("qué persona es
@@ -98,8 +110,18 @@ SHARED_CONFIG_KEYS = (
     # TMDB / fallback de IA -- credenciales y ajustes compartidos por el
     # grupo en vez de que cada persona registre las suyas.
     "tmdb_api_key", "language", "ai_api_key", "ai_fallback_enabled",
+    # ComicVine (identificación de cómics/manga, ver
+    # core/comicvine_client.py) -- misma razón que tmdb_api_key: una única
+    # cuenta del grupo en vez de que cada persona registre la suya.
+    "comicvine_api_key",
+    # Google Books (ebooks, ver core/book_client.py) -- opcional (funciona
+    # sin ella), pero misma razón si el grupo decide configurar una: cuota
+    # per-proyecto compartida en vez de que cada persona dependa de la
+    # cuota anónima global (que puede saturarse por el uso de CUALQUIERA,
+    # no solo del grupo).
+    "google_books_api_key",
     # Convención de nombres y estructura real del servidor.
-    "tv_template", "movie_template", "anime_template",
+    "tv_template", "movie_template", "anime_template", "libro_template", "comic_template",
     "ftp_categories",
     "rename_remote",
     # Servidores de medios -- host, activado y credenciales.

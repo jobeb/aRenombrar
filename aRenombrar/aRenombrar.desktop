@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=aRenombrar
+Comment=Renombrado y subida de series, películas y anime
+Exec=aRenombrar
+Icon=aRenombrar
+Terminal=false
+Categories=Utility;

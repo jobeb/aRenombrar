@@ -32,6 +32,19 @@ DEFAULTS = {
     "movie_template": "{serie} ({año}){ext}",
     # Anime igual que TV pero episodio con 3 dígitos
     "anime_template": "{serie} {temporada}x{episodio:03d} {titulo}{ext}",
+    # Libros (ebooks de texto vía Google Books): sin número de volumen
+    # fiable, así que el nombre por defecto es solo el título.
+    # Nombre: "El Nombre del Viento.epub"
+    "libro_template": "{serie}{ext}",
+    # Cómics/manga vía ComicVine: a diferencia del ebook, el número de
+    # emisión SÍ es fiable -- se extrae del propio nombre de archivo
+    # (patrón "#NN", ver detect_episode en core/api_client.py) igual que
+    # ya se hace con el episodio de una serie. Formato confirmado contra
+    # cómics reales ya en el servidor del usuario ("Avatar - The Last
+    # Airbender - The Promise (2012) #01.cbr"): título en inglés (el que
+    # da ComicVine), año, y "#" + número con 2 dígitos.
+    # Nombre: "Avatar - The Last Airbender - The Promise (2012) #01.cbr"
+    "comic_template": "{serie} ({año}) #{episodio:02d}{ext}",
     "ftp_host": "",
     "ftp_port": 21,
     "ftp_user": "",
@@ -45,6 +58,12 @@ DEFAULTS = {
     "watch_folder": "",
     "poll_interval": 10,
     "auto_action": "Mantener original",
+    "manual_action": "Mantener original",
+    # Descomprimir .zip/.7z/.rar/.tar (y variantes comprimidas de tar)
+    # encontrados en la carpeta vigilada (ver core/archive_extract.py) --
+    # desactivado por defecto porque crea/mueve/borra archivos sin
+    # confirmación, a diferencia de solo identificar.
+    "auto_extract_archives": False,
     "ftp_parallel": 1,
     "ftp_speed_limit": 0,
     "ftp_retries": 3,
@@ -58,6 +77,19 @@ DEFAULTS = {
     # nada a terceros hasta que el usuario lo active explícitamente.
     "ai_fallback_enabled": False,
     "ai_api_key": "",
+    # Identificación de cómics/manga (core/comicvine_client.py) -- credencial
+    # compartida por el grupo igual que tmdb_api_key (ver
+    # core/server_config.py), NO por máquina como ai_api_key/plex_token/
+    # jellyfin_api_key: por eso NO está en _KEYRING_KEYS. ComicVine, a
+    # diferencia de Google Books, exige API key en cada petición.
+    "comicvine_api_key": "",
+    # Google Books (ebooks) SÍ funciona sin key -- pero la cuota anónima es
+    # muy ajustada y compartida globalmente entre cualquiera que llame sin
+    # una, así que puede saturarse (429) incluso con una sola búsqueda si
+    # otros usuarios la están agotando en ese momento. Una key gratuita
+    # propia (console.cloud.google.com, activar "Books API") da cuota per-
+    # proyecto en vez de la anónima compartida.
+    "google_books_api_key": "",
     # Refresco de biblioteca en Plex/Jellyfin tras subir -- cada uno
     # independiente, se puede activar solo uno, los dos, o ninguno.
     "plex_enabled": False,

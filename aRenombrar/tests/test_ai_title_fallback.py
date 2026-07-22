@@ -137,3 +137,60 @@ def test_validate_api_key_gets_logged(monkeypatch, tmp_path):
         h.flush()
     text = (tmp_path / "ai_fallback.log").read_text(encoding="utf-8")
     assert "Validando API Key de Groq" in text
+
+
+# ── guess_original_comic_title_via_ai (traducción de título para ComicVine) ──
+
+def test_comic_translate_returns_none_without_api_key():
+    assert aif.guess_original_comic_title_via_ai("La Promesa", api_key="") is None
+
+
+def test_comic_translate_successful_call_returns_original_title(monkeypatch, tmp_path):
+    _isolated_logger(monkeypatch, tmp_path)
+    content = json.dumps({"original_title": "The Promise"})
+    monkeypatch.setattr(aif.requests, "post",
+                         lambda *a, **kw: _FakeResponse(_groq_payload(content)))
+
+    result = aif.guess_original_comic_title_via_ai("La Promesa", api_key="fake-key")
+    assert result == "The Promise"
+
+
+def test_comic_translate_network_failure_returns_none(monkeypatch, tmp_path):
+    _isolated_logger(monkeypatch, tmp_path)
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(aif.requests, "post", _raise)
+
+    assert aif.guess_original_comic_title_via_ai("La Promesa", api_key="fake-key") is None
+
+
+def test_comic_translate_malformed_json_returns_none(monkeypatch, tmp_path):
+    _isolated_logger(monkeypatch, tmp_path)
+    monkeypatch.setattr(aif.requests, "post",
+                         lambda *a, **kw: _FakeResponse(_groq_payload("no es json valido")))
+
+    assert aif.guess_original_comic_title_via_ai("La Promesa", api_key="fake-key") is None
+
+
+def test_comic_translate_empty_title_returns_none(monkeypatch, tmp_path):
+    _isolated_logger(monkeypatch, tmp_path)
+    content = json.dumps({"original_title": ""})
+    monkeypatch.setattr(aif.requests, "post",
+                         lambda *a, **kw: _FakeResponse(_groq_payload(content)))
+
+    assert aif.guess_original_comic_title_via_ai("La Promesa", api_key="fake-key") is None
+
+
+def test_comic_translate_call_gets_logged(monkeypatch, tmp_path):
+    log = _isolated_logger(monkeypatch, tmp_path)
+    content = json.dumps({"original_title": "The Promise"})
+    monkeypatch.setattr(aif.requests, "post",
+                         lambda *a, **kw: _FakeResponse(_groq_payload(content)))
+
+    aif.guess_original_comic_title_via_ai("La Promesa", api_key="fake-key")
+
+    for h in log.handlers:
+        h.flush()
+    text = (tmp_path / "ai_fallback.log").read_text(encoding="utf-8")
+    assert "La Promesa" in text
+    assert "The Promise" in text
