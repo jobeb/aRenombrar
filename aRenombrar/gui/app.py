@@ -39,6 +39,9 @@ from core.api_client import TMDBClient, detect_episode, MediaInfo, TMDB_IMAGE
 from core.book_client import GoogleBooksClient
 from core.comicvine_client import ComicVineClient
 from core.openlibrary_client import OpenLibraryClient
+from core.mangadex_client import MangaDexClient
+from core.anilist_client import AniListClient
+from core.kitsu_client import KitsuClient
 from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
@@ -616,7 +619,12 @@ class FileEntry:
         self.ext          = get_extension(path)
         self.is_book      = is_book_file(self.path)
         self.is_comic     = is_comic_file(self.path)
-        self.detected     = detect_episode(self.name, is_book=self.is_book, is_comic=self.is_comic)
+        # folder_hint: apoyo para series/mangas cuyos archivos vienen
+        # numerados a secas ("01.cbr") y el nombre real está en la carpeta
+        # que los contiene -- ver core/api_client.py::detect_episode. Solo
+        # se usa si el propio nombre de archivo no deja título aprovechable.
+        self.detected     = detect_episode(self.name, is_book=self.is_book, is_comic=self.is_comic,
+                                            folder_hint=Path(self.path).parent.name)
         self.media_info   = None
         self.new_name     = ""
         self.status       = "pendiente"
@@ -669,7 +677,8 @@ class FileEntry:
         saved_is_comic = d.get("is_comic")
         if entry.is_book and saved_is_comic is not None and saved_is_comic != entry.is_comic:
             entry.is_comic = saved_is_comic
-            entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic)
+            entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic,
+                                             folder_hint=Path(entry.path).parent.name)
         entry._last_known_size_bytes = d.get("last_known_size_bytes")
         if entry._last_known_size_bytes is not None:
             entry._last_known_size_text = _fmt_size(entry._last_known_size_bytes)
@@ -780,6 +789,15 @@ class App(_AppBase):
         self.book_client = GoogleBooksClient(self.config_data.get("google_books_api_key", ""))
         self.comicvine = ComicVineClient(self.config_data.get("comicvine_api_key", ""))
         self.openlibrary_client = OpenLibraryClient()
+        # Alternativas a ComicVine para manga (catálogo mayoritariamente
+        # occidental/inglés, falla a menudo con manga incluso con la
+        # traducción vía IA) -- ninguna necesita API Key. Solo se usan
+        # cuando el selector manual del panel de búsqueda (ver
+        # self._search_provider_override) las elige explícitamente; la
+        # identificación automática al añadir archivos sigue igual.
+        self.mangadex_client = MangaDexClient()
+        self.anilist_client   = AniListClient()
+        self.kitsu_client     = KitsuClient()
         self.ftp  = FTPClient()
         # self.ftp es una única conexión de control compartida con AutoWatcher
         # (ver _toggle_auto) y con varias comprobaciones de fondo de la propia
@@ -1739,6 +1757,15 @@ class App(_AppBase):
                       fg_color=ACCENT, hover_color=ACCENT_HOVER, width=110).pack(side="left", padx=(12, 4), pady=8)
         ctk.CTkButton(left_fr, text="+ Carpeta", command=self._add_folder,
                       width=100).pack(side="left", padx=(0, 4), pady=8)
+        # Selecciona/deselecciona TODOS los archivos de la lista (todas las
+        # páginas, no solo la visible -- self._multi_selected no depende de
+        # qué página esté a la vista, ver _select_range/_current_selection)
+        # de golpe, para poder "Asignar a la selección" sobre cientos de
+        # capítulos sin tener que Ctrl/Shift+clic página por página.
+        self._select_all_btn = ctk.CTkButton(
+            left_fr, text="Seleccionar todos", command=self._toggle_select_all,
+            fg_color="transparent", border_width=1, width=140)
+        self._select_all_btn.pack(side="left", padx=(0, 4), pady=8)
 
         ctk.CTkLabel(table_header, text="Archivos", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=0, column=1, padx=16, pady=8)
@@ -2049,6 +2076,25 @@ class App(_AppBase):
         self._search_lang_flag = ctk.CTkLabel(search_label_row, image=self._uk_flag_image, text="")
         self._search_lang_flag.pack(side="left", padx=(5, 0))
         self._search_lang_flag.pack_forget()   # oculta salvo para cómics -- ver _reset_search_panel
+        # Selector manual de con qué servicio buscar -- "Auto" (por defecto,
+        # cadena automática de siempre según entry.is_comic/is_book) o
+        # forzar uno concreto sin restricción de tipo (p.ej. AniList en un
+        # .epub) -- útil sobre todo para manga, que ComicVine identifica mal
+        # a menudo incluso con traducción vía IA (ver
+        # self._search_provider_override/_on_search_provider_changed). Solo
+        # afecta a la búsqueda MANUAL de este panel -- ni la identificación
+        # automática al añadir archivos ni el Modo Automático la usan.
+        self._SEARCH_PROVIDER_LABELS = {
+            "auto": "Auto", "openlibrary": "OpenLibrary", "google_books": "GoogleBooks",
+            "comicvine": "ComicVine", "mangadex": "MangaDex", "anilist": "AniList", "kitsu": "Kitsu",
+        }
+        self._search_provider_override = "auto"
+        self._search_provider_menu = ctk.CTkOptionMenu(
+            search_top, values=list(self._SEARCH_PROVIDER_LABELS.values()),
+            command=self._on_search_provider_changed, width=239, height=22,
+            font=ctk.CTkFont(size=11))
+        self._search_provider_menu.set("Auto")
+        self._search_provider_menu.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         # Un único campo hace de buscador y de desplegable de resultados:
         # se escribe el título y se pulsa Enter/"Buscar", y el propio campo
         # se convierte en el desplegable para elegir entre los resultados
@@ -2065,7 +2111,7 @@ class App(_AppBase):
                                               command=self._on_result_preview,
                                               dropdown_font=self._search_dropdown_font)
         self._result_combo.set("")
-        self._result_combo.grid(row=1, column=0, sticky="ew")
+        self._result_combo.grid(row=2, column=0, sticky="ew")
         self._result_combo.bind("<Return>", lambda _: self._manual_search(use_ai_fallback=True))
         # Búsqueda automática mientras se escribe (con un pequeño retardo
         # para no lanzar una petición a TMDB en cada pulsación).
@@ -2077,14 +2123,14 @@ class App(_AppBase):
         self._result_combo.bind("<Up>", lambda e: self._cycle_search_result(-1))
         self._search_debounce_id = None
         ctk.CTkButton(search_top, text="Buscar", width=60,
-                      command=lambda: self._manual_search(use_ai_fallback=True)).grid(row=1, column=1, padx=(4, 0))
+                      command=lambda: self._manual_search(use_ai_fallback=True)).grid(row=2, column=1, padx=(4, 0))
         # Texto dinámico: "Asignar" con un solo archivo (ancla), "Asignar a
         # la selección (N)" con varios marcados vía Ctrl/Shift+clic -- ver
         # _update_assign_button_label/_current_selection.
         self._assign_btn = ctk.CTkButton(search_top, text="Asignar", width=200,
                       command=self._assign_selected_result)
         self._assign_btn.grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         # Solo para cómics (ver _reset_search_panel, que la muestra/oculta
         # al cambiar de selección) -- ComicVine falla casi siempre con el
         # título detectado localmente en castellano, este botón pide a la
@@ -2093,7 +2139,7 @@ class App(_AppBase):
             search_top, text="🪄 IA: título original", width=200,
             fg_color="transparent", border_width=1,
             command=self._manual_ai_translate_comic)
-        self._ai_translate_comic_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self._ai_translate_comic_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self._ai_translate_comic_btn.grid_remove()
         self._tmdb_results = []
         # Qué cliente produjo self._tmdb_results -- "tmdb" | "book" | "comic"
@@ -4828,7 +4874,30 @@ class App(_AppBase):
                             e.error_msg = str(exc)
                             _log.exception("Subida: excepcion inesperada procesando %r", e.name)
                 elif idx >= len(self._upload_queue):
-                    # Cola vacía — esperar brevemente por nuevos ítems encolados en caliente
+                    # Cola vacía -- antes de dar la tanda por terminada,
+                    # barrer self.files por si hay archivos que se han
+                    # quedado "listo"/"renombrado" DESPUÉS de arrancar esta
+                    # subida (p.ej. una identificación en bloque de cientos
+                    # de capítulos que todavía seguía en marcha cuando se
+                    # pulsó "Subir todo") -- bug real: esos archivos se
+                    # quedaban en "Listo" para siempre en vez de "Subido",
+                    # salvo que el usuario los subiera manualmente uno a uno
+                    # con el botón ▲ de su fila (ver _upload_one, que ya
+                    # permite encolar en caliente sobre una tanda en
+                    # marcha -- esto hace lo mismo automáticamente).
+                    in_queue = {id(e) for e in self._upload_queue}
+                    stragglers = [e for e in self.files if id(e) not in in_queue
+                                  and e.status in ("listo", "renombrado") and e.media_info]
+                    if stragglers:
+                        for e in stragglers:
+                            e.ftp_progress = 0.0
+                            e.ftp_speed    = 0.0
+                            e.ftp_status   = "En espera"
+                            e.status       = "en_cola"
+                            self.after(0, lambda en=e: self._update_row(en))
+                        self._upload_queue.extend(stragglers)
+                        continue
+                    # Esperar brevemente por nuevos ítems encolados en caliente
                     _time.sleep(0.2)
                     if idx >= len(self._upload_queue):
                         break
@@ -10018,9 +10087,13 @@ class App(_AppBase):
             self.config_data["last_dir"] = folder
             files = [str(f) for f in Path(folder).rglob("*")
                      if f.is_file() and (is_video_file(str(f)) or is_book_file(str(f)) or is_archive_file(str(f)))]
-            self._add_paths_extracting_archives(files)
+            # same_series_prompt=True SOLO aquí (+ Carpeta) -- ver
+            # _prompt_same_series_if_needed. El selector de archivos suelto
+            # y arrastrar y soltar casi nunca añaden una colección entera de
+            # golpe, así que no tiene sentido preguntarles lo mismo.
+            self._add_paths_extracting_archives(files, same_series_prompt=True)
 
-    def _add_paths_extracting_archives(self, paths: list):
+    def _add_paths_extracting_archives(self, paths: list, same_series_prompt: bool = False):
         """Punto de entrada común para _add_files/_on_drop/_add_folder --
         separa archivos comprimidos (.zip/.7z/.rar/.tar y variantes) del
         resto y los descomprime antes de añadirlos (ver
@@ -10032,12 +10105,13 @@ class App(_AppBase):
         archives = [p for p in paths if is_archive_file(p)]
         others   = [p for p in paths if p not in archives]
         if not archives:
-            self._add_entries(others)
+            self._add_entries(others, same_series_prompt=same_series_prompt)
             return
         self._set_status(f"Descomprimiendo {len(archives)} archivo(s)...", WARNING_COLOR)
-        threading.Thread(target=self._extract_archives_worker, args=(archives, others), daemon=True).start()
+        threading.Thread(target=self._extract_archives_worker,
+                          args=(archives, others, same_series_prompt), daemon=True).start()
 
-    def _extract_archives_worker(self, archives, others):
+    def _extract_archives_worker(self, archives, others, same_series_prompt=False):
         """Descomprime *archives* (uno por uno, incluidos los anidados que
         aparezcan dentro -- a diferencia del Modo Automático, que los deja
         para el siguiente ciclo de escaneo, aquí no hay "siguiente ciclo":
@@ -10071,10 +10145,10 @@ class App(_AppBase):
             if fail:
                 names = ", ".join(n for n, _ in fail)
                 self._set_status(f"No se pudo descomprimir: {names}", ERROR_COLOR)
-            self._add_entries(res)
+            self._add_entries(res, same_series_prompt=same_series_prompt)
         self.after(0, _finish)
 
-    def _add_entries(self, paths):
+    def _add_entries(self, paths, same_series_prompt: bool = False):
         existing = {e.path for e in self.files}
         added = []
         for p in paths:
@@ -10083,8 +10157,82 @@ class App(_AppBase):
                 self.files.append(entry)
                 added.append(entry)
         self._refresh_table()
-        if added:
+        if not added:
+            return
+        if same_series_prompt:
+            book_comic_added = [e for e in added if e.is_book]
+            video_added      = [e for e in added if not e.is_book]
+            self._prompt_same_series_if_needed(book_comic_added, video_added)
+        else:
             self.after(50, self._search_new_entries, added)
+
+    def _prompt_same_series_if_needed(self, book_comic_entries, video_entries):
+        """Si se añadieron 2+ archivos de libro/cómic a la vez desde
+        "+ Carpeta" (ver _add_folder), pregunta si son todos la misma
+        serie/colección antes de lanzar una identificación por archivo --
+        evita saturar la cuota del proveedor (ComicVine/OpenLibrary/etc.)
+        con decenas o cientos de búsquedas idénticas cuando en realidad es
+        UNA sola serie. Bug real: 266 capítulos identificados uno a uno
+        agotaron la cuota de ComicVine a mitad de camino (420 Client
+        Error). Los vídeos del mismo lote (si los hay) NUNCA entran en esta
+        pregunta -- siguen su camino de siempre (TMDB por archivo)."""
+        if len(book_comic_entries) < 2:
+            self.after(50, self._search_new_entries, book_comic_entries + video_entries)
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        self._apply_icon(dlg)
+        dlg.title("¿Misma serie o colección?")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+
+        n = len(book_comic_entries)
+        ctk.CTkLabel(
+            dlg, justify="left", wraplength=380,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text=f"Se han detectado {n} archivos de libro/cómic en esta carpeta.\n"
+                 "¿Pertenecen todos a la misma serie o colección?",
+        ).pack(padx=20, pady=(20, 12))
+
+        def _same_series():
+            dlg.destroy()
+            if video_entries:
+                self.after(50, self._search_new_entries, video_entries)
+            # Preselecciona TODOS los libros/cómics de este lote (mismo
+            # mecanismo que el botón "Seleccionar todos", ver
+            # _toggle_select_all) para que "Asignar a la selección" reparta
+            # el mismo resultado a todos en cuanto el usuario busque la
+            # serie una vez -- cada uno conserva su propio episodio/
+            # capítulo ya detectado de su nombre (ver
+            # _assign_to_selection_worker, sin cambios).
+            anchor = book_comic_entries[0]
+            self._selected_entry = anchor
+            self._multi_selected = set(book_comic_entries) - {anchor}
+            self._reset_search_panel(anchor)
+            self._update_detail(anchor)
+            self._refresh_table()
+            self._update_assign_button_label()
+            self._result_combo.focus()
+            self._set_status(
+                f"{n} archivos añadidos como misma serie -- busca una vez y pulsa Asignar",
+                SUCCESS_COLOR)
+
+        def _each_one():
+            dlg.destroy()
+            self.after(50, self._search_new_entries, book_comic_entries + video_entries)
+
+        # Cerrar la ventana sin elegir (aspa) equivale a "No" -- el
+        # comportamiento de siempre es la opción segura por defecto, nunca
+        # dejar el lote entero sin ninguna búsqueda lanzada.
+        dlg.protocol("WM_DELETE_WINDOW", _each_one)
+
+        bf = ctk.CTkFrame(dlg, fg_color="transparent")
+        bf.pack(padx=20, pady=(4, 20))
+        ctk.CTkButton(bf, text="Sí, son la misma serie", command=_same_series, width=180,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=4)
+        ctk.CTkButton(bf, text="No, identificar cada uno", command=_each_one, width=180,
+                      fg_color="transparent", border_width=1).pack(side="left", padx=4)
 
     def _clear_files(self):
         # self._upload_running solo indica una subida MANUAL en marcha -- el
@@ -10190,10 +10338,15 @@ class App(_AppBase):
                                      font=self._font_name, width=cw["name"])
             name_lbl.pack(side="left", padx=0, pady=2)
 
+            # Detectado: doble clic para corregir a mano título/temporada/
+            # episodio -- ver _edit_detected. Útil cuando detect_episode()
+            # no acierta con un nombre de archivo raro, sin tener que
+            # esperar a un arreglo de regex para poder subir ESE archivo ya.
             det_lbl = ctk.CTkLabel(rf, text=_fit_text(det_text, cw["det"], self._font_det), anchor="w",
                                     font=self._font_det, text_color=PENDING_COLOR,
-                                    width=cw["det"])
+                                    width=cw["det"], cursor="hand2")
             det_lbl.pack(side="left", padx=(4, 0), pady=2)   # mirror sash name|det
+            det_lbl.bind("<Double-Button-1>", lambda ev, e=entry: self._edit_detected(e))
 
             nn_lbl = ctk.CTkLabel(rf, text=_fit_text(entry.new_name, cw["nn"], self._font_nn), anchor="w",
                                    font=self._font_nn,
@@ -10495,6 +10648,34 @@ class App(_AppBase):
     def _update_assign_button_label(self):
         n = len(self._current_selection())
         self._assign_btn.configure(text=f"Asignar a la selección ({n})" if n > 1 else "Asignar")
+        self._update_select_all_button_label()
+
+    def _update_select_all_button_label(self):
+        all_selected = bool(self.files) and len(self._current_selection()) == len(self.files)
+        self._select_all_btn.configure(text="Deseleccionar todos" if all_selected else "Seleccionar todos")
+
+    def _toggle_select_all(self):
+        """Marca (o desmarca, si ya estaban todos) TODOS los archivos de
+        self.files como selección múltiple de golpe -- todas las páginas,
+        no solo la visible (self._multi_selected/_current_selection no
+        dependen de qué página esté a la vista). Pensado para poder
+        "Asignar a la selección" sobre cientos de capítulos sin tener que
+        Ctrl/Shift+clic archivo por archivo o página por página."""
+        if not self.files:
+            return
+        if len(self._current_selection()) == len(self.files):
+            self._clear_detail()   # ya deja self._selected_entry/_multi_selected vacíos
+        else:
+            # Conserva el ancla actual si sigue siendo un archivo válido de
+            # la lista (para no descolocar el panel de detalles/búsqueda ya
+            # abierto) -- si no había ninguno, usa el primero de la lista.
+            anchor = self._selected_entry if self._selected_entry in self.files else self.files[0]
+            self._selected_entry = anchor
+            self._multi_selected = set(self.files) - {anchor}
+            self._reset_search_panel(anchor)
+            self._update_detail(anchor)
+        self._refresh_table()
+        self._update_assign_button_label()
 
     def _reset_search_panel(self, entry=None):
         """Limpia el buscador manual (texto, desplegable de resultados y
@@ -10515,19 +10696,66 @@ class App(_AppBase):
         self._tmdb_results = []
         self._results_kind = "tmdb"
         self._previewed_result_idx = -1
-        # La etiqueta debe reflejar el servicio real que va a usarse --
-        # "Buscar en TMDB" no tiene sentido para un libro/cómic (ver
-        # _search_source_name).
-        self._search_label.configure(text=f"Buscar en {self._search_source_name(entry)}:")
-        # El botón de traducción vía IA y la bandera de "busca en inglés"
-        # solo tienen sentido para cómics (ComicVine) -- ocultos para
-        # vídeo/libros de texto (ver _manual_ai_translate_comic).
+        # El selector manual de proveedor NO se resetea al cambiar de
+        # archivo -- persiste tal cual el usuario lo dejó (ver
+        # self._search_provider_override/_on_search_provider_changed), para
+        # no tener que volver a elegir MangaDex/AniList/etc. en cada
+        # capítulo al identificar una colección grande uno a uno.
+        if self._search_provider_override != "auto":
+            label = self._SEARCH_PROVIDER_LABELS.get(self._search_provider_override, "Auto")
+        else:
+            # La etiqueta debe reflejar el servicio real que va a usarse --
+            # "Buscar en TMDB" no tiene sentido para un libro/cómic (ver
+            # _search_source_name).
+            label = self._search_source_name(entry)
+        self._search_label.configure(text=f"Buscar en {label}:")
+        self._update_search_lang_hint(entry)
+
+    def _effective_search_provider(self, entry) -> str:
+        """Proveedor que se usaría de verdad ahora mismo para *entry*: el
+        override manual del selector si no es "auto" (ver
+        self._search_provider_override), si no lo que tocaría por defecto
+        según el tipo de archivo -- mismo criterio que _manual_search_worker."""
+        if self._search_provider_override != "auto":
+            return self._search_provider_override
         if entry is not None and entry.is_comic:
-            self._ai_translate_comic_btn.grid()
+            return "comicvine"
+        if entry is not None and entry.is_book:
+            return "openlibrary"
+        return "tmdb"
+
+    def _update_search_lang_hint(self, entry):
+        """Muestra/oculta la bandera de "busca en inglés" y el botón de
+        traducción vía IA según el proveedor EFECTIVO (ver
+        _effective_search_provider), no solo entry.is_comic -- para que
+        reaccionen también a un cambio manual del selector, no solo al
+        cambiar de archivo seleccionado. ComicVine/AniList/Kitsu no traen
+        alt-títulos en español fiables (de ahí la bandera); MangaDex SÍ, así
+        que no la necesita. El botón de traducción sigue apuntando solo a
+        ComicVine -- no hay traductor propio para los demás proveedores."""
+        provider = self._effective_search_provider(entry)
+        if provider in ("comicvine", "anilist", "kitsu"):
             self._search_lang_flag.pack(side="left", padx=(5, 0))
         else:
-            self._ai_translate_comic_btn.grid_remove()
             self._search_lang_flag.pack_forget()
+        if provider == "comicvine":
+            self._ai_translate_comic_btn.grid()
+        else:
+            self._ai_translate_comic_btn.grid_remove()
+
+    def _on_search_provider_changed(self, choice: str):
+        """Callback del selector manual (self._search_provider_menu) --
+        guarda el proveedor elegido, actualiza la etiqueta/bandera/botón de
+        IA, y relanza la búsqueda ya en marcha (si hay texto y archivo
+        seleccionado) para que el cambio surta efecto sin un clic extra."""
+        key = next((k for k, v in self._SEARCH_PROVIDER_LABELS.items() if v == choice), "auto")
+        self._search_provider_override = key
+        entry = self._selected_entry
+        label = choice if key != "auto" else self._search_source_name(entry)
+        self._search_label.configure(text=f"Buscar en {label}:")
+        self._update_search_lang_hint(entry)
+        if entry is not None and self._result_combo.get().strip():
+            self._manual_search()
 
     # --------------------------------------------------------- TMDB search
 
@@ -10651,7 +10879,8 @@ class App(_AppBase):
         if not entry.is_book or entry.is_comic == is_comic:
             return
         entry.is_comic = is_comic
-        entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic)
+        entry.detected = detect_episode(entry.name, is_book=entry.is_book, is_comic=entry.is_comic,
+                                         folder_hint=Path(entry.path).parent.name)
         entry.media_info = None
         entry.new_name   = ""
         entry.status     = "pendiente"
@@ -10785,8 +11014,31 @@ class App(_AppBase):
         entry = self._selected_entry
         is_comic = bool(entry and entry.is_comic)
         is_book_only = bool(entry and entry.is_book and not entry.is_comic)
+        override = self._search_provider_override
         try:
-            if is_comic:
+            # Selector forzado a un proveedor concreto (no "Auto"): una sola
+            # llamada directa, sin ningún encadenado de apoyo -- forzar
+            # significa forzar, y sin restricción de tipo de archivo (ver
+            # plan: se permite p.ej. AniList en un .epub a propósito).
+            if override == "openlibrary":
+                self._results_kind = "openlibrary"
+                results = self.openlibrary_client.search_volumes(query)
+            elif override == "google_books":
+                self._results_kind = "book"
+                results = self.book_client.search_volumes(query)
+            elif override == "comicvine":
+                self._results_kind = "comic"
+                results = self.comicvine.search_volumes(query)
+            elif override == "mangadex":
+                self._results_kind = "mangadex"
+                results = self.mangadex_client.search_volumes(query)
+            elif override == "anilist":
+                self._results_kind = "anilist"
+                results = self.anilist_client.search_volumes(query)
+            elif override == "kitsu":
+                self._results_kind = "kitsu"
+                results = self.kitsu_client.search_volumes(query)
+            elif is_comic:
                 self._results_kind = "comic"
                 results = self.comicvine.search_volumes(query)
             elif is_book_only:
@@ -10894,6 +11146,21 @@ class App(_AppBase):
             name = (r.get("volume") or {}).get("name") or r.get("name", "")
             year = str(r.get("start_year", "") or "")
             return f"{name} ({year}) [cómic]"
+        if self._results_kind == "mangadex":
+            attrs = r.get("attributes", {}) or {}
+            name = MangaDexClient._first_localized(attrs.get("title", {}))
+            year = str(attrs.get("year", "") or "")
+            return f"{name} ({year}) [MangaDex]"
+        if self._results_kind == "anilist":
+            t = r.get("title", {}) or {}
+            name = t.get("english") or t.get("romaji") or t.get("native") or ""
+            year = str((r.get("startDate") or {}).get("year", "") or "")
+            return f"{name} ({year}) [AniList]"
+        if self._results_kind == "kitsu":
+            attrs = r.get("attributes", {}) or {}
+            name = attrs.get("canonicalTitle") or (attrs.get("titles") or {}).get("en") or ""
+            year = (attrs.get("startDate") or "")[:4]
+            return f"{name} ({year}) [Kitsu]"
         if r.get("media_type") == "tv":
             name = r.get("name", "")
             year = (r.get("first_air_date", "") or "")[:4]
@@ -10913,6 +11180,12 @@ class App(_AppBase):
             return self.book_client.build_book_info(result)
         if self._results_kind == "comic":
             return self.comicvine.build_comic_info(result, episode=det.get("episode"))
+        if self._results_kind == "mangadex":
+            return self.mangadex_client.build_manga_info(result, episode=det.get("episode"))
+        if self._results_kind == "anilist":
+            return self.anilist_client.build_manga_info(result, episode=det.get("episode"))
+        if self._results_kind == "kitsu":
+            return self.kitsu_client.build_manga_info(result, episode=det.get("episode"))
         return self.tmdb.build_media_info(result, season=det.get("season"), episode=det.get("episode"))
 
     def _apply_search_results(self, labels):
@@ -11054,7 +11327,7 @@ class App(_AppBase):
         ok, skipped = 0, 0
         for entry in targets:
             matches = (
-                (kind == "comic" and entry.is_comic) or
+                (kind in ("comic", "mangadex", "anilist", "kitsu") and entry.is_comic) or
                 (kind in ("openlibrary", "book") and entry.is_book and not entry.is_comic) or
                 (kind == "tmdb" and not entry.is_book)
             )
@@ -11385,7 +11658,13 @@ class App(_AppBase):
         otra subida manual en paralelo ni con el modo automático escribiendo
         a la vez -- sin el lock, dos hilos podían basar su escritura en la
         misma lectura desactualizada y uno de los dos perdía su marca
-        "subido", haciendo que ese archivo "reapareciera" como nuevo."""
+        "subido", haciendo que ese archivo "reapareciera" como nuevo.
+
+        Al pasar a "subiendo" se guarda el estado previo (p.ej.
+        "identificado_manual") como "prev_status" en la propia entrada --
+        ver _unmark_auto_processed/_cleanup_stale_uploading_marks, que lo
+        usan para restaurar en vez de borrar del todo si la subida se
+        interrumpe (la app se cierra a medias) sin llegar a "subido"."""
         import json as _json, time as _t
         try:
             from core.auto_watcher import _processed_db_path, _DB_LOCK
@@ -11397,16 +11676,27 @@ class App(_AppBase):
                         db = _json.loads(p.read_text(encoding="utf-8"))
                     except Exception:
                         pass
-                db[original_path] = {"status": status, "new_name": new_name, "ts": _t.time()}
+                entry = {"status": status, "new_name": new_name, "ts": _t.time()}
+                if status == "subiendo":
+                    prev = db.get(original_path, {})
+                    prev_status = prev.get("status", "")
+                    if prev_status and prev_status != "subiendo":
+                        entry["prev_status"]   = prev_status
+                        entry["prev_new_name"] = prev.get("new_name", "")
+                db[original_path] = entry
                 p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
 
     def _unmark_auto_processed(self, original_path: str):
-        """Quita la marca de auto_processed.json para este archivo, si la
-        hay — usado cuando una subida manual empieza (se marca "subiendo")
-        pero no llega a completarse, para no dejarlo bloqueado para
-        AutoWatcher para siempre."""
+        """Deshace la marca "subiendo" de auto_processed.json para este
+        archivo tras una subida manual que no llega a completarse --  si
+        había un estado anterior protegido (p.ej. "identificado_manual",
+        guardado en "prev_status" por _mark_auto_processed), se restaura en
+        vez de borrar la entrada entera: si no, AutoWatcher se olvidaría de
+        que el archivo ya se había identificado a mano y lo trataría como
+        nuevo. Solo se borra del todo si no había nada protegido antes (el
+        archivo era realmente nuevo)."""
         import json as _json
         try:
             from core.auto_watcher import _processed_db_path, _DB_LOCK
@@ -11416,18 +11706,44 @@ class App(_AppBase):
                     return
                 db = _json.loads(p.read_text(encoding="utf-8"))
                 if original_path in db:
-                    del db[original_path]
+                    self._restore_or_delete_entry(db, original_path)
                     p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    @staticmethod
+    def _restore_or_delete_entry(db: dict, key: str):
+        """Restaura la entrada *key* de *db* a su "prev_status" (si lo
+        tenía) o la borra del todo (si no) -- lógica compartida entre
+        _unmark_auto_processed y _cleanup_stale_uploading_marks. Muta *db*
+        in-place, no escribe a disco."""
+        entry = db.get(key, {})
+        prev_status = entry.get("prev_status", "")
+        if prev_status:
+            db[key] = {
+                "status":   prev_status,
+                "new_name": entry.get("prev_new_name", ""),
+                "ts":       entry.get("ts", 0),
+            }
+        else:
+            del db[key]
 
     def _cleanup_stale_uploading_marks(self):
         """Al arrancar, ninguna subida manual puede estar realmente "en
         marcha" todavía (acabamos de abrir la app) — cualquier marca
         "subiendo" que quede en auto_processed.json es forzosamente de una
         sesión anterior cerrada a medias (cierre forzado, cuelgue, etc.).
-        Sin esto, ese archivo se quedaría bloqueado para AutoWatcher para
-        siempre, porque nada más lo desmarcaría."""
+
+        Antes esto borraba la entrada entera, lo que también borraba
+        cualquier "identificado_manual" previo que _mark_auto_processed
+        había guardado en "prev_status" al empezar esa subida -- visto de
+        verdad: un cómic ya identificado a mano quedó "subiendo" al cerrar
+        la app en mitad de la subida, el siguiente arranque lo borró del
+        todo, y el modo automático (activado más tarde) lo detectó como
+        nuevo y lo volvió a identificar (con otro resultado, mal) y subir
+        por su cuenta -- duplicado en el FTP. Ahora se restaura el estado
+        anterior en vez de borrar (ver _restore_or_delete_entry); solo se
+        borra del todo si no había nada protegido antes."""
         import json as _json
         try:
             from core.auto_watcher import _processed_db_path, _DB_LOCK
@@ -11440,7 +11756,7 @@ class App(_AppBase):
                 if not stale:
                     return
                 for k in stale:
-                    del db[k]
+                    self._restore_or_delete_entry(db, k)
                 p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -12100,6 +12416,83 @@ class App(_AppBase):
 
     # ──────────────────────── Menú contextual de fila (reordenar / resetear) ──
 
+    def _edit_detected(self, entry):
+        """Diálogo para corregir a mano el título/temporada/episodio que
+        detect_episode() sacó localmente del nombre de archivo (ver
+        entry.detected) -- doble clic en la columna "Detectado" de la
+        tabla, o desde el menú contextual. Útil cuando el nombre de archivo
+        es raro y la detección automática no acierta -- no hace falta
+        esperar a un arreglo de regex para poder identificar/subir ESE
+        archivo ya.
+
+        Escribe directamente en entry.detected (el mismo dict que ya usa
+        todo el resto del código -- _manual_search lo usa como query por
+        defecto, _build_info_from_result/_assign_to_selection_worker leen
+        det.get("episode"), la columna "Detectado" lo muestra) -- todo lo
+        que ya lee entry.detected recoge el cambio solo con refrescar la
+        fila, sin tocar ningún otro método. entry.status/media_info NO se
+        tocan (a diferencia de _set_book_comic_type): esto solo corrige el
+        punto de partida de la búsqueda, no resetea una identificación ya
+        hecha."""
+        det = entry.detected
+
+        dlg = ctk.CTkToplevel(self)
+        self._apply_icon(dlg)
+        dlg.title("Editar título/episodio")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+
+        ctk.CTkLabel(dlg, text=f"Detectado a mano para:\n{entry.name}",
+                     font=ctk.CTkFont(size=12, weight="bold"), justify="left",
+                     wraplength=380).pack(padx=20, pady=(20, 8))
+
+        ctk.CTkLabel(dlg, text="Título", font=ctk.CTkFont(size=11), anchor="w").pack(
+            padx=20, pady=(4, 0), fill="x")
+        title_entry = ctk.CTkEntry(dlg, width=380)
+        title_entry.insert(0, det.get("title", "") or "")
+        title_entry.pack(padx=20, pady=(0, 4))
+
+        # Temporada solo tiene sentido para vídeo (TV/anime) -- un
+        # cómic/libro nunca la usa (ver detect_episode(is_book=True)).
+        season_entry = None
+        if not entry.is_book:
+            ctk.CTkLabel(dlg, text="Temporada", font=ctk.CTkFont(size=11), anchor="w").pack(
+                padx=20, pady=(4, 0), fill="x")
+            season_entry = ctk.CTkEntry(dlg, width=380)
+            if det.get("season") is not None:
+                season_entry.insert(0, str(det["season"]))
+            season_entry.pack(padx=20, pady=(0, 4))
+
+        ep_label = "Capítulo" if entry.is_comic else "Episodio"
+        ctk.CTkLabel(dlg, text=ep_label, font=ctk.CTkFont(size=11), anchor="w").pack(
+            padx=20, pady=(4, 0), fill="x")
+        episode_entry = ctk.CTkEntry(dlg, width=380)
+        if det.get("episode") is not None:
+            episode_entry.insert(0, str(det["episode"]))
+        episode_entry.pack(padx=20, pady=(0, 8))
+
+        def _to_int_or_none(text: str):
+            text = text.strip()
+            return int(text) if text.isdigit() else None
+
+        def _save():
+            det["title"] = title_entry.get().strip()
+            det["episode"] = _to_int_or_none(episode_entry.get())
+            if season_entry is not None:
+                det["season"] = _to_int_or_none(season_entry.get())
+            self._update_row(entry)
+            if self._selected_entry is entry:
+                self._reset_search_panel(entry)
+            dlg.destroy()
+
+        bf = ctk.CTkFrame(dlg, fg_color="transparent")
+        bf.pack(padx=20, pady=(4, 20))
+        ctk.CTkButton(bf, text="Guardar", command=_save, width=100,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=4)
+        ctk.CTkButton(bf, text="Cancelar", command=dlg.destroy, width=90,
+                      fg_color="transparent", border_width=1).pack(side="left", padx=4)
+
     def _edit_remote_dir(self, entry):
         """Diálogo para fijar a mano la carpeta remota de destino de
         *entry* -- doble clic en la columna "Destino" de la tabla. Mientras
@@ -12183,6 +12576,8 @@ class App(_AppBase):
                                  command=lambda: self._set_book_comic_type(entry, is_comic=True))
         if entry.media_info and entry.status in ("listo", "renombrado", "error", "omitido"):
             menu.add_command(label="▲  Subir este archivo", command=lambda: self._upload_one(entry))
+        menu.add_command(label="✎  Editar título/episodio detectado…",
+                         command=lambda: self._edit_detected(entry))
         menu.add_command(label="✎  Editar carpeta de destino…",
                          command=lambda: self._edit_remote_dir(entry))
         menu.add_separator()

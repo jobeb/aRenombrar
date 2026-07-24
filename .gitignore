@@ -16,6 +16,7 @@ aRenombrar/diagnostico.log
 # Artefactos de build ya descargados a mano (instaladores/.dmg de
 # prueba) -- no pertenecen al repo, son binarios grandes
 aRenombrar/macos_dl/
+/release_assets/
 
 # Marcador de lanzar.vbs -- evita reinstalar dependencias en cada
 # arranque si requirements.txt no ha cambiado

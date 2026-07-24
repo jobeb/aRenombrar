@@ -15,16 +15,30 @@ from collections import deque
 import requests
 
 from core.api_client import MediaInfo
+from core.applog import get_logger
 
 COMICVINE_BASE = "https://comicvine.gamespot.com/api"
 
+_log = get_logger("aRenombrar.comicvine", "app.log")
+
 
 class ComicVineClient:
-    # Cuota pública documentada de ComicVine es bastante más ajustada que
-    # la de TMDB -- este margen es deliberadamente conservador, no una
-    # cifra medida contra el servicio real.
-    _MAX_REQUESTS_PER_WINDOW = 150
-    _WINDOW_SECONDS = 3600.0
+    # Ventana de autolimitado -- antes 150 peticiones / 3600s (1 hora): un
+    # margen "conservador" pero nunca medido contra el servicio real (ver
+    # historial). Bug real: una identificación en bloque de una colección
+    # de ~25 cómics (más reintentos/AI de traducción) agotaba esas 150 en
+    # minutos, y CUALQUIER búsqueda posterior se quedaba bloqueada en
+    # _throttle() -- sin sleep, sin log, sin nada visible -- hasta que se
+    # liberase hueco en la ventana de una hora entera. Desde fuera (botón
+    # "Buscar" de la GUI) eso se veía como "Buscando..." colgado
+    # indefinidamente, sin ningún error ni forma de saber por qué ni
+    # cuánto quedaba. 60 peticiones / 60s (1 por segundo de media) es la
+    # guía pública real de ComicVine -- la espera máxima ahora es de
+    # ~60s en vez de hasta ~3600s, y se deja constancia en el log (ver
+    # más abajo) para que una futura espera larga sea diagnosticable sin
+    # tener que adivinarlo.
+    _MAX_REQUESTS_PER_WINDOW = 60
+    _WINDOW_SECONDS = 60.0
 
     def __init__(self, api_key: str = ""):
         self.api_key = api_key
@@ -48,6 +62,9 @@ class ComicVineClient:
                     self._request_times.append(now)
                     return
                 wait = self._WINDOW_SECONDS - (now - self._request_times[0]) + 0.05
+            _log.warning("ComicVine: limite propio de %d peticiones/%ds alcanzado, "
+                         "esperando %.1fs antes de la siguiente busqueda",
+                         self._MAX_REQUESTS_PER_WINDOW, self._WINDOW_SECONDS, wait)
             time.sleep(wait)
 
     def _get(self, endpoint: str, **params) -> dict:

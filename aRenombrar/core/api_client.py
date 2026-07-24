@@ -335,7 +335,8 @@ def _find_junk_start(text: str, extra_junk_terms: Optional[list] = None) -> int:
 
 
 def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
-                    is_book: bool = False, is_comic: bool = False) -> dict:
+                    is_book: bool = False, is_comic: bool = False,
+                    folder_hint: str = "") -> dict:
     """
     Extrae de un nombre de archivo: season, episode, título limpio, tipo.
 
@@ -343,6 +344,16 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
     en esta llamada concreta (sin persistir) — los usa el fallback de IA
     (core/ai_title_fallback.py) para probar si limpian el título antes de
     aprenderlos de verdad vía core/learned_terms.py.
+
+    folder_hint: nombre de la carpeta que contiene el archivo -- SOLO se usa
+    (is_book/is_comic) cuando el propio nombre de archivo no deja ningún
+    título aprovechable, p.ej. escaneos de manga/cómic numerados a secas
+    ("01.cbr", "Capitulo 05.cbr") donde el nombre de la serie está puesto en
+    la carpeta que los contiene, no en cada archivo. Se limpia con el mismo
+    _clean_title que el nombre de archivo (quita créditos de escaneo, año,
+    grupo...) y solo se usa como último recurso: si el archivo YA trae un
+    título de verdad, ese gana siempre. Ignorado para vídeo (is_book=False)
+    -- ahí el propio nombre de archivo casi siempre trae el título.
 
     is_book: el llamador (gui/app.py, vía core.renamer.is_book_file) ya
     sabe por la extensión que esto es un libro/cómic, no un vídeo -- en
@@ -398,10 +409,38 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
                 # en ningún archivo con más de un grupo final, y el número
                 # de grapa se perdía siempre (caía al 1 por defecto, ver
                 # core/renamer.py::build_new_name) aunque hubiera un número
-                # de verdad justo antes de esos corchetes.
-                m = re.search(r"[\s\-_](\d{1,4})(?:\s*[\[\(][^\]\)]*[\]\)])*\s*$", stem)
+                # de verdad justo antes de esos corchetes. "(?:^|[\s\-_])"
+                # (no solo "[\s\-_]"): un escaneo de manga puede venir sin
+                # NADA de título propio, solo el número a secas ("01.cbz",
+                # con el nombre real de la serie en la carpeta contenedora,
+                # ver folder_hint) -- ahí no hay ningún separador antes del
+                # número porque es lo único que hay en el nombre.
+                m = re.search(r"(?:^|[\s\-_])(\d{1,4})(?:\s*[\[\(][^\]\)]*[\]\)])*\s*$", stem)
+            if not m:
+                # Último recurso: escaneos de webtoon/manga que ponen la
+                # palabra "Capítulo"/"Chapter" delante del número, seguida
+                # del TÍTULO PROPIO de ESE capítulo (no de la serie) -- p.ej.
+                # "Capítulo 128 — Capítulo final de la segunda temporada.cbz".
+                # El patrón de arriba exige que el número esté AL FINAL del
+                # nombre -- aquí no lo está (le sigue un guion/raya y más
+                # texto), así que no encontraba nada y el episodio se perdía
+                # siempre (caía al 1 por defecto, ver core/renamer.py::
+                # build_new_name), bug real visto con los capítulos
+                # 128/129/193 de una colección de 266 subidos todos como
+                # "#01". Se prueba SOLO si el patrón de arriba (número al
+                # final) no encontró nada -- si el número SÍ está al final
+                # (p.ej. "Capitulo 05.cbr", sin subtítulo detrás), ese
+                # patrón ya lo captura bien y no hace falta llegar aquí. Todo
+                # lo que va DESPUÉS del número (el subtítulo del capítulo) no
+                # es el título de la serie, así que se descarta -- si no
+                # queda nada útil ANTES tampoco (lo habitual), folder_hint
+                # (ver más abajo) aporta el nombre real de la serie desde la
+                # carpeta contenedora.
+                m = re.search(r"\b(?:cap[ií]tulos?|chapters?|ep(?:isodios?)?)\.?\s*#?\s*(\d{1,4})(?:\.\d+)?",
+                              stem, flags=re.IGNORECASE)
             if m:
                 title = _clean_title(stem[:m.start()], extra_junk_terms)
+                title = _apply_folder_hint(title, folder_hint, extra_junk_terms)
                 return {
                     "title": title,
                     "season": None,
@@ -410,8 +449,10 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
                     "raw_match": m.group(),
                     "extra_episodes": [],
                 }
+        title = _clean_title(stem, extra_junk_terms)
+        title = _apply_folder_hint(title, folder_hint, extra_junk_terms)
         return {
-            "title": _clean_title(stem, extra_junk_terms),
+            "title": title,
             "season": None,
             "episode": None,
             "media_type": "libro",
@@ -471,6 +512,45 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
         "raw_match": None,
         "extra_episodes": [],
     }
+
+
+# Palabras sueltas que un nombre de archivo de cómic/manga puede dejar como
+# "título" tras quitarle el número de grapa/capítulo -- no identifican la
+# serie, así que no sirven para buscar (p.ej. "Capitulo 05.cbr" limpia a
+# "Capitulo", "Tomo 3.cbz" a "Tomo"). Ver _is_uninformative_book_title.
+_GENERIC_CHAPTER_WORDS = {
+    "cap", "capitulo", "capítulo", "chapter", "ch", "tomo", "vol", "volumen",
+    "episodio", "parte", "issue", "numero", "número", "n",
+}
+
+
+def _is_uninformative_book_title(title: str) -> bool:
+    """True si *title* (ya limpiado) no aporta nada para identificar la
+    serie -- vacío, puramente numérico, o una de las palabras sueltas de
+    _GENERIC_CHAPTER_WORDS con o sin el propio número de tomo/capítulo
+    pegado detrás (p.ej. un ebook de texto "Tomo 3.epub" no pasa por la
+    extracción de número de grapa de los cómics -- ese "3" se queda pegado
+    al título tal cual, así que hay que reconocer "tomo3" igual que "tomo")."""
+    if not title:
+        return True
+    normalized = re.sub(r"[^\w]", "", title).lower()
+    if not normalized:
+        return True
+    if normalized.isdigit():
+        return True
+    return re.sub(r"\d+$", "", normalized) in _GENERIC_CHAPTER_WORDS
+
+
+def _apply_folder_hint(title: str, folder_hint: str, extra_junk_terms: Optional[list] = None) -> str:
+    """Sustituye *title* por *folder_hint* (limpiado igual que un nombre de
+    archivo) cuando el propio archivo no dejó ningún título aprovechable --
+    ver detect_episode(folder_hint=...). Si *title* ya es útil, o no hay
+    folder_hint, o el propio folder_hint limpia a nada, se deja *title* tal
+    cual."""
+    if not folder_hint or not _is_uninformative_book_title(title):
+        return title
+    folder_title = _clean_title(folder_hint, extra_junk_terms)
+    return folder_title if folder_title else title
 
 
 def _clean_title(text: str, extra_junk_terms: Optional[list] = None) -> str:

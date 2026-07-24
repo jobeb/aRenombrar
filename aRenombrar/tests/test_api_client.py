@@ -498,3 +498,110 @@ def test_detect_comic_trailing_number_with_two_bracket_groups_different_credit(m
     _isolate_learned_terms(monkeypatch, tmp_path)
     r = detect_episode("WWH 01 - Hulka Vol4 - Tomo 6 [por Parche][CRG-FPJ].cbr", is_book=True, is_comic=True)
     assert r["episode"] == 6
+
+
+# ── folder_hint: series/mangas cuyos capítulos vienen numerados a secas y
+# el nombre real está en la carpeta que los contiene, no en cada archivo ──
+
+def test_detect_comic_bare_number_uses_folder_hint_as_title(monkeypatch, tmp_path):
+    # Bug real: escaneos de manga donde el archivo es solo "01.cbz" y el
+    # nombre de la serie está puesto en la carpeta contenedora -- sin
+    # folder_hint, el título quedaba vacío y ComicVine no podía buscar nada.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("01.cbz", is_book=True, is_comic=True,
+                        folder_hint="One Piece [Completo][CRG]")
+    assert r["episode"] == 1
+    assert r["title"] == "One Piece"
+
+
+def test_detect_comic_generic_chapter_word_uses_folder_hint(monkeypatch, tmp_path):
+    # "Capitulo 05.cbr" limpia a "Capitulo" (sin número) -- palabra genérica,
+    # no una serie -- debe descartarse en favor de la carpeta.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Capitulo 05.cbr", is_book=True, is_comic=True,
+                        folder_hint="Vagabond (Ed.Panini) [CRG-FPJ]")
+    assert r["episode"] == 5
+    assert r["title"] == "Vagabond"
+
+
+def test_detect_book_bare_number_uses_folder_hint(monkeypatch, tmp_path):
+    # Mismo criterio para ebooks de texto (sin número de emisión propio).
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Tomo 3.epub", is_book=True, folder_hint="El Nombre del Viento")
+    assert r["title"] == "El Nombre Del Viento"
+
+
+def test_detect_comic_real_title_in_filename_ignores_folder_hint(monkeypatch, tmp_path):
+    # Si el archivo YA trae un título de verdad, ese gana siempre -- el
+    # folder_hint es solo el último recurso, no debe pisar nada útil.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Avatar La Busqueda 01.cbr", is_book=True, is_comic=True,
+                        folder_hint="Carpeta Descargas Varias")
+    assert r["title"] == "Avatar La Busqueda"
+
+
+def test_detect_comic_no_folder_hint_keeps_old_behavior(monkeypatch, tmp_path):
+    # Sin folder_hint (valor por defecto ""), el comportamiento no cambia.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("01.cbz", is_book=True, is_comic=True)
+    assert r["episode"] == 1
+    assert r["title"] == ""
+
+
+def test_detect_comic_folder_hint_that_also_cleans_to_nothing_keeps_original(monkeypatch, tmp_path):
+    # Si el folder_hint tampoco deja nada útil tras limpiarlo, no debe
+    # sustituir por una cadena vacía -- se conserva el título original
+    # (aunque tampoco sirva de mucho, es preferible a perderlo del todo).
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Capitulo 05.cbr", is_book=True, is_comic=True,
+                        folder_hint="[CRG-FPJ]")
+    assert r["title"] == "Capitulo"
+
+
+# ── "Capítulo N — subtítulo del capítulo": el número NO está al final del
+# nombre, sino seguido del título propio de ese capítulo (no de la serie) ──
+
+def test_detect_comic_chapter_keyword_with_subtitle_after_number(monkeypatch, tmp_path):
+    # Bug real: capítulos 128/129/193 de una colección de 266 subidos todos
+    # como "#01" -- el número no estaba al final del nombre (le seguía un
+    # guion/raya y el subtítulo de ESE capítulo), así que el patrón de
+    # "número al final" no encontraba nada.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Capítulo 128  — Capítulo final de la segunda temporada.cbz",
+                        is_book=True, is_comic=True, folder_hint="Dungeon Reset")
+    assert r["episode"] == 128
+    assert r["title"] == "Dungeon Reset"
+
+    r = detect_episode("Capítulo 129  — Inicio de la tercera temporada.cbz",
+                        is_book=True, is_comic=True, folder_hint="Dungeon Reset")
+    assert r["episode"] == 129
+
+    r = detect_episode("Capítulo 193  — Capítulo final de la tercera temporada.cbz",
+                        is_book=True, is_comic=True, folder_hint="Dungeon Reset")
+    assert r["episode"] == 193
+
+
+def test_detect_comic_chapter_keyword_in_english(monkeypatch, tmp_path):
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Chapter 45 - The Reckoning.cbz", is_book=True, is_comic=True,
+                        folder_hint="Some Manga")
+    assert r["episode"] == 45
+    assert r["title"] == "Some Manga"
+
+
+def test_detect_comic_chapter_keyword_only_tried_when_trailing_number_pattern_fails(monkeypatch, tmp_path):
+    # Si el número SÍ está al final (sin subtítulo detrás), el patrón
+    # existente (número al final) ya lo captura bien -- no debe cambiar el
+    # comportamiento de siempre para este caso simple.
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Capitulo 05.cbr", is_book=True, is_comic=True,
+                        folder_hint="[CRG-FPJ]")   # folder_hint inútil a propósito
+    assert r["episode"] == 5
+    assert r["title"] == "Capitulo"   # comportamiento de siempre, sin cambios
+
+
+def test_detect_comic_chapter_keyword_no_useful_title_falls_back_to_folder_hint(monkeypatch, tmp_path):
+    _isolate_learned_terms(monkeypatch, tmp_path)
+    r = detect_episode("Capítulo 10.cbz", is_book=True, is_comic=True, folder_hint="Dungeon Reset")
+    assert r["episode"] == 10
+    assert r["title"] == "Dungeon Reset"

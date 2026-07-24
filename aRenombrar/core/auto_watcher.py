@@ -461,8 +461,12 @@ class AutoWatcher:
             is_book  = is_book_file(str(path))
             is_comic = is_comic_file(str(path)) if is_book else False
 
-            # 1. Detección local (patrones de nombre)
-            detected = detect_episode(path.name, is_book=is_book, is_comic=is_comic)
+            # 1. Detección local (patrones de nombre) -- folder_hint: apoyo
+            # para series/mangas cuyos capítulos vienen numerados a secas y
+            # el nombre real está puesto en la carpeta que los contiene (ver
+            # core/api_client.py::detect_episode).
+            detected = detect_episode(path.name, is_book=is_book, is_comic=is_comic,
+                                       folder_hint=path.parent.name)
             _log.debug("Detección local: %s", detected)
             if not detected.get("title"):
                 _log.warning("Sin patrón reconocible: %s", path.name)
