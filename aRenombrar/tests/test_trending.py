@@ -1,4 +1,5 @@
-from core.trending import trending_score, format_trending_score, DEFAULT_HALF_LIFE_DAYS
+from core.trending import (trending_score, format_trending_score, explain_trending_score,
+                            DEFAULT_HALF_LIFE_DAYS)
 
 DAY = 86400
 NOW = 1_800_000_000.0   # cualquier epoch fijo, solo para restar contra el
@@ -51,3 +52,28 @@ def test_format_trending_score_hides_zero():
 
 def test_format_trending_score_shows_one_decimal():
     assert format_trending_score(12.34) == "🔥 12.3"
+
+
+def test_explain_never_played():
+    text = explain_trending_score(0, None, NOW)
+    assert "Nunca vista" in text
+
+
+def test_explain_includes_score_play_count_and_half_life():
+    text = explain_trending_score(15, NOW - 8 * DAY, NOW)
+    assert "15 veces" in text
+    assert "hace 8 días" in text
+    assert "30 días" in text   # DEFAULT_HALF_LIFE_DAYS
+    score = trending_score(15, NOW - 8 * DAY, NOW)
+    assert f"{score:.1f}" in text
+
+
+def test_explain_singular_play_count():
+    text = explain_trending_score(1, NOW - 5 * DAY, NOW)
+    assert "1 vez" in text
+    assert "1 veces" not in text
+
+
+def test_explain_today_and_yesterday_wording():
+    assert "hoy" in explain_trending_score(2, NOW, NOW)
+    assert "ayer" in explain_trending_score(2, NOW - DAY, NOW)

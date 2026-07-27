@@ -13,12 +13,65 @@ pura, sin binario externo). .rar necesita un programa externo
 disponible en el sistema, la extracción falla de forma controlada (ver
 _extract_rar) y el archivo se deja intacto para que el usuario lo
 resuelva a mano.
+
+En Windows, rarfile solo busca "unrar"/"unar"/"7z"/"7zz"/"bsdtar" como
+comando SUELTO en el PATH -- WinRAR instala UnRAR.exe (misma sintaxis de
+línea de comandos que el unrar independiente) pero nunca lo añade al PATH,
+así que un usuario con WinRAR instalado de verdad seguía viendo "unrar no
+está instalado" (bug real, confirmado con un archivo .rar real: UnRAR.exe
+SÍ estaba en su carpeta de instalación de WinRAR, rarfile simplemente no
+lo encontraba). Ver _configure_windows_rar_fallback_tool, que busca en las
+rutas de instalación típicas antes de rendirse.
 """
 
+import os
 from pathlib import Path
+
+from core.appdirs import is_windows
 
 _TAR_COMPOUND_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz")
 _TAR_SINGLE_SUFFIXES = {".tar", ".tgz", ".tbz2", ".txz"}
+
+# (plantilla de ruta con variable de entorno, atributo de rarfile a fijar) --
+# UnRAR.exe/Rar.exe de WinRAR entienden la misma sintaxis que el unrar de
+# línea de comandos independiente (UNRAR_CONFIG), así que apuntar
+# rarfile.UNRAR_TOOL a su ruta completa basta, sin necesidad de una
+# configuración de herramienta distinta. 7-Zip (sevenzip) sabe LEER (no
+# crear) archivos .rar -- válido como último recurso si no hay WinRAR.
+_WINDOWS_RAR_TOOL_CANDIDATES = [
+    (r"%ProgramFiles%\WinRAR\UnRAR.exe", "UNRAR_TOOL"),
+    (r"%ProgramFiles(x86)%\WinRAR\UnRAR.exe", "UNRAR_TOOL"),
+    (r"%ProgramFiles%\WinRAR\Rar.exe", "UNRAR_TOOL"),
+    (r"%ProgramFiles(x86)%\WinRAR\Rar.exe", "UNRAR_TOOL"),
+    (r"%ProgramFiles%\7-Zip\7z.exe", "SEVENZIP_TOOL"),
+    (r"%ProgramFiles(x86)%\7-Zip\7z.exe", "SEVENZIP_TOOL"),
+]
+
+_rar_fallback_probed = False
+
+
+def _configure_windows_rar_fallback_tool(rarfile_module) -> bool:
+    """Se llama solo cuando rarfile ya falló al buscar un binario por PATH
+    (RarCannotExec) -- prueba las rutas de instalación típicas de Windows
+    para WinRAR/7-Zip y, si encuentra algo, deja rarfile_module configurado
+    para el resto de la sesión (no hace falta repetir la búsqueda en cada
+    archivo .rar). Devuelve True si encontró y configuró algo utilizable."""
+    global _rar_fallback_probed
+    if _rar_fallback_probed:
+        return rarfile_module.UNRAR_TOOL != "unrar" or rarfile_module.SEVENZIP_TOOL != "7z"
+    _rar_fallback_probed = True
+    if not is_windows():
+        return False
+    for template, attr in _WINDOWS_RAR_TOOL_CANDIDATES:
+        candidate = os.path.expandvars(template)
+        if os.path.isfile(candidate):
+            setattr(rarfile_module, attr, candidate)
+            try:
+                rarfile_module.tool_setup(force=True)
+                return True
+            except rarfile_module.RarCannotExec:
+                continue
+    return False
 
 
 def _is_safe_member(dest: Path, member_name: str) -> bool:
@@ -122,6 +175,12 @@ def _extract_rar(path: Path, dest: Path) -> tuple[bool, str]:
         try:
             rf.extractall(dest)
         except rarfile.RarCannotExec:
-            return False, ("unrar no está instalado en este sistema -- instálalo "
-                            "(o unar/bsdtar) para poder descomprimir archivos .rar")
+            # Antes de rendirse: en Windows, WinRAR/7-Zip pueden estar
+            # instalados de verdad pero no en el PATH (ver
+            # _configure_windows_rar_fallback_tool) -- reintentar una vez
+            # con lo que se encuentre ahí antes de reportar "no instalado".
+            if not _configure_windows_rar_fallback_tool(rarfile):
+                return False, ("unrar no está instalado en este sistema -- instálalo "
+                                "(o unar/bsdtar) para poder descomprimir archivos .rar")
+            rf.extractall(dest)
     return True, str(dest)

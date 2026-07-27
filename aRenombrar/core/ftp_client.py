@@ -302,6 +302,34 @@ class FTPClient:
         except ftplib.all_errors:
             return []
 
+    def get_folder_tree(self, path: str, max_depth: int = 6) -> "dict | None":
+        """{ruta_de_carpeta: [(nombre, tamaño), ...], ...} de TODO el árbol
+        bajo *path* -- LIST -R si el servidor lo soporta (ver
+        list_tree_recursive, mucho más rápido), si no recorre subcarpeta
+        por subcarpeta con list_dirs/list_files_with_sizes (mismo patrón
+        que get_folder_size, pero acumulando el árbol completo en vez de
+        solo el total). Para el desplegable "ver árbol de archivos" de una
+        serie en Episodios que faltan (ver
+        gui/app.py::_toggle_missing_ep_ftp_tree) -- a diferencia de
+        list_files_recursive (que descarta la carpeta y solo deja el
+        nombre de archivo suelto, pensado para detect_episode()), aquí
+        hace falta conservar la estructura de carpetas para poder
+        dibujarla con indentación. None si no hay conexión."""
+        if not self.is_connected():
+            return None
+        tree = self.list_tree_recursive(path)
+        if tree is not None:
+            return tree
+        return self._walk_folder_tree(path, max_depth)
+
+    def _walk_folder_tree(self, path: str, max_depth: int) -> dict:
+        if max_depth <= 0:
+            return {path: []}
+        result = {path: self.list_files_with_sizes(path)}
+        for sub in self.list_dirs(path):
+            result.update(self._walk_folder_tree(f"{path.rstrip('/')}/{sub}", max_depth - 1))
+        return result
+
     def get_folder_size(self, path: str, max_depth: int = 6) -> int:
         """Tamaño total en bytes de todos los archivos bajo *path*,
         recorriendo subcarpetas -- la herramienta de liberar espacio
@@ -804,6 +832,41 @@ def _parse_recursive_list_sections(lines: list) -> "dict | None":
     _flush()
 
     return sections if saw_header else None
+
+
+def format_ftp_tree(root: str, tree: dict) -> str:
+    """Texto indentado (para un CTkTextbox de solo lectura) del árbol que
+    devuelve FTPClient.get_folder_tree(root) -- para el desplegable "ver
+    árbol de archivos" de una serie en Episodios que faltan (ver
+    gui/app.py::_toggle_missing_ep_ftp_tree). *root* mismo NO se imprime
+    como carpeta (ya se ve en la ruta de arriba, ver _missing_ep_path_lbl)
+    -- sus subcarpetas arrancan sin indentar, y sus archivos sueltos (si
+    los hay) igual. Cada nivel de subcarpeta por debajo suma 2 espacios.
+    "" si el árbol no tiene ningún archivo."""
+    root = root.rstrip("/")
+
+    def _fmt_size(nbytes: int) -> str:
+        for unit, divisor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+            if nbytes >= divisor:
+                return f"{nbytes / divisor:.1f} {unit}"
+        return f"{nbytes} B"
+
+    def _depth(path: str) -> int:
+        rel = path.rstrip("/")
+        if rel == root:
+            return 0
+        return rel[len(root) + 1:].count("/") + 1
+
+    lines = []
+    for path in sorted(tree.keys(), key=lambda p: p.rstrip("/")):
+        rel = path.rstrip("/")
+        depth = _depth(path)
+        if rel != root:
+            name = rel.rsplit("/", 1)[-1]
+            lines.append("  " * (depth - 1) + f"📁 {name}/")
+        for name, size in sorted(tree[path]):
+            lines.append("  " * depth + f"📄 {name}  ({_fmt_size(size)})")
+    return "\n".join(lines)
 
 
 def sizes_by_top_level_folder(tree: dict, root: str) -> dict:

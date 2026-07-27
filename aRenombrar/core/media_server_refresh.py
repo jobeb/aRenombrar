@@ -25,6 +25,23 @@ from core.applog import get_logger
 _log = get_logger("aRenombrar.media_refresh", "media_refresh.log")
 
 
+class _ItemNotFoundSentinel:
+    """Marca que el servidor respondió SIN error pero sin ningún item para
+    ese id -- a diferencia de None (fallo de red/timeout/token inválido),
+    esto sí confirma que el id ya no existe en el servidor (la serie se
+    borró de la biblioteca). Ver get_jellyfin_series_item/
+    get_plex_series_item y App._rescan_single_series_worker, que trata
+    estos dos casos de forma distinta: un fallo de red deja la fila tal
+    cual (podría ser algo temporal), pero un "no encontrado" confirmado
+    quita la serie de la lista de huecos, igual que ya hace un reescaneo
+    completo (ver _scan_missing_episodes)."""
+    def __repr__(self):
+        return "ITEM_NOT_FOUND"
+
+
+ITEM_NOT_FOUND = _ItemNotFoundSentinel()
+
+
 def parse_media_date(value):
     """Convierte una fecha de Jellyfin (cadena ISO8601, "2024-03-01T00:00:00Z")
     o de Plex (entero unix) a epoch en segundos -- para poder comparar
@@ -213,7 +230,9 @@ def get_jellyfin_series_item(host: str, api_key: str, item_id: str, timeout: int
     seguía usando el tmdb_id viejo -- guardado en caché de la última vez
     que SÍ se pidió la biblioteca completa -- y "reescanear esta serie"
     comprobaba huecos contra la ficha de TMDB equivocada de todas formas.
-    Devuelve {"id", "name", "tmdb_id", "folder_name"} o None si falla."""
+    Devuelve {"id", "name", "tmdb_id", "folder_name"}, ITEM_NOT_FOUND si el
+    servidor respondió sin error pero ya no existe ese id (se borró la
+    serie), o None si falla la petición en sí (red/timeout/token)."""
     if not host or not api_key or not item_id:
         return None
     base = host.rstrip("/")
@@ -227,13 +246,15 @@ def get_jellyfin_series_item(host: str, api_key: str, item_id: str, timeout: int
             params={"Ids": item_id, "Fields": "ProviderIds,Path"},
             timeout=timeout,
         )
+        if resp.status_code == 404:
+            return ITEM_NOT_FOUND
         resp.raise_for_status()
         items = resp.json().get("Items", []) or []
     except Exception as e:
         _log.warning("Jellyfin: fallo al releer la serie %s: %s", item_id, e)
         return None
     if not items:
-        return None
+        return ITEM_NOT_FOUND
     item = items[0]
     tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
     try:
@@ -322,7 +343,9 @@ def get_plex_series_item(host: str, token: str, rating_key: str, timeout: int = 
     """Igual que get_jellyfin_series_item pero para Plex -- ver ese
     docstring para el motivo (releer el tmdb_id ACTUAL de una sola serie
     tras una re-identificación manual, sin pedir toda la biblioteca).
-    Devuelve {"rating_key", "name", "tmdb_id"} o None si falla."""
+    Devuelve {"rating_key", "name", "tmdb_id"}, ITEM_NOT_FOUND si el
+    servidor respondió sin error pero ya no existe ese id (se borró la
+    serie), o None si falla la petición en sí (red/timeout/token)."""
     if not host or not token or not rating_key:
         return None
     base = host.rstrip("/")
@@ -333,13 +356,18 @@ def get_plex_series_item(host: str, token: str, rating_key: str, timeout: int = 
             headers={"Accept": "application/json"},
             timeout=timeout,
         )
+        # A diferencia de /Items de Jellyfin (una búsqueda, que responde
+        # 200 con lista vacía), esto es una petición directa por id -- un
+        # ratingKey borrado de verdad da 404, no una lista vacía.
+        if resp.status_code == 404:
+            return ITEM_NOT_FOUND
         resp.raise_for_status()
         items = resp.json().get("MediaContainer", {}).get("Metadata", []) or []
     except Exception as e:
         _log.warning("Plex: fallo al releer la serie %s: %s", rating_key, e)
         return None
     if not items:
-        return None
+        return ITEM_NOT_FOUND
     item = items[0]
     tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
     return {"rating_key": item.get("ratingKey"), "name": item.get("title", ""), "tmdb_id": tmdb_id}

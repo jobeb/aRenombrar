@@ -184,3 +184,33 @@ def test_find_existing_category_folder_low_similarity_does_not_match():
         categories, "Loki", None, lambda root: ["Lucifer"])
     assert cat is None
     assert folder is None
+
+
+def test_find_existing_category_folder_known_year_disambiguates_a_remake():
+    # Caso real: "Ranma ½" (1989, Jellyfin) y "Ranma1/2" (2024, Plex) --
+    # las dos carpetas reales llevan el año entre parentesis para
+    # distinguir el remake del original, pero el titulo que da el
+    # servidor de medios no trae año -- ni el nombre exacto ni el ratio
+    # normal (< 0.90) encuentran la carpeta sin known_year.
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    listings = ["Ranma (1989)", "Ranma (2024)"]
+
+    cat, folder = find_existing_category_folder(
+        categories, "Ranma ½", None, lambda root: listings, known_year="1989")
+    assert cat["name"] == "Series"
+    assert folder == "Ranma (1989)"
+
+    cat, folder = find_existing_category_folder(
+        categories, "Ranma1/2", None, lambda root: listings, known_year="2024")
+    assert cat["name"] == "Series"
+    assert folder == "Ranma (2024)"
+
+
+def test_find_existing_category_folder_without_known_year_still_fails_on_this_case():
+    # Sin known_year, el comportamiento previo (fallo) no cambia -- el
+    # fallback solo se activa cuando SE PASA un año conocido de antemano.
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Ranma ½", None, lambda root: ["Ranma (1989)", "Ranma (2024)"])
+    assert cat is None
+    assert folder is None

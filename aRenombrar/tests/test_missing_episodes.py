@@ -5,7 +5,8 @@ from core.missing_episodes import (find_missing_episodes, format_missing_summary
                                     remap_absolute_episodes, remove_missing_episode, remove_series,
                                     _season_ranges,
                                     has_spanish_availability, episode_has_spanish_text,
-                                    filter_missing_by_spanish_dub, filter_missing_by_dub_cutoff)
+                                    filter_missing_by_spanish_dub, filter_missing_by_dub_cutoff,
+                                    apply_ignored_filter)
 
 
 def test_find_missing_episodes_finds_gaps():
@@ -320,3 +321,38 @@ def test_filter_missing_by_dub_cutoff_drops_season_if_all_past_cutoff():
 def test_filter_missing_by_dub_cutoff_empty_cutoff_keeps_everything():
     missing = {1: [1, 2, 3]}
     assert filter_missing_by_dub_cutoff(missing, {}) == missing
+
+
+def test_apply_ignored_filter_removes_ignored_episode():
+    missing = {1: [1, 2, 3]}
+    assert apply_ignored_filter(missing, [], {1: [2]}) == {1: [1, 3]}
+
+
+def test_apply_ignored_filter_removes_whole_ignored_season():
+    missing = {1: [1, 2], 2: [1]}
+    assert apply_ignored_filter(missing, [1], {}) == {2: [1]}
+
+
+def test_apply_ignored_filter_drops_season_if_all_episodes_ignored():
+    missing = {1: [1, 2]}
+    assert apply_ignored_filter(missing, [], {1: [1, 2]}) == {}
+
+
+def test_apply_ignored_filter_ignored_season_wins_over_ignored_episode_of_same_season():
+    # Una temporada ignorada entera no deja "huérfano" un episodio suelto
+    # ignorado de esa misma temporada -- simplemente ya no aparece, sin
+    # necesidad de que ambos coincidan.
+    missing = {1: [1, 2, 3]}
+    assert apply_ignored_filter(missing, [1], {1: [1]}) == {}
+
+
+def test_apply_ignored_filter_no_ignored_anything_keeps_everything():
+    missing = {1: [1, 2, 3]}
+    assert apply_ignored_filter(missing, None, None) == missing
+
+
+def test_apply_ignored_filter_does_not_mutate_input():
+    missing = {1: [1, 2, 3]}
+    original = {1: [1, 2, 3]}
+    apply_ignored_filter(missing, [], {1: [2]})
+    assert missing == original

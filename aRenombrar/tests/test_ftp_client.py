@@ -2,7 +2,7 @@ import ftplib
 
 from core.ftp_client import (
     FTPClient, _ftp_safe, _parse_unix_list_dirs, _parse_unix_list_files,
-    sizes_by_top_level_folder, files_by_top_level_folder,
+    sizes_by_top_level_folder, files_by_top_level_folder, format_ftp_tree,
 )
 
 
@@ -453,6 +453,83 @@ def test_get_folder_size_respects_max_depth():
 def test_get_folder_size_returns_zero_when_not_connected():
     client = FTPClient()
     assert client.get_folder_size("/series/Serie") == 0
+
+
+# ── get_folder_tree / format_ftp_tree (árbol de archivos, Episodios que faltan) ──
+
+class _FakeFtpTreeWithSizesNoDashR(_FakeFtpTreeWithSizes):
+    """Como _FakeFtpTreeWithSizes, pero rechaza "LIST -R" (servidor sin
+    soporte) -- para forzar la caída de get_folder_tree() a la
+    reconstrucción manual carpeta por carpeta (_walk_folder_tree)."""
+    def sendcmd(self, cmd):
+        return "200 OK"
+
+    def transfercmd(self, cmd):
+        raise ftplib.error_perm("500 LIST -R no soportado")
+
+
+def test_get_folder_tree_uses_list_tree_recursive_when_supported():
+    raw = (
+        "/datos2/series/Serie A:\r\n"
+        "-rw-r--r-- 1 user user 1000 Jan 01 00:00 ep1.mkv\r\n"
+        "drwxr-xr-x 2 user user 4096 Jan 01 00:00 Extras\r\n"
+        "\r\n"
+        "/datos2/series/Serie A/Extras:\r\n"
+        "-rw-r--r-- 1 user user 500 Jan 01 00:00 trailer.mkv\r\n"
+    ).encode("utf-8")
+    client = FTPClient()
+    client.ftp = _FakeFtpMixedEncoding(raw)
+    tree = client.get_folder_tree("/datos2/series/Serie A")
+    assert tree == {
+        "/datos2/series/Serie A": [("ep1.mkv", 1000)],
+        "/datos2/series/Serie A/Extras": [("trailer.mkv", 500)],
+    }
+
+
+def test_get_folder_tree_falls_back_to_manual_walk_without_dash_r():
+    client = FTPClient()
+    client.ftp = _FakeFtpTreeWithSizesNoDashR({
+        "/series/Serie": (["Temporada 01"], {}),
+        "/series/Serie/Temporada 01": ([], {"Serie 1x01.mkv": 1000, "Serie 1x02.mkv": 2000}),
+    })
+    tree = client.get_folder_tree("/series/Serie")
+    assert tree == {
+        "/series/Serie": [],
+        "/series/Serie/Temporada 01": [("Serie 1x01.mkv", 1000), ("Serie 1x02.mkv", 2000)],
+    }
+
+
+def test_get_folder_tree_returns_none_when_not_connected():
+    client = FTPClient()
+    assert client.get_folder_tree("/series/Serie") is None
+
+
+def test_format_ftp_tree_indents_subfolders_and_shows_sizes():
+    tree = {
+        "/series/Serie": [],
+        "/series/Serie/Temporada 01": [("Serie 1x01.mkv", 1024 * 1024 * 200)],
+        "/series/Serie/Temporada 01/Extras": [("opening.mkv", 1024 * 100)],
+    }
+    text = format_ftp_tree("/series/Serie", tree)
+    lines = text.split("\n")
+    assert lines == [
+        "📁 Temporada 01/",
+        "  📄 Serie 1x01.mkv  (200.0 MB)",
+        "  📁 Extras/",
+        "    📄 opening.mkv  (100.0 KB)",
+    ]
+
+
+def test_format_ftp_tree_shows_loose_files_directly_at_root_unindented():
+    tree = {
+        "/series/Serie": [("suelto.mkv", 100)],
+    }
+    text = format_ftp_tree("/series/Serie", tree)
+    assert text == "📄 suelto.mkv  (100 B)"
+
+
+def test_format_ftp_tree_empty_tree_is_empty_string():
+    assert format_ftp_tree("/series/Serie", {}) == ""
 
 
 def test_list_files_with_sizes_falls_back_to_list_parsing():

@@ -164,7 +164,8 @@ class TMDBClient:
             air_date = e.get("air_date")
             if not air_date or air_date > today:
                 continue
-            episodes.append({"episode_number": e.get("episode_number"), "name": e.get("name", "")})
+            episodes.append({"episode_number": e.get("episode_number"), "name": e.get("name", ""),
+                              "air_date": air_date})
         return episodes
 
     def get_tv_details(self, tv_id: int) -> dict:

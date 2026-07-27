@@ -221,8 +221,8 @@ def test_get_season_episodes_returns_episode_numbers_and_names(monkeypatch):
     monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
     episodes = client.get_season_episodes(1396, 1)
     assert episodes == [
-        {"episode_number": 1, "name": "Piloto"},
-        {"episode_number": 2, "name": "Segundo episodio"},
+        {"episode_number": 1, "name": "Piloto", "air_date": "2020-01-01"},
+        {"episode_number": 2, "name": "Segundo episodio", "air_date": "2020-01-08"},
     ]
 
 
@@ -238,7 +238,7 @@ def test_get_season_episodes_excludes_unaired_episodes(monkeypatch):
     ]}
     monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
     episodes = client.get_season_episodes(1396, 1)
-    assert episodes == [{"episode_number": 1, "name": "Ya emitido"}]
+    assert episodes == [{"episode_number": 1, "name": "Ya emitido", "air_date": "2020-01-01"}]
 
 
 # ── Límite de peticiones a TMDB (~40/10s por IP) ────────────────────────

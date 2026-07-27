@@ -215,6 +215,29 @@ def filter_missing_by_dub_cutoff(missing: dict, dub_cutoff: dict) -> dict:
     return result
 
 
+def apply_ignored_filter(missing: dict, ignored_seasons, ignored_episodes: dict) -> dict:
+    """Recorta *missing* ({temporada: [episodios]}) quitando las temporadas
+    de *ignored_seasons* enteras y los episodios sueltos de
+    *ignored_episodes* ({temporada: [episodios]}) -- mismo mecanismo que
+    filter_missing_by_spanish_dub/filter_missing_by_dub_cutoff (recorta, no
+    borra nada persistido), para "Ignorar capítulo"/"Ignorar temporada" en
+    Episodios que faltan (gui/app.py::_toggle_missing_ep_episode_ignore/
+    _toggle_missing_ep_season_ignore). Una temporada ignorada entera tiene
+    prioridad sobre episodios sueltos ignorados de esa misma temporada
+    (quedarían huérfanos igual, la temporada ya no aparece)."""
+    ignored_seasons = set(ignored_seasons or ())
+    ignored_episodes = ignored_episodes or {}
+    result = {}
+    for season, episodes in missing.items():
+        if season in ignored_seasons:
+            continue
+        ignored_eps = set(ignored_episodes.get(season, ()))
+        kept = [ep for ep in episodes if ep not in ignored_eps]
+        if kept:
+            result[season] = kept
+    return result
+
+
 def remove_series(results: list, tmdb_id: int) -> bool:
     """Quita la fila ENTERA de *results* cuyo tmdb_id coincida -- usado
     cuando la serie completa se borra del servidor (botón de borrar en

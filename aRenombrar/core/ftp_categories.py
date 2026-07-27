@@ -10,7 +10,7 @@ import uuid
 from typing import Callable, Optional
 
 from core.ftp_client import _ftp_safe
-from core.series_match import best_match
+from core.series_match import best_match, best_match_with_year
 
 
 def new_category_id() -> str:
@@ -36,7 +36,8 @@ def choose_category(genre_ids, categories: list) -> Optional[dict]:
 
 def find_existing_category_folder(categories: list, desired_title: str,
                                     known_folder_name: Optional[str],
-                                    dir_lookup: Callable[[str], Optional[list]]) -> tuple:
+                                    dir_lookup: Callable[[str], Optional[list]],
+                                    known_year: Optional[str] = None) -> tuple:
     """Busca en *categories* (ya filtradas por tipo de media) si ya existe
     una carpeta con nombre igual o prácticamente idéntico a *desired_title*
     -- para que la organización real del servidor prevalezca sobre la
@@ -63,7 +64,16 @@ def find_existing_category_folder(categories: list, desired_title: str,
     contenido en el otro, o solo difiere en mayúsculas/capitalización --
     no es un parecido vago). Devuelve (categoría, nombre_de_carpeta_
     existente), o (None, None) si no hay ninguna coincidencia de esa
-    confianza en ninguna categoría."""
+    confianza en ninguna categoría.
+
+    known_year (opcional, p.ej. first_air_date de TMDB) es el año de
+    estreno real de *desired_title* cuando el propio texto no lo trae
+    (típico de un título tal cual lo da un servidor de medios) -- caso
+    real: "Ranma ½" (sin año) frente a dos carpetas reales "Ranma (1989)"
+    y "Ranma (2024)" (remake con el mismo nombre base), donde el ratio
+    normal se queda justo por debajo de 0.90 al no encontrar ninguna con
+    exact/0.90 de parecido directo. Se usa solo como último recurso, tras
+    fallar las comprobaciones de arriba (ver best_match_with_year)."""
     sanitized_desired = _ftp_safe(desired_title)
     for cat in categories:
         root = cat.get("root", "")
@@ -82,6 +92,10 @@ def find_existing_category_folder(categories: list, desired_title: str,
         candidate, ratio = best_match(desired_title, existing, min_ratio=0.55)
         if ratio >= 0.90:
             return cat, candidate
+        if known_year:
+            candidate, ratio = best_match_with_year(desired_title, existing, known_year)
+            if candidate:
+                return cat, candidate
     return None, None
 
 

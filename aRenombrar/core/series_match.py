@@ -84,6 +84,41 @@ def best_match(desired: str, candidates, min_ratio: float = 0.55):
     return None, 0.0
 
 
+def best_match_with_year(desired: str, candidates, known_year, min_ratio: float = 0.90):
+    """Como best_match, pero para cuando *desired* no trae año en el
+    propio texto (típico: el título tal cual lo da un servidor de medios,
+    p.ej. "Ranma ½") y *known_year* es su año de estreno real ya conocido
+    de antemano (p.ej. first_air_date de TMDB) -- caso real que motivó
+    esto: dos carpetas reales "Ranma (1989)" y "Ranma (2024)" (remake con
+    el mismo nombre base) junto al título sin año de cada una. Meter el
+    año a mano en *desired* ("Ranma ½ (1989)") NO basta -- se probó y el
+    ratio de series_similarity se queda en ~0.83, por debajo del 0.90,
+    porque el resto del nombre ya no es una substring literal del
+    candidato una vez el año se cuela en medio del texto (ver "1 2" de la
+    fracción "½"). En vez de eso, aquí se comparan *desired* y cada
+    candidato con su PROPIO año ya quitado -- así el año sirve solo para
+    CONFIRMAR qué candidato es (year debe coincidir con known_year) sin
+    diluir el parecido de texto ni arriesgarse a confundir el remake con
+    el original. Devuelve (None, 0.0) si no hay known_year o ningún
+    candidato con ese año llega a min_ratio tras quitárselo."""
+    if not known_year:
+        return None, 0.0
+    known_year = str(known_year)
+    best_name, best_ratio = None, 0.0
+    for c in candidates:
+        nc = normalize_series_name(c)
+        m = _YEAR_RE.search(nc)
+        if not m or m.group() != known_year:
+            continue
+        stripped = _YEAR_RE.sub("", nc, count=1).strip()
+        ratio = series_similarity(desired, stripped)
+        if ratio > best_ratio:
+            best_name, best_ratio = c, ratio
+    if best_ratio >= min_ratio:
+        return best_name, best_ratio
+    return None, 0.0
+
+
 def match_names_exclusively(candidates: list, targets: list, min_ratio: float = 0.55,
                             strict: bool = True) -> dict:
     """Empareja cada nombre de *candidates* con como mucho un nombre de

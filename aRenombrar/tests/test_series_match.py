@@ -2,6 +2,7 @@ from core.series_match import (
     normalize_series_name,
     series_similarity,
     best_match,
+    best_match_with_year,
     match_names_exclusively,
 )
 
@@ -137,3 +138,38 @@ def test_match_names_exclusively_more_candidates_than_targets():
     result = match_names_exclusively(candidates, targets, min_ratio=0.55)
     assert len(result) == 1
     assert result.get("Serie X") == "Serie X"
+
+
+# ── best_match_with_year (caso real: Ranma ½ 1989 vs remake 2024) ──────────
+
+def test_best_match_with_year_finds_folder_whose_own_year_matches_known_year():
+    # "Ranma ½" no trae año -- embebido a mano en el propio texto el ratio
+    # normal (series_similarity) se queda en ~0.83, por debajo de 0.90 (ver
+    # docstring de best_match_with_year); comparando el candidato SIN su
+    # año sí llega.
+    candidates = ["Ranma (1989)", "Ranma (2024)"]
+    name, ratio = best_match_with_year("Ranma ½", candidates, known_year="1989")
+    assert name == "Ranma (1989)"
+    assert ratio >= 0.90
+
+
+def test_best_match_with_year_never_confuses_the_remake():
+    candidates = ["Ranma (1989)", "Ranma (2024)"]
+    name, ratio = best_match_with_year("Ranma1/2", candidates, known_year="2024")
+    assert name == "Ranma (2024)"
+    assert ratio >= 0.90
+
+
+def test_best_match_with_year_ignores_candidates_with_a_different_year():
+    # Ninguna carpeta lleva el año conocido -- no hay con qué comparar.
+    candidates = ["Ranma (2024)"]
+    name, ratio = best_match_with_year("Ranma ½", candidates, known_year="1989")
+    assert name is None
+    assert ratio == 0.0
+
+
+def test_best_match_with_year_without_known_year_returns_nothing():
+    candidates = ["Ranma (1989)", "Ranma (2024)"]
+    name, ratio = best_match_with_year("Ranma ½", candidates, known_year=None)
+    assert name is None
+    assert ratio == 0.0

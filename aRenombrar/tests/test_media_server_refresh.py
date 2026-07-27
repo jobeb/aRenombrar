@@ -936,3 +936,72 @@ def test_verify_jellyfin_password_false_on_network_failure(monkeypatch):
         raise ConnectionError("sin red")
     monkeypatch.setattr(msr.requests, "post", _raise)
     assert msr.verify_jellyfin_password("http://jf:8096", "Jose", "correcta") is False
+
+
+# ── get_jellyfin_series_item / get_plex_series_item (reescaneo individual) ──
+# Caso real: al reescanear UNA serie que ya se borró del todo del servidor
+# de medios, hay que distinguir "no encontrada de verdad" (ITEM_NOT_FOUND)
+# de "fallo de red" (None) -- solo la primera debe hacer que se quite de la
+# lista de huecos.
+
+def test_get_jellyfin_series_item_returns_data_when_found(monkeypatch):
+    payload = {"Items": [{"Id": "abc123", "Name": "El consultor",
+                          "ProviderIds": {"Tmdb": "12345"}, "Path": "/datos2/series/El consultor"}]}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    item = msr.get_jellyfin_series_item("http://jf:8096", "key", "abc123")
+    assert item == {"id": "abc123", "name": "El consultor", "tmdb_id": 12345, "folder_name": "El consultor"}
+
+
+def test_get_jellyfin_series_item_returns_not_found_on_empty_items(monkeypatch):
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse({"Items": []}))
+    assert msr.get_jellyfin_series_item("http://jf:8096", "key", "abc123") is msr.ITEM_NOT_FOUND
+
+
+def test_get_jellyfin_series_item_returns_not_found_on_404(monkeypatch):
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(status=404))
+    assert msr.get_jellyfin_series_item("http://jf:8096", "key", "abc123") is msr.ITEM_NOT_FOUND
+
+
+def test_get_jellyfin_series_item_returns_none_on_network_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "get", _raise)
+    assert msr.get_jellyfin_series_item("http://jf:8096", "key", "abc123") is None
+
+
+def test_get_jellyfin_series_item_without_config_returns_none():
+    assert msr.get_jellyfin_series_item("", "", "abc123") is None
+
+
+def test_get_plex_series_item_returns_data_when_found(monkeypatch):
+    payload = {"MediaContainer": {"Metadata": [
+        {"ratingKey": "999", "title": "El consultor",
+         "Guid": [{"id": "tmdb://12345"}]},
+    ]}}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    item = msr.get_plex_series_item("http://plex:32400", "tok", "999")
+    assert item == {"rating_key": "999", "name": "El consultor", "tmdb_id": 12345}
+
+
+def test_get_plex_series_item_returns_not_found_on_404(monkeypatch):
+    # Caso real: un ratingKey borrado responde 404 directamente (a
+    # diferencia de la búsqueda de Jellyfin, que responde 200 con lista
+    # vacía) -- ver el comentario en get_plex_series_item.
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(status=404))
+    assert msr.get_plex_series_item("http://plex:32400", "tok", "999") is msr.ITEM_NOT_FOUND
+
+
+def test_get_plex_series_item_returns_not_found_on_empty_metadata(monkeypatch):
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse({"MediaContainer": {}}))
+    assert msr.get_plex_series_item("http://plex:32400", "tok", "999") is msr.ITEM_NOT_FOUND
+
+
+def test_get_plex_series_item_returns_none_on_network_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "get", _raise)
+    assert msr.get_plex_series_item("http://plex:32400", "tok", "999") is None
+
+
+def test_get_plex_series_item_without_config_returns_none():
+    assert msr.get_plex_series_item("", "", "999") is None

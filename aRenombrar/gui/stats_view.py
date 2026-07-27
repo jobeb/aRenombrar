@@ -189,7 +189,7 @@ class StatsView:
             w.destroy()
 
         by_disk = bytes_by_disk(self.app._shared_category_stats,
-                                 self.app.config_data.get("ftp_categories", {"tv": [], "movie": []}))
+                                 self.app.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}))
         free_by_disk = self.app._shared_free_space_by_disk
 
         disks = sorted(set(by_disk) | set(free_by_disk))

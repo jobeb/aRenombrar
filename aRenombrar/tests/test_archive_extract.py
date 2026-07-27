@@ -4,7 +4,18 @@ from pathlib import Path
 
 import pytest
 
-from core.archive_extract import extract_archive
+import core.archive_extract as archive_extract_mod
+from core.archive_extract import extract_archive, _configure_windows_rar_fallback_tool
+
+
+@pytest.fixture(autouse=True)
+def _reset_rar_fallback_probe():
+    """_configure_windows_rar_fallback_tool solo busca en el sistema la
+    primera vez (ver _rar_fallback_probed) -- aislar cada test entre sí,
+    o el orden de ejecución cambiaría el resultado."""
+    archive_extract_mod._rar_fallback_probed = False
+    yield
+    archive_extract_mod._rar_fallback_probed = False
 
 
 def test_extract_zip_success(tmp_path):
@@ -93,6 +104,11 @@ def test_extract_7z_rejects_zip_slip(tmp_path, monkeypatch):
 
 
 def test_extract_rar_without_unrar_installed(tmp_path, monkeypatch):
+    # is_windows=False: sin esto, en una máquina Windows de verdad
+    # _configure_windows_rar_fallback_tool intentaría tocar atributos
+    # (UNRAR_TOOL, tool_setup...) que este rarfile de mentira no tiene.
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: False)
+
     class _FakeRarFile:
         def __init__(self, *a, **kw):
             pass
@@ -120,6 +136,131 @@ def test_extract_rar_without_unrar_installed(tmp_path, monkeypatch):
     ok, msg = extract_archive(archive)
     assert ok is False
     assert "unrar" in msg.lower()
+
+
+def test_extract_rar_falls_back_to_winrar_path_on_windows(tmp_path, monkeypatch):
+    """Bug real: un usuario con WinRAR instalado (UnRAR.exe presente de
+    verdad en C:\\Program Files\\WinRAR\\) seguía viendo "unrar no está
+    instalado", porque rarfile solo busca el comando suelto "unrar" en el
+    PATH -- WinRAR nunca se añade solo al PATH. Confirmado contra un
+    archivo .rar real del usuario: rarfile.testrar() fallaba con
+    RarCannotExec hasta fijar rarfile.UNRAR_TOOL a la ruta completa."""
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: True)
+
+    winrar_path = r"C:\Program Files\WinRAR\UnRAR.exe"
+    monkeypatch.setattr("os.path.isfile", lambda p: p == winrar_path)
+
+    calls = {"extractall": 0}
+
+    class _FakeRarFile:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def namelist(self):
+            return ["Comic 01.cbz"]
+
+        def extractall(self, dest):
+            calls["extractall"] += 1
+            if calls["extractall"] == 1:
+                # Primer intento (sin configurar): falla, como en la
+                # máquina real del usuario antes del arreglo.
+                raise fake_rarfile.RarCannotExec("no tool found")
+            # Segundo intento, ya con UNRAR_TOOL apuntando a WinRAR: éxito.
+            (Path(dest) / "Comic 01.cbz").write_bytes(b"contenido")
+
+    class _RarCannotExec(Exception):
+        pass
+
+    tool_setup_calls = []
+
+    def _fake_tool_setup(force=False):
+        tool_setup_calls.append(fake_rarfile.UNRAR_TOOL)
+        if fake_rarfile.UNRAR_TOOL == winrar_path:
+            return object()
+        raise _RarCannotExec("still not found")
+
+    fake_rarfile = type("fake_rarfile", (), {
+        "RarFile": _FakeRarFile, "RarCannotExec": _RarCannotExec,
+        "UNRAR_TOOL": "unrar", "SEVENZIP_TOOL": "7z",
+        "tool_setup": staticmethod(_fake_tool_setup),
+    })
+    monkeypatch.setitem(__import__("sys").modules, "rarfile", fake_rarfile)
+
+    archive = tmp_path / "Comic.rar"
+    archive.write_bytes(b"x")
+    ok, dest = extract_archive(archive)
+
+    assert ok is True, "debería haber encontrado UnRAR.exe de WinRAR y reintentado con éxito"
+    assert (Path(dest) / "Comic 01.cbz").read_bytes() == b"contenido"
+    assert fake_rarfile.UNRAR_TOOL == winrar_path
+    assert calls["extractall"] == 2, "debe reintentar extractall() tras configurar el tool"
+
+
+def test_extract_rar_still_fails_when_no_tool_found_anywhere_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: True)
+    monkeypatch.setattr("os.path.isfile", lambda p: False)   # nada instalado en ninguna ruta típica
+
+    class _FakeRarFile:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def namelist(self):
+            return ["Comic 01.cbz"]
+
+        def extractall(self, dest):
+            raise fake_rarfile.RarCannotExec("no tool found")
+
+    class _RarCannotExec(Exception):
+        pass
+
+    fake_rarfile = type("fake_rarfile", (), {
+        "RarFile": _FakeRarFile, "RarCannotExec": _RarCannotExec,
+        "UNRAR_TOOL": "unrar", "SEVENZIP_TOOL": "7z",
+    })
+    monkeypatch.setitem(__import__("sys").modules, "rarfile", fake_rarfile)
+
+    archive = tmp_path / "Comic.rar"
+    archive.write_bytes(b"x")
+    ok, msg = extract_archive(archive)
+    assert ok is False
+    assert "unrar" in msg.lower()
+
+
+def test_configure_windows_rar_fallback_tool_returns_false_off_windows(monkeypatch):
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: False)
+    fake_rarfile = type("fake_rarfile", (), {})
+    assert _configure_windows_rar_fallback_tool(fake_rarfile) is False
+
+
+def test_configure_windows_rar_fallback_tool_probes_only_once(monkeypatch):
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: True)
+    probe_count = {"n": 0}
+
+    def fake_isfile(p):
+        probe_count["n"] += 1
+        return False
+
+    monkeypatch.setattr("os.path.isfile", fake_isfile)
+    fake_rarfile = type("fake_rarfile", (), {"UNRAR_TOOL": "unrar", "SEVENZIP_TOOL": "7z"})
+
+    _configure_windows_rar_fallback_tool(fake_rarfile)
+    n_after_first = probe_count["n"]
+    assert n_after_first > 0
+
+    _configure_windows_rar_fallback_tool(fake_rarfile)
+    assert probe_count["n"] == n_after_first, "la segunda llamada no debería volver a tocar el disco"
 
 
 def test_extract_rar_success(tmp_path, monkeypatch):

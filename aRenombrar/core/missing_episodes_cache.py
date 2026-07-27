@@ -7,8 +7,16 @@ comprobar qué ha cambiado de verdad, en vez de repetir todo el trabajo cada
 vez.
 
 Formato: {tmdb_id_como_texto: {"name", "source", "server_id",
-"last_episode_id", "expected", "missing", "ignored", "ai_verdict"},
+"last_episode_id", "expected", "missing", "ignored", "ai_verdict",
+"first_air_date", "season_air_dates", "episode_air_dates"},
 "_meta": {"last_scan_ts": float, "scanned_by": str}}
+
+"first_air_date"/"season_air_dates"/"episode_air_dates" (fechas de estreno
+de la serie/temporada/episodio, formato ISO "AAAA-MM-DD" tal cual las da
+TMDB) ya venían de fábrica en las mismas respuestas de TMDB que este
+escaneo ya pedía (get_tv_details/get_season_episodes) -- antes se
+descartaban sin usar. "season_air_dates"/"episode_air_dates" siguen el
+mismo patrón anidado que "episode_titles" (claves de texto por ser JSON).
 
 "ai_verdict" ({"veredicto", "motivo", "doblaje_castellano"?}, ver
 core/missing_episodes_ai.py) se guarda aparte, en gui/app.py::

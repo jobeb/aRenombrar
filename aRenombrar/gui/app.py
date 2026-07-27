@@ -53,7 +53,8 @@ from gui.table_view import TableView, ColumnSpec
 from core.appdirs import app_data_dir, is_windows, is_macos, is_linux
 from core.applog import get_logger
 from core.version import __version__
-from core.trending import trending_score, format_trending_score
+from core.trending import trending_score, format_trending_score, explain_trending_score
+from gui.tooltip import attach_tooltip
 
 _log = get_logger("aRenombrar.gui", "app.log")
 
@@ -109,6 +110,20 @@ def _fmt_size(nbytes):
         if nbytes >= divisor:
             return f"{nbytes / divisor:.1f} {unit}"
     return f"{nbytes} B"
+
+
+def _fmt_air_date(iso_date) -> str:
+    """"2024-03-15" (formato de TMDB) -> "15/03/2024" (mismo formato
+    DD/MM/AAAA que ya usa el resto de la app para fechas, ver el historial
+    de subidas/borrados) -- "" si no hay fecha o no tiene el formato
+    esperado, para no reventar mostrando basura."""
+    if not iso_date:
+        return ""
+    import datetime
+    try:
+        return datetime.datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except (ValueError, TypeError):
+        return ""
 
 
 class _OverwriteDialog(ctk.CTkToplevel):
@@ -846,6 +861,11 @@ class App(_AppBase):
         self._watcher: AutoWatcher = None
         self._tray        = None
         self._tray_running = False
+        # Notificaciones de "Subida completada" agrupadas -- ver
+        # _queue_upload_notification/_flush_upload_notifications.
+        self._pending_upload_notifications: list = []
+        self._upload_notification_after_id = None
+        self._status_bar_debounce_id = None   # ver _ftp_row_live
         self._upload_history: list = []   # historial de subidas en memoria
         self._history_lock = threading.Lock()   # evita carreras al escribir upload_history.json
         # Cupo de subidas simultáneas COMPARTIDO entre la cola manual y el modo
@@ -1017,8 +1037,24 @@ class App(_AppBase):
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(2, weight=0)
 
+        # Cabecera responsiva -- ver _update_header_responsive_layout. El
+        # ancho natural de la cabecera (con las 8 pestañas de navegación)
+        # supera el ancho mínimo configurado de la ventana (self.minsize)
+        # -- por debajo de ese umbral, la navegación se colapsa en un
+        # único botón "☰" (ver _header_needed_width, recalculado en cada
+        # redimensionado, no cacheado de una sola medición al arrancar).
+        self._header_compact_mode = None
+        self._root_resize_after_id = None
+        self._nav_overflow_popup = None   # ver _show_nav_overflow_menu
         self._build_header()
         self._startup_mark("  _build_header()")
+        # Primer chequeo tras construir la cabecera -- después de esto,
+        # cada <Configure> de la ventana (_on_root_resize) ya lo mantiene
+        # al día solo. after(0, ...): winfo_reqwidth() necesita que Tk
+        # haya calculado el layout al menos un ciclo antes de poder leerlo
+        # (ver _header_needed_width, que además ya fuerza su propio
+        # update_idletasks() por si acaso).
+        self.after(0, self._update_header_responsive_layout)
 
         self._main_frame = ctk.CTkFrame(self, fg_color="transparent")
         self._main_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(CONTAINER_GAP, CONTAINER_GAP))
@@ -1209,10 +1245,11 @@ class App(_AppBase):
         header = ctk.CTkFrame(self, height=56, corner_radius=0)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_columnconfigure(2, weight=1)
-        ctk.CTkLabel(header, text="  aRenombrar",
-                     font=ctk.CTkFont(size=20, weight="bold")).grid(
-            row=0, column=0, padx=(20, 12), pady=10)
+        self._header = header
 
+        # Sin etiqueta "aRenombrar" aquí -- el título ya se ve en la barra
+        # de la ventana (self.title(), ver __init__) y duplicarlo en la
+        # cabecera solo quitaba espacio a la navegación sin aportar nada.
         # Navegación: las 4 vistas como pestañas conectadas (una activa a
         # la vez), en vez de botones de alternancia sueltos -- Archivos
         # tiene su propia pestaña ahora, igual que las demás.
@@ -1220,11 +1257,21 @@ class App(_AppBase):
             header, values=list(self._NAV_LABELS.values()), height=30, border_width=1,
             command=self._on_nav_segment_changed)
         self._nav_segmented.set(self._NAV_LABELS["files"])
-        self._nav_segmented.grid(row=0, column=1, padx=(0, 16))
+        self._nav_segmented.grid(row=0, column=1, padx=(20, 16))
 
-        self._status_lbl = ctk.CTkLabel(header, text="", text_color=ACCENT,
-                                         font=ctk.CTkFont(size=13), anchor="w")
-        self._status_lbl.grid(row=0, column=2, padx=10, sticky="w")
+        # Botón "☰" -- colapsa la navegación (Archivos/Episodios/Liberar
+        # espacio/.../Configuración -- 8 pestañas) en un único menú cuando
+        # la ventana no tiene ancho de sobra (ver
+        # _update_header_responsive_layout/_show_nav_overflow_menu). Mismo
+        # hueco (columna 1) que ocupa _nav_segmented -- nunca conviven
+        # visibles a la vez.
+        self._nav_menu_btn = ctk.CTkButton(
+            header, text="☰", height=30, width=40, font=ctk.CTkFont(size=15),
+            fg_color="transparent", border_width=1,
+            command=self._show_nav_overflow_menu)
+        self._nav_menu_btn.grid(row=0, column=1, padx=(20, 16))
+        self._nav_menu_btn.grid_remove()   # oculto salvo en modo compacto
+
         self._ftp_space_lbl = ctk.CTkLabel(
             header, text="", font=ctk.CTkFont(size=12),
             text_color=PENDING_COLOR)
@@ -1252,6 +1299,183 @@ class App(_AppBase):
             command=self._minimize_to_tray)
         self._tray_btn.grid(row=0, column=7, padx=(0, 16))
 
+        self.bind("<Configure>", self._on_root_resize, add="+")
+
+    def _header_needed_width(self) -> int:
+        """Ancho necesario AHORA MISMO para mostrar toda la cabecera con
+        _nav_segmented visible (en vez de su versión colapsada "☰") --
+        recalculado en directo en cada redimensionado, NO cacheado de una
+        sola medición al arrancar.
+
+        Bug real de la primera versión de esto: se medía self._header.
+        winfo_reqwidth() una sola vez al arrancar y se guardaba como
+        umbral fijo para toda la sesión -- pero en ese momento
+        _ftp_space_lbl todavía estaba vacía ("" -- el espacio libre del
+        FTP tarda un poco en llegar tras abrir la app), así que el umbral
+        medido salía DE MENOS de lo que la cabecera necesita de verdad en
+        cuanto esa etiqueta tiene texto real. Resultado: con la ventana en
+        un ancho intermedio, el umbral (de menos) decía "todavía cabe
+        todo" y no colapsaba la navegación, pero "Auto"/"⊟" sí quedaban
+        recortados por el borde de la ventana, que es justo lo que se
+        veía. Sumar cada ancho por separado y leerlos en el momento evita
+        depender de una foto fija tomada demasiado pronto.
+
+        _nav_segmented.winfo_reqwidth() se lee siempre (esté colapsado o
+        no ahora mismo) -- un widget oculto con grid_remove() sigue
+        reportando su tamaño natural, no hace falta mostrarlo para medirlo.
+
+        "Guardar configuración" SÍ se cuenta solo si está visible ahora
+        mismo (winfo_ismapped(), fuera de Ajustes no ocupa sitio de verdad)
+        -- reservar sus ~178px SIEMPRE (estuviera o no visible) fue
+        demasiado conservador y colapsaba la navegación antes de que
+        hiciera falta de verdad la inmensa mayoría del tiempo (fuera de
+        Ajustes)."""
+        self._header.update_idletasks()
+        save_w = self._save_settings_btn.winfo_reqwidth() + 8 if self._save_settings_btn.winfo_ismapped() else 0
+        return (
+            20 + self._nav_segmented.winfo_reqwidth() + 16       # padx del nav
+            + 10 + self._ftp_space_lbl.winfo_reqwidth()           # padx del espacio FTP
+            + 4 + 12                                              # separador
+            + save_w                                              # Guardar (solo si está visible ahora)
+            + self._auto_btn.winfo_reqwidth() + 8                 # Auto
+            + self._tray_btn.winfo_reqwidth() + 16                # bandeja
+        )
+
+    def _on_root_resize(self, event):
+        if event.widget is not self:
+            return   # <Configure> también burbujea desde widgets hijos -- solo interesa el de la ventana
+        self._schedule_header_layout_check()
+
+    def _schedule_header_layout_check(self):
+        """Debounce compartido para _update_header_responsive_layout --
+        además de en cada redimensionado de la ventana (_on_root_resize),
+        hace falta llamarlo también cuando cambia el TEXTO de
+        _ftp_space_lbl (_refresh_ftp_space, cada 5 min): cambiar el texto
+        de una etiqueta NO redimensiona la ventana en sí (solo su
+        contenido interno), así que ningún <Configure> del root se
+        dispara solo por eso -- bug real: el umbral se recalcula bien
+        (ver _header_needed_width), pero si nada llama a este método, ese
+        recálculo nunca llega a ejecutarse, y la navegación se queda sin
+        colapsar aunque el texto real de esa etiqueta ya no quepa."""
+        if self._root_resize_after_id is not None:
+            self.after_cancel(self._root_resize_after_id)
+        self._root_resize_after_id = self.after(150, self._update_header_responsive_layout)
+
+    def _update_header_responsive_layout(self):
+        """Colapsa la navegación (Archivos/Episodios/.../Configuración --
+        8 pestañas, con diferencia lo más ancho de la cabecera, ~806px) en
+        el botón "☰" cuando la ventana no tiene ancho de sobra. Los
+        botones de acción (Guardar/Auto/Minimizar) NO se tocan -- siguen
+        visibles siempre, tal cual estaban antes de este cambio; colapsar
+        solo la navegación ya libera de sobra el espacio que necesitan."""
+        self._root_resize_after_id = None
+        compact = self.winfo_width() < self._header_needed_width()
+        if compact == self._header_compact_mode:
+            return
+        self._header_compact_mode = compact
+        self._close_nav_overflow_menu()   # el botón que lo abrió puede estar a punto de ocultarse
+        if compact:
+            self._nav_segmented.grid_remove()
+            self._nav_menu_btn.grid()
+        else:
+            self._nav_menu_btn.grid_remove()
+            self._nav_segmented.grid()
+
+    def _show_nav_overflow_menu(self):
+        """Menú del botón "☰" -- las mismas 8 vistas que _nav_segmented,
+        reconstruido cada vez que se abre. Panel propio (CTkToplevel sin
+        decoración + CTkButtons) en vez de un tk.Menu nativo del SO -- el
+        menú nativo se veía siempre con los colores por defecto del
+        sistema (gris claro fijo), desentonando por completo con el tema
+        oscuro de la app; este respeta el tema actual y resalta la vista
+        activa, igual que ya hace _nav_segmented."""
+        if self._nav_overflow_popup is not None:
+            self._close_nav_overflow_menu()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.overrideredirect(True)
+        try:
+            popup.attributes("-topmost", True)
+        except Exception:
+            pass
+        x = self._nav_menu_btn.winfo_rootx()
+        y = self._nav_menu_btn.winfo_rooty() + self._nav_menu_btn.winfo_height() + 4
+        popup.geometry(f"+{x}+{y}")
+
+        frame = ctk.CTkFrame(popup, corner_radius=8, border_width=1,
+                              border_color=("gray70", "gray30"))
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
+
+        current_key = self._current_view_key()
+        for key, label in self._NAV_LABELS.items():
+            is_active = key == current_key
+            btn = ctk.CTkButton(
+                frame, text=label, anchor="w", corner_radius=6, height=34,
+                fg_color=ACCENT if is_active else "transparent",
+                hover_color=ACCENT_HOVER if is_active else ("gray85", "gray25"),
+                text_color="white" if is_active else None,
+                command=lambda k=key: self._on_nav_overflow_select(k))
+            btn.pack(fill="x", padx=6, pady=3)
+
+        # Cerrar al perder el foco (clic fuera) o con Escape -- un menú
+        # nativo (tk.Menu) se cierra solo en ambos casos; un CTkToplevel
+        # normal no, hay que hacerlo a mano.
+        popup.bind("<FocusOut>", lambda e: self._close_nav_overflow_menu())
+        popup.bind("<Escape>", lambda e: self._close_nav_overflow_menu())
+        popup.focus_force()
+        self._nav_overflow_popup = popup
+
+    def _on_nav_overflow_select(self, key: str):
+        """Bug real: a veces el panel se quedaba visible en pantalla tras
+        elegir una opción -- este callback corre DESDE DENTRO del propio
+        procesamiento de clic del CTkButton, así que destruir el
+        CTkToplevel que lo contiene en ese mismo instante (antes de que Tk
+        termine de procesar ese clic) podía dejar el repintado a medias en
+        algunos casos (más aún tratándose de un overrideredirect(True),
+        que no tiene ayuda del gestor de ventanas para repintar). Cambiar
+        de vista (_show_view) también puede tardar un momento (sincroniza
+        con el FTP, reconstruye paneles...) -- si ese trabajo arranca
+        ANTES de que el cierre del panel se refleje en pantalla, el hueco
+        del panel podía quedarse "congelado" hasta el siguiente repintado
+        de cualquier otra cosa. _close_nav_overflow_menu() ya oculta el
+        panel al instante (withdraw()) antes de destruirlo -- separar
+        _show_view en un after(0, ...) aparte le da a Tk un ciclo de
+        inactividad de por medio para completar ese repintado antes de
+        ponerse con el trabajo más pesado del cambio de vista."""
+        self._close_nav_overflow_menu()
+        self.after(0, lambda: self._show_view(key))
+
+    def _close_nav_overflow_menu(self):
+        popup = self._nav_overflow_popup
+        if popup is None:
+            return
+        self._nav_overflow_popup = None
+        try:
+            # Desligar los binds ANTES de nada -- si no, un <FocusOut>
+            # pendiente (p.ej. el que dispara este mismo cierre) podía
+            # llegar a intentar procesarse sobre un widget ya destruido a
+            # medias en la siguiente vuelta del bucle de eventos.
+            popup.unbind("<FocusOut>")
+            popup.unbind("<Escape>")
+        except Exception:
+            pass
+        try:
+            # withdraw() antes de destroy(): oculta la ventana del SO al
+            # instante, sin esperar a que Tk termine de liberar el widget
+            # -- un CTkToplevel con overrideredirect(True) no tiene ayuda
+            # del gestor de ventanas para repintar solo, así que destroy()
+            # por sí solo podía dejarlo visualmente "pegado" en pantalla
+            # unos instantes (visto de verdad, sobre todo si justo después
+            # arrancaba trabajo más pesado -- ver _on_nav_overflow_select).
+            popup.withdraw()
+        except Exception:
+            pass
+        try:
+            popup.destroy()
+        except Exception:
+            pass
+
     def _build_status_bar(self):
         bar = ctk.CTkFrame(self, height=28, corner_radius=0)
         bar.grid(row=2, column=0, sticky="ew")
@@ -1259,6 +1483,14 @@ class App(_AppBase):
         self._status_bar_left = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11), text_color=PENDING_COLOR, anchor="w")
         self._status_bar_left.grid(row=0, column=0, sticky="w", padx=12, pady=4)
+        # Mensajes de estado/error de _set_status (antes en la cabecera,
+        # ver _status_lbl) -- columna central, la única con weight=1 (el
+        # hueco que antes quedaba vacío entre el recuento de archivos y la
+        # selección actual), para que todo mensaje de la app salga por la
+        # barra de estado inferior en vez de arriba.
+        self._status_bar_center = ctk.CTkLabel(
+            bar, text="", font=ctk.CTkFont(size=11), text_color=ACCENT, anchor="center")
+        self._status_bar_center.grid(row=0, column=1, sticky="ew", padx=12, pady=4)
         self._status_bar_right = ctk.CTkLabel(
             bar, text="", font=ctk.CTkFont(size=11), text_color=PENDING_COLOR, anchor="e")
         self._status_bar_right.grid(row=0, column=2, sticky="e", padx=12, pady=4)
@@ -1519,9 +1751,10 @@ class App(_AppBase):
                 entry.new_name     = new_name or entry.new_name
                 self._update_row(entry)
                 self._ftp_row_live(entry, 1.0, 0.0)
-                # Notificación de escritorio
+                # Notificación de escritorio -- agrupada, ver
+                # _queue_upload_notification (no una por archivo).
                 fname = entry.new_name or entry.name
-                self._send_notification("aRenombrar — Subida completada", fname)
+                self._queue_upload_notification(fname)
                 # Guardar en historial (modo automático) -- size viene del
                 # propio AutoWatcher (ya lo calculó antes de subir, ver
                 # core/auto_watcher.py), NO recalculado aquí: en este punto
@@ -1643,6 +1876,7 @@ class App(_AppBase):
             self._config_panel_frame.grid_remove()
             self._config_visible = False
             self._save_settings_btn.grid_remove()
+            self._schedule_header_layout_check()
         elif self._missing_ep_visible:
             self._missing_ep_frame.grid_remove()
             self._missing_ep_visible = False
@@ -1714,6 +1948,7 @@ class App(_AppBase):
             self._config_panel_frame.grid(row=0, column=0, sticky="nsew")
             self._config_visible = True
             self._save_settings_btn.grid()
+            self._schedule_header_layout_check()
 
         self._nav_segmented.set(self._NAV_LABELS[view_key])
         self._update_status_bar()   # el texto de la derecha depende de la vista activa (ver _update_status_bar)
@@ -1829,6 +2064,7 @@ class App(_AppBase):
         self._file_table.enable_dynamic_page_size(lambda _size: self._refresh_table())
         self._file_rows = []
         self._files_page = 0
+        self._table_resize_debounce_id = None   # ver _on_table_resize
         self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
 
         # Paginado (ver TableView.page_size, calculado dinámicamente según
@@ -1923,6 +2159,8 @@ class App(_AppBase):
         nn   = max(0,  flex - name - det)
         return dict(name=name, det=det, nn=nn, dest=dest_w, stat=74, bar=110, spd=80, size=60, btn=28)
 
+    _TABLE_RESIZE_DEBOUNCE_MS = 150   # ver _on_table_resize
+
     def _on_table_resize(self, event):
         """Reescala columnas al cambiar el ancho del canvas."""
         # Ancho REAL actual de "Destino" (puede haberse arrastrado a mano
@@ -1945,6 +2183,22 @@ class App(_AppBase):
         for key in ("name", "det", "nn"):
             self._file_table.set_width(key, new_cw[key], refresh=False)
         self._file_table.refresh_header()
+        # _apply_col_widths() (el reflow caro: font.measure() + varios
+        # .configure() POR FILA visible) se aplaza con antirrebote -- este
+        # handler se dispara en CADA píxel mientras se arrastra el
+        # separador del panel lateral (la columna de la tabla tiene
+        # weight=1, así que se redimensiona en cascada), y sin frenarlo
+        # eran cientos de llamadas Tcl por evento de ratón, el origen real
+        # del tirón al arrastrar. Los anchos de columna/cabecera de arriba
+        # sí se quedan síncronos -- eso es barato y se ve en vivo durante
+        # el arrastre.
+        if self._table_resize_debounce_id is not None:
+            self.after_cancel(self._table_resize_debounce_id)
+        self._table_resize_debounce_id = self.after(
+            self._TABLE_RESIZE_DEBOUNCE_MS, self._apply_col_widths_debounced)
+
+    def _apply_col_widths_debounced(self):
+        self._table_resize_debounce_id = None
         self._apply_col_widths()
 
     def _apply_col_widths(self):
@@ -2253,6 +2507,10 @@ class App(_AppBase):
             disks.setdefault(segments[0], root)
         return disks
 
+    def _clear_ftp_space_lbl(self):
+        self._ftp_space_lbl.configure(text="")
+        self._schedule_header_layout_check()
+
     def _refresh_ftp_space(self):
         """Consulta el espacio libre de cada disco distinto usado en las
         categorías FTP configuradas y actualiza la etiqueta de la cabecera
@@ -2260,7 +2518,7 @@ class App(_AppBase):
         · Datos2-40,0 GB")."""
         disks = self._disks_from_categories()
         if not disks:
-            self._ftp_space_lbl.configure(text="")
+            self._clear_ftp_space_lbl()
             return
 
         def worker():
@@ -2281,7 +2539,7 @@ class App(_AppBase):
                     self.config_data.get("ftp_password", ""),
                     self.config_data.get("ftp_use_tls", False))
                 if not ok:
-                    self.after(0, lambda: self._ftp_space_lbl.configure(text=""))
+                    self.after(0, self._clear_ftp_space_lbl)
                     return
                 parts = []
                 any_low = False
@@ -2297,13 +2555,14 @@ class App(_AppBase):
             finally:
                 own_ftp.disconnect()
             if not parts:
-                self.after(0, lambda: self._ftp_space_lbl.configure(text=""))
+                self.after(0, self._clear_ftp_space_lbl)
                 return
             text = "Espacio disponible: " + " · ".join(parts)
             color = WARNING_COLOR if any_low else SUCCESS_COLOR
 
             def apply():
                 self._ftp_space_lbl.configure(text=text, text_color=color)
+                self._schedule_header_layout_check()
                 # Espacio libre en bytes crudos, para el panel "Capacidad"
                 # de Estadísticas -- lee esto directamente, sin abrir su
                 # propia conexión FTP (ver gui/stats_view.py).
@@ -3919,6 +4178,18 @@ class App(_AppBase):
                         remote_data = None
                 if not remote_data and not self._category_stats_bootstrap_done:
                     remote_data = self._bootstrap_category_stats(own_ftp)
+                elif remote_data:
+                    # Bug real: la categoría "Libros" (ebooks) se creó/usó
+                    # DESPUÉS del único escaneo completo que sembró este
+                    # archivo (ver _bootstrap_category_stats, que solo
+                    # corre una vez por diseño) -- se quedó sin ninguna
+                    # entrada para siempre, mientras "Comics-Mangas", que sí
+                    # tenía contenido a tiempo, se contó bien. Backfill
+                    # dirigido: solo escanea las categorías configuradas
+                    # HOY que todavía no tengan ninguna entrada, sin tocar
+                    # las que ya están bien (evita repetir un escaneo caro
+                    # de categorías grandes -- "Series" tiene 338 carpetas).
+                    remote_data = self._backfill_missing_category_stats(own_ftp, remote_data)
                 if remote_data:
                     self.after(0, lambda: self._apply_synced_category_stats(remote_data))
             finally:
@@ -3957,36 +4228,17 @@ class App(_AppBase):
         síntoma reportado ("hay cerca de 3000 películas, solo cuenta 3";
         categorías enteras sin aparecer)."""
         self._category_stats_bootstrap_done = True
-        from core.cleanup_candidates import group_loose_files_by_name
         data = {}
         cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         with own_ftp.widened_timeout(300):
             for cat_list in cats.values():
                 for cat in cat_list:
-                    root = (cat.get("root") or "").rstrip("/")
-                    if not root:
+                    if not (cat.get("root") or "").strip():
                         continue
-                    tree = own_ftp.list_tree_recursive(root)
-                    if tree is not None:
-                        sizes = sizes_by_top_level_folder(tree, root)
-                        root_files = tree.get(root, [])
-                        via = "LIST -R"
-                    else:
-                        sizes = {name: own_ftp.get_folder_size(f"{root}/{name}")
-                                 for name in own_ftp.list_dirs(root)}
-                        root_files = own_ftp.list_files_with_sizes(root)
-                        via = "list_dirs (sin soporte LIST -R)"
-                    loose_groups = group_loose_files_by_name(root_files)
-                    for base_name, group in loose_groups.items():
-                        sizes[base_name] = sizes.get(base_name, 0) + group["size_bytes"]
-                    _log.info(
-                        "Estadísticas: bootstrap categoría %r (%s) vía %s -- "
-                        "%d carpeta(s), %d archivo(s) suelto(s) en la raíz -> "
-                        "%d agrupado(s), %d elemento(s) en total",
-                        cat.get("name", root), root, via,
-                        len(sizes) - len(loose_groups), len(root_files), len(loose_groups), len(sizes))
+                    sizes = self._scan_category_sizes(own_ftp, cat, log_prefix="bootstrap")
                     if sizes:
-                        data[cat.get("id", root)] = {"category_name": cat.get("name", root), "folders": sizes}
+                        data[cat.get("id", cat["root"])] = {
+                            "category_name": cat.get("name", cat["root"]), "folders": sizes}
         if not data:
             return {}
         from core.category_stats import wrap_for_remote
@@ -3994,6 +4246,81 @@ class App(_AppBase):
         raw = _json.dumps(wrap_for_remote(data), ensure_ascii=False, indent=2).encode("utf-8")
         own_ftp.upload_bytes(raw, self._category_stats_remote_path())
         return data
+
+    def _scan_category_sizes(self, own_ftp, cat: dict, log_prefix: str = "escaneo") -> dict:
+        """Escanea UNA categoría (carpetas propias + archivos sueltos en la
+        raíz, agrupados por nombre base) y devuelve {nombre: bytes} -- lógica
+        compartida entre _bootstrap_category_stats (todas las categorías,
+        una vez por sesión) y _backfill_missing_category_stats (solo las
+        que falten, ver más abajo). El llamador es responsable de envolver
+        la llamada en own_ftp.widened_timeout(...) -- listar una categoría
+        grande puede tardar bastante más que el timeout de 15s por defecto
+        de connect()."""
+        from core.cleanup_candidates import group_loose_files_by_name
+        root = (cat.get("root") or "").rstrip("/")
+        if not root:
+            return {}
+        tree = own_ftp.list_tree_recursive(root)
+        if tree is not None:
+            sizes = sizes_by_top_level_folder(tree, root)
+            root_files = tree.get(root, [])
+            via = "LIST -R"
+        else:
+            sizes = {name: own_ftp.get_folder_size(f"{root}/{name}")
+                     for name in own_ftp.list_dirs(root)}
+            root_files = own_ftp.list_files_with_sizes(root)
+            via = "list_dirs (sin soporte LIST -R)"
+        loose_groups = group_loose_files_by_name(root_files)
+        for base_name, group in loose_groups.items():
+            sizes[base_name] = sizes.get(base_name, 0) + group["size_bytes"]
+        _log.info(
+            "Estadísticas: %s categoría %r (%s) vía %s -- "
+            "%d carpeta(s), %d archivo(s) suelto(s) en la raíz -> "
+            "%d agrupado(s), %d elemento(s) en total",
+            log_prefix, cat.get("name", root), root, via,
+            len(sizes) - len(loose_groups), len(root_files), len(loose_groups), len(sizes))
+        return sizes
+
+    def _backfill_missing_category_stats(self, own_ftp, remote_data: dict) -> dict:
+        """Detecta categorías configuradas HOY (Ajustes → Categorías) que
+        no tienen ninguna entrada en remote_data y las escanea -- SOLO a
+        ellas, sin repetir el escaneo de las que ya tienen datos (evita el
+        coste de recorrer categorías grandes que ya están bien, p.ej.
+        "Series" con cientos de carpetas).
+
+        Bug real: la categoría "Libros" (ebooks) se creó/empezó a recibir
+        contenido DESPUÉS del único escaneo completo que sembró
+        category_stats.json (ver _bootstrap_category_stats, que por diseño
+        solo corre una vez por sesión/hasta que haya datos válidos) -- se
+        quedó sin ninguna entrada para siempre (ni "0 bytes" siquiera),
+        mientras "Comics-Mangas", que sí tenía contenido a tiempo, se
+        contó bien. _sync_category_stats_from_ftp nunca volvía a
+        recorrer el árbol una vez que remote_data ya era "válido" (no
+        vacío, versión de escaneo correcta) -- exactamente el mismo tipo
+        de dato ya sembrado y nunca recalculado documentado para el resto
+        de bugs de esta pestaña. Esto lo resuelve sin necesidad de subir
+        SCAN_VERSION (que forzaría re-escanear TODO, categorías grandes
+        incluidas) -- solo rellena el hueco real."""
+        cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
+        missing = [cat for cat_list in cats.values() for cat in cat_list
+                   if (cat.get("root") or "").strip()
+                   and cat.get("id", cat["root"]) not in remote_data]
+        if not missing:
+            return remote_data
+        added = False
+        with own_ftp.widened_timeout(300):
+            for cat in missing:
+                sizes = self._scan_category_sizes(own_ftp, cat, log_prefix="backfill")
+                if sizes:
+                    remote_data[cat.get("id", cat["root"])] = {
+                        "category_name": cat.get("name", cat["root"]), "folders": sizes}
+                    added = True
+        if added:
+            from core.category_stats import wrap_for_remote
+            import json as _json
+            raw = _json.dumps(wrap_for_remote(remote_data), ensure_ascii=False, indent=2).encode("utf-8")
+            own_ftp.upload_bytes(raw, self._category_stats_remote_path())
+        return remote_data
 
     def _check_for_updates_at_startup(self):
         """Comprueba en segundo plano si hay una versión más nueva publicada
@@ -4197,7 +4524,8 @@ class App(_AppBase):
         cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         return choose_category(info.genre_ids, cats.get(info.media_type, []))
 
-    def _find_category_with_existing_folder(self, ftp_conn, info, use_cache_only=False, force_refresh=False):
+    def _find_category_with_existing_folder(self, ftp_conn, info, use_cache_only=False, force_refresh=False,
+                                             known_year=None):
         """Busca en TODAS las categorías configuradas para el tipo de
         *info* (no solo en la que tocaría por género) si ya existe una
         carpeta con nombre igual o prácticamente idéntico a la serie --
@@ -4236,6 +4564,11 @@ class App(_AppBase):
         de verdad en vez de arriesgarse a un "no encontrado" con la
         carpeta ahí delante.
 
+        known_year (opcional, ver core.ftp_categories.find_existing_category_folder
+        y _missing_ep_known_year) ayuda a encontrar la carpeta cuando el
+        nombre que da Jellyfin/Plex no trae año pero la carpeta real sí
+        lo lleva para distinguir un remake del original.
+
         El propio emparejamiento (nombre exacto/folder_name conocido/
         parecido >=0.90) vive en core.ftp_categories.find_existing_category_folder,
         compartido con AutoWatcher (ver core/auto_watcher.py) -- aquí solo
@@ -4267,7 +4600,8 @@ class App(_AppBase):
             return self._ftp_dir_cache[root]
 
         from core.ftp_categories import find_existing_category_folder
-        return find_existing_category_folder(cats, info.title, known_folder_name, dir_lookup)
+        return find_existing_category_folder(cats, info.title, known_folder_name, dir_lookup,
+                                              known_year=known_year)
 
     def _resolve_series_folder(self, ftp_conn, category: dict, info, entry=None) -> str:
         """Si ya existe en la raíz de *category* una carpeta con nombre
@@ -4923,7 +5257,7 @@ class App(_AppBase):
             if row["entry"] is entry:
                 row["ftp_up"].configure(
                     text="⏹", fg_color="#c0392b", hover_color="#96281b",
-                    font=ctk.CTkFont(size=12),
+                    font=self._font_btn,
                     command=lambda e=entry: self._queue_skip_entry(e))
                 break
 
@@ -4933,9 +5267,11 @@ class App(_AppBase):
             if row["entry"] is entry:
                 row["ftp_up"].configure(
                     text="▲", fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                    font=ctk.CTkFont(size=12),
+                    font=self._font_btn,
                     command=lambda e=entry: self._upload_one(e))
                 break
+
+    _STATUS_BAR_DEBOUNCE_MS = 200   # ver _ftp_row_live
 
     def _ftp_row_live(self, entry, pct, speed_bps):
         """Actualiza barra y velocidad durante la subida (llamado desde after)."""
@@ -4945,9 +5281,20 @@ class App(_AppBase):
                 row["ftp_speed"].configure(text=_fmt_speed(speed_bps) if speed_bps > 0 else "")
                 break
         # Velocidad total en la barra de estado (ver _update_status_bar) --
-        # solo reconfigura una etiqueta de texto, no reconstruye ninguna
-        # tabla, así que no hace falta frenar esto aunque se llame varias
-        # veces por segundo con varias subidas a la vez.
+        # _update_status_bar() en realidad recorre TODO self.files (no solo
+        # la página) para el desglose de conteos/tamaño, no "solo
+        # reconfigura una etiqueta" como se pensaba antes -- con varias
+        # subidas a la vez llamando esto varias veces por segundo, ese
+        # recorrido completo SÍ se notaba. Antirrebote en vez de
+        # instantáneo: coalesce ráfagas de ticks en una sola actualización
+        # cada _STATUS_BAR_DEBOUNCE_MS.
+        if self._status_bar_debounce_id is not None:
+            self.after_cancel(self._status_bar_debounce_id)
+        self._status_bar_debounce_id = self.after(
+            self._STATUS_BAR_DEBOUNCE_MS, self._update_status_bar_debounced)
+
+    def _update_status_bar_debounced(self):
+        self._status_bar_debounce_id = None
         self._update_status_bar()
 
     def _ftp_row_set(self, entry, status_text, pct, speed_bps):
@@ -6798,7 +7145,8 @@ class App(_AppBase):
             "<Button-3>", lambda e: self._show_missing_ep_dub_hidden_dialog())
         self._missing_ep_search_entry = ctk.CTkEntry(right_fr, width=180, placeholder_text="Filtrar por nombre...")
         self._missing_ep_search_entry.pack(side="right", padx=4, pady=8)
-        self._missing_ep_search_entry.bind("<KeyRelease>", lambda e: self._render_missing_episodes_table())
+        self._missing_ep_search_entry.bind("<KeyRelease>", self._on_missing_ep_search_key)
+        self._missing_ep_search_debounce_id = None   # ver _on_missing_ep_search_key
 
         # -- Barra de estado / progreso (una u otra, nunca las dos) --
         self._missing_ep_status_lbl = ctk.CTkLabel(
@@ -6810,11 +7158,17 @@ class App(_AppBase):
         # (empaquetado solo mientras escanea)
 
         # -- Cuerpo: tabla a la izquierda, ficha de TMDB a la derecha --
+        # Columna 0: tabla (se expande). Columna 1: separador arrastrable.
+        # Columna 2: panel lateral (ancho fijo, pero ajustable a mano) --
+        # mismo patrón de 3 columnas que _build_files_tab (ver
+        # _detail_sash_press/_motion/_release ahí, y su equivalente
+        # _missing_ep_sash_* aquí más abajo).
         body = ctk.CTkFrame(parent, fg_color="transparent")
         body.grid(row=2, column=0, sticky="nsew")
         parent.grid_rowconfigure(2, weight=1)
         body.grid_columnconfigure(0, weight=1)
         body.grid_columnconfigure(1, weight=0)
+        body.grid_columnconfigure(2, weight=0)
         body.grid_rowconfigure(0, weight=1)
 
         self._missing_ep_empty_msg = None   # label "sin resultados"/"pulsa Comprobar", ver _render_missing_episodes_table
@@ -6837,6 +7191,7 @@ class App(_AppBase):
             ColumnSpec("logo", "", width=28),
             ColumnSpec("fav", "", width=28),
             ColumnSpec("name", "Serie", expand=True, resizable=True),
+            ColumnSpec("premiere", "Estreno", width=80),
             ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100),
             ColumnSpec("trending", "Tendencia", width=70),
             ColumnSpec("ignore", "", width=90),
@@ -6848,8 +7203,21 @@ class App(_AppBase):
         self._missing_ep_table.on_widths_changed = lambda w: self._save_table_col_widths("episodios", w)
         self._missing_ep_table.enable_dynamic_page_size(lambda _size: self._missing_ep_render_page())
 
+        # Separador arrastrable entre la tabla y el panel lateral -- mismo
+        # patrón visual y de comportamiento que _detail_sash de Archivos
+        # (ver _missing_ep_sash_press/_motion/_release más abajo).
+        self._missing_ep_sash = tk.Frame(body, width=4, bg="#505060",
+                                          cursor="sb_h_double_arrow")
+        self._missing_ep_sash.grid(row=0, column=1, sticky="ns", pady=8)
+        self._missing_ep_sash.bind("<ButtonPress-1>", self._missing_ep_sash_press)
+        self._missing_ep_sash.bind("<B1-Motion>", self._missing_ep_sash_motion)
+        self._missing_ep_sash.bind("<ButtonRelease-1>", self._missing_ep_sash_release)
+        self._missing_ep_sash_state = None
+        self._missing_ep_resize_debounce_id = None
+        self._missing_ep_panel_width = 240   # igual que el width= inicial de _build_missing_ep_side_panel
+
         self._missing_ep_side_panel = self._build_missing_ep_side_panel(body)
-        self._missing_ep_side_panel.grid(row=0, column=1, sticky="nsew")
+        self._missing_ep_side_panel.grid(row=0, column=2, sticky="nsew")
 
         # Paginado (ver TableView.page_size, calculado dinámicamente) -- con varios cientos de
         # series cacheadas, dibujar la tabla entera de golpe (o incluso en
@@ -6884,6 +7252,15 @@ class App(_AppBase):
         self._missing_ep_expanded = set()   # tmdb_ids con la fila desplegada
         self._missing_ep_expanded_seasons = set()   # (tmdb_id, temporada) con la temporada desplegada
         self._missing_ep_poster_token = None
+        # Desplegable "ver árbol de archivos" bajo la ruta del FTP (ver
+        # _toggle_missing_ep_ftp_tree) -- _ftp_tree_ruta es la ruta que
+        # ese árbol representa AHORA MISMO (None mientras no se conoce
+        # ninguna), _ftp_tree_loaded_for la última ruta ya listada (para
+        # no repetir la conexión FTP si se colapsa/despliega la misma
+        # serie varias veces seguidas).
+        self._missing_ep_ftp_tree_expanded = False
+        self._missing_ep_ftp_tree_ruta = None
+        self._missing_ep_ftp_tree_loaded_for = None
         self._update_missing_ep_status_text()
         # Diferido, no al construir la app: dibujar esta tabla implica
         # crear un widget por cada serie con hueco cacheada, y esta
@@ -6902,6 +7279,59 @@ class App(_AppBase):
             lbl = widgets.get("summary_lbl")
             if lbl is not None:
                 lbl.configure(width=w)
+
+    _MISSING_EP_PANEL_MIN_W = 180
+    _MISSING_EP_PANEL_MAX_W = 500
+    _MISSING_EP_RESIZE_DEBOUNCE_MS = 150
+
+    def _missing_ep_sash_press(self, event):
+        self._missing_ep_sash_state = {"x0": event.x_root, "w0": self._missing_ep_panel_width}
+
+    def _missing_ep_sash_motion(self, event):
+        if not self._missing_ep_sash_state:
+            return
+        # El panel está a la derecha del separador: arrastrar hacia la
+        # izquierda (x decrece) lo ensancha, hacia la derecha lo estrecha
+        # (mismo criterio que _detail_sash_motion de Archivos).
+        delta = self._missing_ep_sash_state["x0"] - event.x_root
+        new_w = max(self._MISSING_EP_PANEL_MIN_W,
+                    min(self._MISSING_EP_PANEL_MAX_W, self._missing_ep_sash_state["w0"] + delta))
+        if new_w == self._missing_ep_panel_width:
+            return   # mismo ancho (redondeo) -- no repetir trabajo de layout
+        self._missing_ep_panel_width = new_w
+        # Durante el arrastre en vivo solo se mueve el borde del panel --
+        # el reajuste de los cuadros de texto de dentro (caro, ver
+        # _commit_missing_ep_panel_width) se aplaza con antirrebote.
+        self._missing_ep_side_panel.configure(width=new_w)
+        if self._missing_ep_resize_debounce_id is not None:
+            self.after_cancel(self._missing_ep_resize_debounce_id)
+        self._missing_ep_resize_debounce_id = self.after(
+            self._MISSING_EP_RESIZE_DEBOUNCE_MS, self._commit_missing_ep_panel_width)
+
+    def _missing_ep_sash_release(self, event):
+        self._missing_ep_sash_state = None
+        if self._missing_ep_resize_debounce_id is not None:
+            self.after_cancel(self._missing_ep_resize_debounce_id)
+            self._missing_ep_resize_debounce_id = None
+        self._commit_missing_ep_panel_width()
+
+    def _commit_missing_ep_panel_width(self):
+        """Aplica self._missing_ep_panel_width de verdad a los widgets de
+        dentro del panel (el póster se queda a tamaño fijo, igual que en
+        Archivos -- ver _commit_detail_panel_width). Es la parte cara --
+        se llama con antirrebote durante el arrastre, no en cada evento de
+        movimiento."""
+        self._missing_ep_resize_debounce_id = None
+        w = self._missing_ep_panel_width
+        self._missing_ep_side_panel.configure(width=w)
+        content_w = max(100, w - 40)   # descontar el padding interno del panel
+        self._missing_ep_detail_title.configure(width=content_w)
+        self._missing_ep_detail_overview.configure(width=content_w)
+        self._missing_ep_path_lbl.configure(wraplength=content_w)
+        self._missing_ep_ai_verdict_lbl.configure(wraplength=content_w)
+        self._missing_ep_ftp_tree_box.configure(width=content_w)
+        self._autosize_textbox(self._missing_ep_detail_title)
+        self._autosize_textbox(self._missing_ep_detail_overview)
 
     def _build_missing_ep_side_panel(self, parent):
         """Ficha de TMDB de la serie pulsada -- póster + sinopsis, mismo
@@ -6936,11 +7366,26 @@ class App(_AppBase):
         # Ruta de la serie en el FTP -- se ve directamente al pulsar la
         # serie, sin tocar ningún botón (a diferencia de los enlaces
         # personalizables, que son independientes de esto). Ver
-        # _update_missing_ep_path_label.
+        # _update_missing_ep_path_label. Es además el desplegable del
+        # árbol de archivos de abajo -- cursor de mano y clic alternan
+        # _toggle_missing_ep_ftp_tree (solo hace algo si ya hay ruta
+        # conocida; con "Buscando..."/"No encontrada" el clic no hace
+        # nada, ver _refresh_missing_ep_path_label_text).
         self._missing_ep_path_lbl = ctk.CTkLabel(
             scroll, text="", font=ctk.CTkFont(size=11), text_color=PENDING_COLOR,
-            wraplength=200, justify="left", anchor="w")
+            wraplength=200, justify="left", anchor="w", cursor="hand2")
         self._missing_ep_path_lbl.pack(pady=(0, 4), fill="x")
+        self._missing_ep_path_lbl.bind("<Button-1>", lambda ev: self._toggle_missing_ep_ftp_tree())
+
+        # Árbol de archivos de la carpeta de la serie en el FTP --
+        # colapsado por defecto (sin pack todavía), se despliega pulsando
+        # la ruta de arriba. "v"/">" en vez de ▼/▶: esos caracteres
+        # Unicode dejan un recuadro visible en el sistema del usuario (ver
+        # el mismo ajuste ya hecho en el toggle de fila/temporada de esta
+        # misma tabla).
+        self._missing_ep_ftp_tree_box = ctk.CTkTextbox(
+            scroll, width=200, height=180, wrap="word", font=ctk.CTkFont(size=10))
+        self._missing_ep_ftp_tree_box.configure(state="disabled")
 
         # Botón por serie (no uno general): pregunta a la IA solo por la
         # serie que se está viendo ahora mismo en el panel.
@@ -7000,6 +7445,11 @@ class App(_AppBase):
             name = entry.get("name", "")
             episode_titles = {int(s): {int(e): t for e, t in eps.items()}
                               for s, eps in (entry.get("episode_titles") or {}).items()}
+            season_air_dates = {int(s): d for s, d in (entry.get("season_air_dates") or {}).items()}
+            episode_air_dates = {int(s): {int(e): d for e, d in eps.items()}
+                                 for s, eps in (entry.get("episode_air_dates") or {}).items()}
+            ignored_seasons = set(entry.get("ignored_seasons") or [])
+            ignored_episodes = {int(s): set(eps) for s, eps in (entry.get("ignored_episodes") or {}).items()}
             expected = {int(k): v for k, v in (entry.get("expected") or {}).items()}
             present_season_counts = {int(k): v for k, v in (entry.get("present_season_counts") or {}).items()}
             # La caché en disco guarda el hueco SIN filtrar (ver
@@ -7025,6 +7475,11 @@ class App(_AppBase):
                 "play_count": entry.get("play_count", 0),
                 "last_played_ts": entry.get("last_played_ts"),
                 "folder_name": entry.get("folder_name"),
+                "first_air_date": entry.get("first_air_date", ""),
+                "season_air_dates": season_air_dates,
+                "episode_air_dates": episode_air_dates,
+                "ignored_seasons": ignored_seasons,
+                "ignored_episodes": ignored_episodes,
             })
         return results
 
@@ -7214,20 +7669,64 @@ class App(_AppBase):
 
     def _on_toggle_hide_no_dub(self):
         """Al activar "Ocultar sin doblaje ES": si hay episodios pendientes
-        de comprobar, lanza el chequeo en segundo plano (con barra de
-        progreso, ver _start_spanish_dub_check) antes de redibujar -- al
-        desactivarlo, basta con redibujar (no hay nada que comprobar para
-        volver a MOSTRAR episodios). Este chequeo automático (TMDB) es el
-        comportamiento por defecto -- tiene un fallo conocido (falso
-        positivo en series con doblaje parcial, ver el docstring de
-        core.missing_episodes.episode_has_spanish_text), que el usuario
-        puede corregir serie a serie pulsando "🤖 Preguntar a la IA" en el
-        panel lateral (ver _ask_ai_about_current_missing_ep_show) -- nunca
-        al revés, y nunca automáticamente."""
-        if self._missing_ep_hide_no_dub_var.get():
+        de comprobar (o caducados, ver is_stale), pregunta primero si
+        comprobarlos en TMDB ahora (tarda, una llamada por episodio
+        pendiente) o reutilizar tal cual el último resultado guardado --
+        antes se lanzaba el chequeo automáticamente, pero para una serie
+        con muchos huecos sin comprobar eso se sentía como si la app se
+        quedara "escaneando el servidor" sin haberlo pedido. Reutilizar
+        simplemente redibuja: los episodios sin comprobar no se ocultan
+        (ver filter_missing_by_spanish_dub), se quedan visibles hasta que
+        se comprueben de verdad. Sin nada pendiente, o al desactivar el
+        interruptor, no hace falta preguntar nada -- basta con redibujar
+        (o, si hay pendientes y el usuario confirma, lanzar el chequeo con
+        barra de progreso, ver _start_spanish_dub_check). Este chequeo
+        automático (TMDB) es el comportamiento por defecto -- tiene un
+        fallo conocido (falso positivo en series con doblaje parcial, ver
+        el docstring de core.missing_episodes.episode_has_spanish_text),
+        que el usuario puede corregir serie a serie pulsando "🤖 Preguntar
+        a la IA" en el panel lateral (ver
+        _ask_ai_about_current_missing_ep_show) -- nunca al revés, y nunca
+        automáticamente."""
+        if not self._missing_ep_hide_no_dub_var.get():
+            self._render_missing_episodes_table()
+            return
+        if not self._missing_ep_dub_pending_checks():
+            self._start_spanish_dub_check()   # nada pendiente -- renderiza al momento, sin red
+            return
+        if _ConfirmDialog(
+                self, "Comprobar doblaje castellano",
+                "Hay episodios sin comprobar (o cuyo resultado ya caducó). "
+                "¿Comprobarlos ahora en TMDB o reutilizar el último resultado guardado?",
+                "Comprobar ahora consulta TMDB episodio a episodio (puede tardar si faltan muchos). "
+                "Reutilizar el último escaneo es inmediato, pero los episodios aún sin comprobar "
+                "se quedarán visibles hasta que se comprueben de verdad.",
+                confirm_text="Comprobar ahora", cancel_text="Reutilizar lo que haya").result:
             self._start_spanish_dub_check()
         else:
             self._render_missing_episodes_table()
+
+    def _missing_ep_dub_pending_checks(self) -> list:
+        """Episodios (tmdb_id, name, season, ep) que _start_spanish_dub_check
+        tendría que consultar a TMDB -- sin entrada en
+        self._spanish_dub_cache, o con una caducada (ver is_stale).
+        Extraído de _start_spanish_dub_check para poder preguntar al
+        usuario ANTES de lanzar el chequeo si quiere comprobar de nuevo o
+        reutilizar el último resultado (ver _on_toggle_hide_no_dub)."""
+        from core.spanish_dub_cache import is_stale
+        known_cache = self._spanish_dub_cache
+        now = _time.time()
+        pending = []
+        for r in self._missing_ep_results:
+            if r.get("ignored"):
+                continue
+            series_entry = known_cache.get(str(r["tmdb_id"]), {})
+            dub_episodes = {} if is_stale(series_entry, now) else series_entry.get("episodes", {})
+            for season, eps in r["missing"].items():
+                for ep in eps:
+                    if f"{season}x{ep:02d}" not in dub_episodes:
+                        pending.append((r["tmdb_id"], r["name"], season, ep))
+        return pending
 
     def _on_force_recheck(self, tmdb_id):
         """Botón "🔄" de _DubHiddenDialog -- fuerza un repaso inmediato del
@@ -7249,30 +7748,19 @@ class App(_AppBase):
         por episodio pendiente. Reutiliza la barra de progreso y el botón
         "Cancelar" del escaneo normal (_set_missing_ep_scanning_ui) -- ambos
         comparten self._missing_ep_scanning para no competir por el mismo
-        límite de peticiones de TMDB."""
+        límite de peticiones de TMDB. Ver _missing_ep_dub_pending_checks
+        para cómo se decide qué está pendiente."""
         if self._missing_ep_scanning:
             return
-        from core.spanish_dub_cache import is_stale
         known_cache = self._spanish_dub_cache   # solo lectura mientras corre el worker
         now = _time.time()
-        pending = []
-        for r in self._missing_ep_results:
-            if r.get("ignored"):
-                continue
-            series_entry = known_cache.get(str(r["tmdb_id"]), {})
-            # Una entrada caducada (ver is_stale) se trata como si no
-            # tuviera NINGÚN episodio comprobado -- se repasa la serie
-            # entera, no solo los episodios nuevos desde la última vez.
-            dub_episodes = {} if is_stale(series_entry, now) else series_entry.get("episodes", {})
-            for season, eps in r["missing"].items():
-                for ep in eps:
-                    if f"{season}x{ep:02d}" not in dub_episodes:
-                        pending.append((r["tmdb_id"], r["name"], season, ep))
+        pending = self._missing_ep_dub_pending_checks()
 
         if not pending:
             self._render_missing_episodes_table()
             return
 
+        from core.spanish_dub_cache import is_stale
         self._missing_ep_scanning = True
         self._missing_ep_cancel_event = threading.Event()
         cancel_event = self._missing_ep_cancel_event
@@ -7426,6 +7914,23 @@ class App(_AppBase):
             text = f"{len(pending)} serie(s) con episodios que faltan" + (f" -- último escaneo {when}" if when else "")
         self._missing_ep_status_lbl.configure(text=text)
 
+    _MISSING_EP_SEARCH_DEBOUNCE_MS = 200   # ver _on_missing_ep_search_key
+
+    def _on_missing_ep_search_key(self, event):
+        """<KeyRelease> del cuadro de búsqueda -- con antirrebote en vez de
+        redibujar en cada tecla: _render_missing_episodes_table() recalcula
+        y reconstruye la página entera de la tabla (filtra+ordena TODAS las
+        series cacheadas), caro para repetirlo en cada pulsación mientras
+        el usuario todavía está escribiendo."""
+        if self._missing_ep_search_debounce_id is not None:
+            self.after_cancel(self._missing_ep_search_debounce_id)
+        self._missing_ep_search_debounce_id = self.after(
+            self._MISSING_EP_SEARCH_DEBOUNCE_MS, self._render_missing_ep_search_debounced)
+
+    def _render_missing_ep_search_debounced(self):
+        self._missing_ep_search_debounce_id = None
+        self._render_missing_episodes_table()
+
     def _render_missing_episodes_table(self, reset_page: bool = True):
         """Punto de entrada tras cambiar filtros, terminar un escaneo, o
         cualquier otro cambio que pueda alterar QUÉ filas hay que ver --
@@ -7554,20 +8059,26 @@ class App(_AppBase):
         _render_batch()
 
     def _visible_missing_ep_row(self, r: dict):
-        """Aplica los filtros activos (búsqueda, ignoradas, descartadas por
-        IA y doblaje ES) -- devuelve la fila a pintar, o None si no debe
-        verse ahora mismo. Con "Ocultar sin doblaje ES" activo, devuelve
-        una COPIA con "missing" recortado a solo los episodios con doblaje
-        confirmado -- por defecto según el chequeo automático de TMDB
-        (self._spanish_dub_cache, ver _start_spanish_dub_check), SALVO que
-        el usuario haya pulsado "🤖 Preguntar a la IA" para esta serie
-        concreta (ver _ask_ai_about_current_missing_ep_show): en ese caso
-        el veredicto de la IA (r["ai_verdict"]["doblaje_castellano"])
+        """Aplica los filtros activos (búsqueda, ignoradas -- serie,
+        temporada Y capítulo --, descartadas por IA y doblaje ES) --
+        devuelve la fila a pintar, o None si no debe verse ahora mismo.
+        Con "Ocultar sin doblaje ES" activo, o con capítulos/temporadas
+        sueltos ignorados (ver _toggle_missing_ep_season_ignore/
+        _toggle_missing_ep_episode_ignore) y "Mostrar ignoradas" desactivado,
+        devuelve una COPIA con "missing" recortado -- mismo mecanismo para
+        ambos casos, se pueden combinar. Con doblaje: solo los episodios
+        con doblaje confirmado -- por defecto según el chequeo automático
+        de TMDB (self._spanish_dub_cache, ver _start_spanish_dub_check),
+        SALVO que el usuario haya pulsado "🤖 Preguntar a la IA" para esta
+        serie concreta (ver _ask_ai_about_current_missing_ep_show): en ese
+        caso el veredicto de la IA (r["ai_verdict"]["doblaje_castellano"])
         sustituye por completo al de TMDB para esta serie, nunca al revés.
         Si tras recortar no queda ningún hueco (ni unknown_seasons), la
         fila entera se oculta. Usado tanto por _render_missing_episodes_table
         como por _append_missing_ep_result_live, para que ambos apliquen
         exactamente el mismo criterio."""
+        from core.missing_episodes import format_missing_summary, apply_ignored_filter
+
         query = self._missing_ep_search_entry.get().strip().lower()
         show_ignored = self._missing_ep_show_ignored_var.get()
         hide_ai_dismissed = self._missing_ep_hide_ai_var.get()
@@ -7579,18 +8090,28 @@ class App(_AppBase):
             return None
         if hide_ai_dismissed and ai_dismissed:
             return None
-        if not self._missing_ep_hide_no_dub_var.get():
-            return r
 
-        from core.missing_episodes import format_missing_summary
-        filtered_missing = self._missing_ep_dub_filtered(r)
-        if not filtered_missing and not r.get("unknown_seasons"):
-            return None
-        if filtered_missing == r["missing"]:
+        missing = r["missing"]
+        if not show_ignored and (r.get("ignored_seasons") or r.get("ignored_episodes")):
+            missing = apply_ignored_filter(missing, r.get("ignored_seasons"), r.get("ignored_episodes"))
+            if not missing and not r.get("unknown_seasons"):
+                return None
+
+        if self._missing_ep_hide_no_dub_var.get():
+            # _missing_ep_dub_filtered recorta sobre r["missing"] tal cual
+            # -- si ya se recortó arriba por ignorados, hay que pasarle esa
+            # versión en vez de la original, para que ambos filtros se
+            # combinen en vez de que uno deshaga al otro.
+            r_for_dub = r if missing is r["missing"] else dict(r, missing=missing)
+            missing = self._missing_ep_dub_filtered(r_for_dub)
+            if not missing and not r.get("unknown_seasons"):
+                return None
+
+        if missing is r["missing"]:
             return r
         display = dict(r)
-        display["missing"] = filtered_missing
-        display["summary"] = format_missing_summary(r["name"], filtered_missing) if filtered_missing else r["summary"]
+        display["missing"] = missing
+        display["summary"] = format_missing_summary(r["name"], missing) if missing else r["summary"]
         return display
 
     def _missing_ep_dub_filtered(self, r: dict) -> dict:
@@ -7734,6 +8255,11 @@ class App(_AppBase):
         name_lbl.pack(side="left", padx=4, pady=6, fill="x", expand=True)
         name_lbl.bind("<Button-1>", lambda e, tid=tmdb_id, row=r: self._on_missing_ep_name_click(tid, row))
 
+        premiere_lbl = ctk.CTkLabel(header_row, text=_fmt_air_date(r.get("first_air_date")),
+                                    width=cw("premiere"), font=self._missing_ep_summary_font,
+                                    text_color=PENDING_COLOR)
+        premiere_lbl.pack(side="left", padx=(0, 4), pady=6)
+
         n_missing = sum(len(eps) for eps in r["missing"].values())
         n_seasons = len(r["missing"])
         ai_verdict = r.get("ai_verdict")
@@ -7766,6 +8292,8 @@ class App(_AppBase):
         trending_lbl = ctk.CTkLabel(header_row, text=format_trending_score(score), width=cw("trending"),
                                     font=self._missing_ep_summary_font, text_color=PENDING_COLOR)
         trending_lbl.pack(side="left", padx=(0, 4), pady=6)
+        attach_tooltip(trending_lbl, lambda row=r: explain_trending_score(
+            row.get("play_count", 0), row.get("last_played_ts"), _time.time()))
 
         btn_text = "Restaurar" if r.get("ignored") else "Ignorar"
         ctk.CTkButton(header_row, text=btn_text, width=cw("ignore"), fg_color="transparent", border_width=1,
@@ -7920,12 +8448,20 @@ class App(_AppBase):
             # rectángulo redondeado en un canvas propio, y ese redondeado
             # deja un halo/marco visible alrededor del texto. CTkLabel no
             # dibuja ningún rectángulo, solo el texto.
+            season_air_date = (r.get("season_air_dates") or {}).get(season, "")
             toggle_btn = ctk.CTkLabel(
-                header_fr, text=f"{arrow} Temporada {season} ({len(lines)} episodios)",
-                font=season_font, anchor="w", width=220, cursor="hand2")
+                header_fr,
+                text=self._missing_ep_season_header_text(season, len(lines), season_air_date, arrow=arrow),
+                font=season_font, anchor="w", width=280, cursor="hand2")
             toggle_btn.pack(side="left")
             toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, s=season:
                             self._toggle_missing_ep_season_expand(tid, s))
+            season_ignored = season in (r.get("ignored_seasons") or set())
+            ctk.CTkButton(
+                header_fr, text="Restaurar" if season_ignored else "Ignorar temporada",
+                width=110, height=22, fg_color="transparent", border_width=1,
+                command=lambda tid=tmdb_id, s=season, ig=not season_ignored:
+                self._toggle_missing_ep_season_ignore(tid, s, ig)).pack(side="left", padx=(6, 0))
             season_vars = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season}
             for link in season_links:
                 template = link.get("url_template", "")
@@ -7980,13 +8516,24 @@ class App(_AppBase):
         episode_links = self.config_data.get("custom_links_episode", [])
 
         ep_row = 0
-        for _season, ep, title, name in widgets["lines"]:
+        for _season, ep, title, name, air_date in widgets["lines"]:
             ctk.CTkLabel(episodes_fr, text=name, font=detail_font, text_color=PENDING_COLOR,
                          anchor="w").grid(row=ep_row, column=0, sticky="w", pady=1)
-            btn_col = 1
+            ctk.CTkLabel(episodes_fr, text=_fmt_air_date(air_date), font=detail_font,
+                         text_color=PENDING_COLOR, anchor="w", width=80).grid(
+                row=ep_row, column=1, sticky="w", padx=(8, 0), pady=1)
+            btn_col = 2
             ctk.CTkButton(episodes_fr, text="📋", width=28, height=22, fg_color="transparent",
                           border_width=1, command=lambda n=name: self._copy_to_clipboard(n)).grid(
                 row=ep_row, column=btn_col, padx=(6, 0), pady=1)
+            btn_col += 1
+            ep_ignored = ep in (r.get("ignored_episodes") or {}).get(season, set())
+            ctk.CTkButton(
+                episodes_fr, text="Restaurar" if ep_ignored else "Ignorar", width=70, height=22,
+                fg_color="transparent", border_width=1,
+                command=lambda tid=tmdb_id, s=season, e=ep, ig=not ep_ignored:
+                self._toggle_missing_ep_episode_ignore(tid, s, e, ig)).grid(
+                row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             variables = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season,
                         "episodio": ep, "titulo": title, "nombre_archivo": name}
             for link in episode_links:
@@ -8015,7 +8562,9 @@ class App(_AppBase):
         if widgets is None:
             return   # la temporada no está visible ahora mismo (serie colapsada) -- nada que actualizar
         arrow = "v" if expand_now else ">"
-        widgets["toggle_btn"].configure(text=f"{arrow} Temporada {season} ({widgets['n_eps']} episodios)")
+        season_air_date = (widgets["r"].get("season_air_dates") or {}).get(season, "")
+        widgets["toggle_btn"].configure(
+            text=self._missing_ep_season_header_text(season, widgets["n_eps"], season_air_date, arrow=arrow))
         if expand_now:
             self._build_missing_ep_season_episode_rows(season_key)
             widgets["episodes_fr"].grid()
@@ -8069,6 +8618,14 @@ class App(_AppBase):
         # a la IA solo necesita los recuentos por temporada, ya calculados
         # de antemano en el propio escaneo, no depende del póster/sinopsis.
         self._missing_ep_ai_ask_btn.configure(state="normal")
+        # El árbol de archivos es de la serie anterior -- se colapsa y se
+        # olvida la ruta ya lista (_missing_ep_ftp_tree_loaded_for) para
+        # no mostrar por un instante el árbol de OTRA serie mientras llega
+        # la ruta nueva (ver _update_missing_ep_path_label más abajo).
+        self._missing_ep_ftp_tree_expanded = False
+        self._missing_ep_ftp_tree_ruta = None
+        self._missing_ep_ftp_tree_loaded_for = None
+        self._missing_ep_ftp_tree_box.pack_forget()
         token = object()
         self._missing_ep_poster_token = token
         self._update_missing_ep_path_label(r, token)
@@ -8133,6 +8690,15 @@ class App(_AppBase):
                 text += "\n🎙 Doblaje castellano: sin recorte encontrado (parece completo, o sin datos fiables)"
         self._missing_ep_ai_verdict_lbl.configure(text=text)
 
+    @staticmethod
+    def _missing_ep_known_year(r: dict):
+        """Año de estreno de *r* (de first_air_date, "AAAA-MM-DD") como
+        texto de 4 dígitos, o None si no se conoce -- para
+        find_existing_category_folder/_match_ftp_present, ver
+        core.series_match.best_match_with_year."""
+        year = (r.get("first_air_date") or "")[:4]
+        return year if year.isdigit() else None
+
     def _missing_ep_series_path(self, r: dict, use_cache_only: bool = True, ftp_conn=None) -> str:
         """Ruta de la carpeta de la serie en el FTP, si ya existe (p.ej.
         "/datos2/series/La nena") -- para el {ruta} de los enlaces
@@ -8176,7 +8742,8 @@ class App(_AppBase):
         # español) vs carpeta real "Accused" ya tuvo en el botón de borrar.
         info = types.SimpleNamespace(title=r["name"], media_type="tv", folder_name=r.get("folder_name"))
         category, folder_name = self._find_category_with_existing_folder(
-            ftp_conn or self.ftp, info, use_cache_only=use_cache_only)
+            ftp_conn or self.ftp, info, use_cache_only=use_cache_only,
+            known_year=self._missing_ep_known_year(r))
         if not category or not folder_name:
             return ""
         return f"{category.get('root', '').rstrip('/')}/{folder_name}"
@@ -8192,9 +8759,10 @@ class App(_AppBase):
         patrón que _missing_ep_poster_token para el póster)."""
         ruta = self._missing_ep_series_path(r, use_cache_only=True)
         if ruta:
-            self._missing_ep_path_lbl.configure(text=f"📁 {ruta}", text_color=PENDING_COLOR)
+            self._set_missing_ep_ftp_tree_ruta(ruta)
             return
 
+        self._missing_ep_ftp_tree_ruta = None
         self._missing_ep_path_lbl.configure(text="📁 Buscando la carpeta en el FTP...", text_color=PENDING_COLOR)
 
         def worker():
@@ -8219,10 +8787,79 @@ class App(_AppBase):
         if self._missing_ep_poster_token is not token:
             return   # el usuario ya pulsó otra serie mientras se buscaba -- no pisar su etiqueta
         if ruta:
-            self._missing_ep_path_lbl.configure(text=f"📁 {ruta}", text_color=PENDING_COLOR)
+            self._set_missing_ep_ftp_tree_ruta(ruta)
         else:
+            self._missing_ep_ftp_tree_ruta = None
             self._missing_ep_path_lbl.configure(text="📁 No se encontró la carpeta en el FTP",
                                                 text_color=WARNING_COLOR)
+
+    def _set_missing_ep_ftp_tree_ruta(self, ruta: str):
+        """Fija la ruta que representa el desplegable del árbol de
+        archivos (ver _toggle_missing_ep_ftp_tree) y refresca la etiqueta
+        con la flecha ">"/"v" delante -- llamado en cuanto
+        _update_missing_ep_path_label/_apply_missing_ep_path_label
+        encuentran una ruta real (nunca con "Buscando..."/"No
+        encontrada", que no tienen nada que desplegar)."""
+        self._missing_ep_ftp_tree_ruta = ruta
+        arrow = "v" if self._missing_ep_ftp_tree_expanded else ">"
+        self._missing_ep_path_lbl.configure(text=f"{arrow} 📁 {ruta}", text_color=PENDING_COLOR)
+
+    def _toggle_missing_ep_ftp_tree(self):
+        """Despliega/colapsa el árbol de archivos de la carpeta de la
+        serie en el FTP, justo debajo de la ruta y encima de "Preguntar a
+        la IA" -- pulsando la propia ruta, como si fuese un desplegable.
+        Sin ruta conocida todavía (aún buscando, o no encontrada) no hay
+        nada que desplegar. El árbol se lista una sola vez por ruta
+        (_missing_ep_ftp_tree_loaded_for) -- colapsar y volver a desplegar
+        la misma serie no repite la conexión FTP."""
+        ruta = self._missing_ep_ftp_tree_ruta
+        if not ruta:
+            return
+        self._missing_ep_ftp_tree_expanded = not self._missing_ep_ftp_tree_expanded
+        arrow = "v" if self._missing_ep_ftp_tree_expanded else ">"
+        self._missing_ep_path_lbl.configure(text=f"{arrow} 📁 {ruta}")
+
+        if not self._missing_ep_ftp_tree_expanded:
+            self._missing_ep_ftp_tree_box.pack_forget()
+            return
+
+        self._missing_ep_ftp_tree_box.pack(pady=(0, 4), fill="x", before=self._missing_ep_ai_ask_btn)
+        if self._missing_ep_ftp_tree_loaded_for == ruta:
+            return   # ya en cache -- no hace falta volver a listar
+
+        self._set_textbox_text(self._missing_ep_ftp_tree_box, "Listando el árbol de archivos...")
+        token = self._missing_ep_poster_token
+
+        def worker():
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            try:
+                own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                tree = own_ftp.get_folder_tree(ruta)
+            except Exception:
+                tree = None
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._apply_missing_ep_ftp_tree(token, ruta, tree))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_missing_ep_ftp_tree(self, token, ruta: str, tree):
+        if self._missing_ep_poster_token is not token:
+            return   # el usuario ya cambió de serie mientras se listaba
+        if ruta != self._missing_ep_ftp_tree_ruta or not self._missing_ep_ftp_tree_expanded:
+            return   # colapsó el árbol (o cambió de ruta) antes de que terminara de listar
+        if tree is None:
+            self._set_textbox_text(self._missing_ep_ftp_tree_box, "No se pudo listar la carpeta en el FTP.")
+            return
+        from core.ftp_client import format_ftp_tree
+        text = format_ftp_tree(ruta, tree)
+        self._set_textbox_text(self._missing_ep_ftp_tree_box, text or "Carpeta vacía.")
+        self._missing_ep_ftp_tree_loaded_for = ruta
 
     def _render_missing_ep_show_links(self, r: dict):
         """Botones de los enlaces personalizables (Ajustes) a nivel serie
@@ -8479,20 +9116,36 @@ class App(_AppBase):
         except Exception:
             pass
 
+    @staticmethod
+    def _missing_ep_season_header_text(season: int, n_eps: int, air_date: str, arrow: str = ">") -> str:
+        """Texto del desplegable "Temporada N (M episodios)" -- compartido
+        entre la primera construcción (_build_missing_ep_detail_frame) y el
+        refresco al expandir/colapsar (_toggle_missing_ep_season_expand),
+        para que no diverjan. Añade la fecha de estreno de la temporada
+        cuando se conoce (ver r["season_air_dates"], viene de
+        details["seasons"][i]["air_date"] de TMDB)."""
+        text = f"{arrow} Temporada {season} ({n_eps} episodios)"
+        formatted = _fmt_air_date(air_date)
+        if formatted:
+            text += f" -- estrenada {formatted}"
+        return text
+
     def _missing_episode_lines(self, r: dict) -> list:
-        """Una entrada (temporada, episodio, título, nombre_archivo) por
-        episodio que falta -- el nombre de archivo sigue la plantilla de TV
-        configurada por el usuario, así se reconocen igual que verían el
-        archivo ya renombrado en disco, en vez del formato interno "T1E05".
-        Si no se conoce el título del episodio (huecos venidos de una
-        caché antigua, o de un fallo puntual de TMDB), se deja "{titulo}"
-        vacío en vez de omitirlo."""
+        """Una entrada (temporada, episodio, título, nombre_archivo,
+        fecha_estreno) por episodio que falta -- el nombre de archivo sigue
+        la plantilla de TV configurada por el usuario, así se reconocen
+        igual que verían el archivo ya renombrado en disco, en vez del
+        formato interno "T1E05". Si no se conoce el título/la fecha del
+        episodio (huecos venidos de una caché antigua, o de un fallo
+        puntual de TMDB), se dejan vacíos en vez de omitir la línea."""
         template = self.config_data.get("tv_template")
         episode_titles = r.get("episode_titles") or {}
+        episode_air_dates = r.get("episode_air_dates") or {}
         lines = []
         for season in sorted(r["missing"]):
             for ep in r["missing"][season]:
                 title = episode_titles.get(season, {}).get(ep, "")
+                air_date = episode_air_dates.get(season, {}).get(ep, "")
                 info = MediaInfo(tmdb_id=r["tmdb_id"], media_type="tv", title=r["name"],
                                  original_title=r["name"], year="", season=season,
                                  episode=ep, episode_title=title)
@@ -8502,7 +9155,7 @@ class App(_AppBase):
                     name = f"T{season}E{ep:02d}"
                 else:
                     name = name.rsplit(".", 1)[0]   # quitar la extension ficticia -- no es un archivo real
-                lines.append((season, ep, title, name))
+                lines.append((season, ep, title, name, air_date))
         return lines
 
     def _toggle_missing_ep_ignore(self, tmdb_id, ignored: bool):
@@ -8511,6 +9164,34 @@ class App(_AppBase):
             if r["tmdb_id"] == tmdb_id:
                 r["ignored"] = ignored
         self._update_missing_ep_status_text()
+        self._render_missing_episodes_table(reset_page=False)
+
+    def _toggle_missing_ep_season_ignore(self, tmdb_id, season: int, ignored: bool):
+        """"Ignorar temporada" -- mismo mecanismo que _toggle_missing_ep_ignore
+        (serie completa) pero a nivel de UNA temporada: se oculta del
+        recuento de huecos de esa serie (sin desaparecer del todo -- se
+        puede volver a ver/deshacer marcando "Mostrar ignoradas", ver
+        _visible_missing_ep_row/apply_ignored_filter)."""
+        self._set_missing_episode_season_ignored(tmdb_id, season, ignored)
+        for r in self._missing_ep_results:
+            if r["tmdb_id"] == tmdb_id:
+                seasons = set(r.get("ignored_seasons") or [])
+                seasons.add(season) if ignored else seasons.discard(season)
+                r["ignored_seasons"] = seasons
+        self._render_missing_episodes_table(reset_page=False)
+
+    def _toggle_missing_ep_episode_ignore(self, tmdb_id, season: int, episode: int, ignored: bool):
+        """"Ignorar capítulo" -- igual que _toggle_missing_ep_season_ignore
+        pero para UN episodio suelto."""
+        self._set_missing_episode_episode_ignored(tmdb_id, season, episode, ignored)
+        for r in self._missing_ep_results:
+            if r["tmdb_id"] == tmdb_id:
+                ignored_eps = {s: set(eps) for s, eps in (r.get("ignored_episodes") or {}).items()}
+                eps = ignored_eps.setdefault(season, set())
+                eps.add(episode) if ignored else eps.discard(episode)
+                if not eps:
+                    ignored_eps.pop(season, None)
+                r["ignored_episodes"] = ignored_eps
         self._render_missing_episodes_table(reset_page=False)
 
     # ── Borrar serie desde Episodios que faltan -- mismo diálogo de
@@ -8555,29 +9236,35 @@ class App(_AppBase):
 
         def worker():
             try:
-                results = self._rescan_single_series_worker(r)
+                results, removed_reason = self._rescan_single_series_worker(r)
             except Exception:
                 _log.exception("Reescaneo de '%s' (tmdb_id=%s): fallo inesperado", name, tmdb_id)
                 self.after(0, lambda: self._set_status(
                     f"Error al reescanear \"{name}\" -- revisa app.log", ERROR_COLOR))
                 self.after(0, lambda: self._finish_single_missing_ep_rescan(tmdb_id, name, None))
                 return
-            self.after(0, lambda: self._finish_single_missing_ep_rescan(tmdb_id, name, results))
+            self.after(0, lambda: self._finish_single_missing_ep_rescan(tmdb_id, name, results, removed_reason))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _rescan_single_series_worker(self, r: dict) -> list:
+    def _rescan_single_series_worker(self, r: dict) -> tuple:
         """Hilo de fondo de _rescan_single_missing_ep_series -- misma
         lógica que el bucle principal de _scan_missing_episodes para UNA
         serie (recomprobación siempre forzada, como un hueco visto antes),
         más el cruce con el FTP acotado a su propia carpeta (ver
-        _cross_check_single_result_with_ftp). Devuelve una lista con 0 o 1
-        filas, mismo contrato que espera _finish_single_missing_ep_rescan."""
+        _cross_check_single_result_with_ftp). Devuelve (resultados,
+        motivo_de_borrado) -- resultados es una lista con 0 o 1 filas,
+        mismo contrato que ya esperaba _finish_single_missing_ep_rescan;
+        motivo_de_borrado es None salvo cuando resultados == [] porque la
+        serie ya no existe en el servidor de medios (ver más abajo), para
+        poder mostrar un mensaje que diga POR QUÉ se quitó en vez del
+        genérico "ya no tiene huecos"."""
         from core.media_server_refresh import (get_jellyfin_episodes, get_plex_episodes,
-                                               get_jellyfin_series_item, get_plex_series_item)
+                                               get_jellyfin_series_item, get_plex_series_item,
+                                               ITEM_NOT_FOUND)
         from core.missing_episodes import (find_missing_episodes, format_missing_summary,
                                            apply_season_split_filter, find_unknown_seasons,
                                            looks_like_absolute_numbering, remap_absolute_episodes)
-        from core.missing_episodes_cache import load_cache, save_cache
+        from core.missing_episodes_cache import load_cache, save_cache, remove_series_from_cache
 
         old_tmdb_id = r["tmdb_id"]
         tmdb_id = old_tmdb_id
@@ -8585,6 +9272,12 @@ class App(_AppBase):
         source = r.get("source")
         server_id = r.get("server_id")
         folder_name = r.get("folder_name")
+        # "Ignorar capítulo"/"Ignorar temporada" (ver
+        # _toggle_missing_ep_season_ignore/_episode_ignore) tienen que
+        # sobrevivir a reescanear esta serie sola, igual que "ignored"
+        # (serie entera, línea de abajo).
+        ignored_seasons = set(r.get("ignored_seasons") or [])
+        ignored_episodes = {s: set(eps) for s, eps in (r.get("ignored_episodes") or {}).items()}
         if not source or not server_id:
             # Fila de antes de que estos campos se guardaran en caché --
             # sin ellos no hay atajo posible, hace falta un reescaneo
@@ -8592,7 +9285,7 @@ class App(_AppBase):
             # reescanear esta serie sola la próxima vez.
             self.after(0, lambda: self._set_status(
                 f"\"{name}\" necesita un reescaneo completo antes de poder reescanearse sola", WARNING_COLOR))
-            return [r]
+            return [r], None
 
         # Releer la ficha ACTUAL de esta serie en el servidor (no solo sus
         # episodios) -- si el usuario corrigió a mano la identificación en
@@ -8607,6 +9300,21 @@ class App(_AppBase):
         else:
             item = get_plex_series_item(self.config_data.get("plex_host", ""),
                                         self.config_data.get("plex_token", ""), server_id)
+        if item is ITEM_NOT_FOUND:
+            # A diferencia de item is None (fallo de red/timeout, podría
+            # ser algo temporal -- se deja la fila tal cual, ver más
+            # abajo), esto es una respuesta confirmada del servidor: esa
+            # serie ya no existe en su biblioteca (se borró). No tiene
+            # sentido seguir vigilando huecos de algo que ya no está, así
+            # que se quita de la caché aquí mismo -- igual que ya hace un
+            # reescaneo completo con las series que desaparecen (ver
+            # _scan_missing_episodes).
+            cache = dict(load_cache())
+            remove_series_from_cache(cache, old_tmdb_id)
+            save_cache(cache)
+            self._push_missing_episodes_to_ftp()
+            server_label = "Jellyfin" if source == "jellyfin" else "Plex"
+            return [], f"ya no está en {server_label}"
         if item and item.get("tmdb_id"):
             if item["tmdb_id"] != old_tmdb_id:
                 _log.info("Reescaneo individual: '%s' cambió de tmdb_id %s -> %s (identificación "
@@ -8616,6 +9324,7 @@ class App(_AppBase):
             folder_name = item.get("folder_name", folder_name)   # Plex no lo trae, se conserva el de antes
 
         details = self.tmdb.get_tv_details(tmdb_id)
+        first_air_date = details.get("first_air_date", "") or ""
         if source == "jellyfin":
             present = get_jellyfin_episodes(self.config_data.get("jellyfin_host", ""),
                                             self.config_data.get("jellyfin_api_key", ""), server_id)
@@ -8623,10 +9332,12 @@ class App(_AppBase):
             present = get_plex_episodes(self.config_data.get("plex_host", ""),
                                         self.config_data.get("plex_token", ""), server_id)
         if present is None:
-            return [r]   # sin dato fiable ahora mismo -- se deja la fila tal cual
+            return [r], None   # sin dato fiable ahora mismo -- se deja la fila tal cual
 
         expected = {}
         episode_titles = {}
+        season_air_dates = {}
+        episode_air_dates = {}
         for season in details.get("seasons", []):
             n = season.get("season_number", 0)
             if n <= 0:   # temporada 0 = especiales, no cuenta como hueco
@@ -8640,6 +9351,9 @@ class App(_AppBase):
                 expected[n] = nums
                 episode_titles[n] = {e["episode_number"]: e.get("name", "") for e in eps
                                      if e.get("episode_number")}
+                season_air_dates[n] = season.get("air_date", "") or ""
+                episode_air_dates[n] = {e["episode_number"]: e.get("air_date", "") for e in eps
+                                        if e.get("episode_number")}
 
         season_episode_counts = {s: len(eps) for s, eps in expected.items()}
         absolute_numbering = looks_like_absolute_numbering(season_episode_counts, present)
@@ -8666,6 +9380,12 @@ class App(_AppBase):
             "unknown_seasons": sorted(unknown_seasons),
             "present_season_counts": {str(k): v for k, v in present_season_counts.items()},
             "absolute_numbering": absolute_numbering,
+            "first_air_date": first_air_date,
+            "season_air_dates": {str(s): d for s, d in season_air_dates.items()},
+            "episode_air_dates": {str(s): {str(e): d for e, d in eps.items()}
+                                  for s, eps in episode_air_dates.items()},
+            "ignored_seasons": sorted(ignored_seasons),
+            "ignored_episodes": {str(s): sorted(eps) for s, eps in ignored_episodes.items()},
             "ignored": r.get("ignored", False),
             "play_count": r.get("play_count", 0),
             "last_played_ts": r.get("last_played_ts"),
@@ -8680,7 +9400,7 @@ class App(_AppBase):
         if not (missing or unknown_seasons):
             save_cache(cache)
             self._push_missing_episodes_to_ftp()
-            return []   # ya no le falta nada -- se quita de la lista
+            return [], None   # ya no le falta nada -- se quita de la lista
 
         # missing aquí es SOLO para mostrar -- cache_entry["missing"] se
         # corrige más abajo, tras el cruce con el FTP, antes de guardar.
@@ -8698,6 +9418,11 @@ class App(_AppBase):
             "ai_verdict": r.get("ai_verdict") if tmdb_id == old_tmdb_id else None,
             "absolute_numbering": absolute_numbering,
             "folder_name": folder_name,
+            "first_air_date": first_air_date,
+            "season_air_dates": season_air_dates,
+            "episode_air_dates": episode_air_dates,
+            "ignored_seasons": ignored_seasons,
+            "ignored_episodes": ignored_episodes,
         }
         new_row = self._cross_check_single_result_with_ftp(new_row)
         # Propagar la corrección del cruce FTP a la caché de disco -- antes
@@ -8713,14 +9438,17 @@ class App(_AppBase):
         self._push_missing_episodes_to_ftp()
 
         if not (new_row["missing"] or new_row["unknown_seasons"]):
-            return []
-        return [new_row]
+            return [], None
+        return [new_row], None
 
-    def _finish_single_missing_ep_rescan(self, tmdb_id: int, name: str, results):
+    def _finish_single_missing_ep_rescan(self, tmdb_id: int, name: str, results, removed_reason: str = None):
         """results es None si el reescaneo falló (se deja la fila tal cual
         estaba); si no, 0 o 1 filas -- se sustituye la fila vieja de esta
         serie (si había) por el resultado nuevo, o se quita de la lista si
-        ya no le falta nada. El tmdb_id del resultado puede ser DISTINTO
+        ya no le falta nada (o si ya no existe en el servidor de medios,
+        ver removed_reason/_rescan_single_series_worker -- el mensaje dice
+        POR QUÉ se quitó en vez del genérico "ya no tiene huecos" cuando se
+        conoce el motivo real). El tmdb_id del resultado puede ser DISTINTO
         al que se pasó aquí -- ver _rescan_single_series_worker, releer
         la ficha corrige una identificación equivocada -- así que también
         se quita cualquier fila que ya hubiera con el tmdb_id nuevo, para
@@ -8731,6 +9459,8 @@ class App(_AppBase):
             self._missing_ep_results.extend(results)
             if results:
                 self._set_status(f"\"{name}\" actualizada", SUCCESS_COLOR)
+            elif removed_reason:
+                self._set_status(f"\"{name}\" {removed_reason} -- se quitó de la lista", WARNING_COLOR)
             else:
                 self._set_status(f"\"{name}\" ya no tiene huecos -- se quitó de la lista", SUCCESS_COLOR)
             self._render_missing_episodes_table(reset_page=False)
@@ -8760,7 +9490,8 @@ class App(_AppBase):
         try:
             known_folder = r.get("folder_name")
             info = types.SimpleNamespace(title=r["name"], media_type="tv", folder_name=known_folder)
-            cat, folder_name = self._find_category_with_existing_folder(own_ftp, info, force_refresh=True)
+            cat, folder_name = self._find_category_with_existing_folder(
+                own_ftp, info, force_refresh=True, known_year=self._missing_ep_known_year(r))
             if not folder_name:
                 # Diagnóstico para la próxima vez que esto falle: sin esto,
                 # "no encontrado" no dice si es que r["folder_name"] estaba
@@ -8937,6 +9668,7 @@ class App(_AppBase):
                 "missing": missing, "summary": format_missing_summary(name, missing),
                 "ignored": ignored, "episode_titles": {}, "split_seasons": split_seasons,
                 "unknown_seasons": unknown_seasons or set(),
+                "ignored_seasons": set(), "ignored_episodes": {},
                 "play_count": usage.get("play_count", 0),
                 "last_played_ts": parse_media_date(usage.get("last_played")),
                 # Lista real de episodios que debería tener cada temporada
@@ -8974,6 +9706,14 @@ class App(_AppBase):
             key = str(tmdb_id)
             cached = cache.get(key)
             ignored = bool(cached and cached.get("ignored", False))
+            # "Ignorar capítulo"/"Ignorar temporada" (ver
+            # _toggle_missing_ep_season_ignore/_episode_ignore) tienen que
+            # sobrevivir a un reescaneo igual que "ignored" (serie entera) --
+            # se leen de la caché ANTERIOR y se vuelven a escribir tal cual
+            # más abajo, el escaneo en sí no decide nada sobre esto.
+            cached_ignored_seasons = set((cached or {}).get("ignored_seasons") or [])
+            cached_ignored_episodes = {int(s): set(eps) for s, eps in
+                                       (cached or {}).get("ignored_episodes", {}).items()}
 
             try:
                 details = self.tmdb.get_tv_details(tmdb_id)
@@ -8994,10 +9734,23 @@ class App(_AppBase):
                     row["episode_titles"] = {int(s): {int(e): t for e, t in eps.items()}
                                              for s, eps in cached.get("episode_titles", {}).items()}
                     row["absolute_numbering"] = cached.get("absolute_numbering", False)
+                    row["first_air_date"] = cached.get("first_air_date", "")
+                    row["season_air_dates"] = {int(s): d for s, d in
+                                               cached.get("season_air_dates", {}).items()}
+                    row["episode_air_dates"] = {int(s): {int(e): d for e, d in eps.items()}
+                                                for s, eps in cached.get("episode_air_dates", {}).items()}
+                    row["ignored_seasons"] = cached_ignored_seasons
+                    row["ignored_episodes"] = cached_ignored_episodes
                     results.append(row)
                     if on_result_cb:
                         on_result_cb(row)
                 continue
+
+            # Fecha de estreno de la SERIE -- ya viene de fábrica en la
+            # misma respuesta de get_tv_details() que ya se pide arriba
+            # para last_episode_to_air/seasons, no hace falta ninguna
+            # llamada aparte (ver core/api_client.py::get_tv_details).
+            first_air_date = details.get("first_air_date", "") or ""
 
             last_episode_id = (details.get("last_episode_to_air") or {}).get("id")
             had_gaps_before = bool(cached and cached.get("missing"))
@@ -9028,6 +9781,14 @@ class App(_AppBase):
             if needs_full_recheck:
                 expected = {}
                 episode_titles = {}
+                # season.get("air_date"): fecha de estreno de la TEMPORADA,
+                # ya viene dentro de details["seasons"] (misma respuesta de
+                # get_tv_details() de más arriba) -- no hace falta pedirla
+                # aparte. episode["air_date"] sí necesitó tocar
+                # get_season_episodes() (ver core/api_client.py) porque esa
+                # función descartaba el campo antes de devolver la lista.
+                season_air_dates = {}
+                episode_air_dates = {}
                 for season in details.get("seasons", []):
                     n = season.get("season_number", 0)
                     if n <= 0:   # temporada 0 = especiales, no cuenta como hueco
@@ -9041,10 +9802,16 @@ class App(_AppBase):
                         expected[n] = nums
                         episode_titles[n] = {e["episode_number"]: e.get("name", "") for e in eps
                                              if e.get("episode_number")}
+                        season_air_dates[n] = season.get("air_date", "") or ""
+                        episode_air_dates[n] = {e["episode_number"]: e.get("air_date", "") for e in eps
+                                                if e.get("episode_number")}
             else:
                 expected = {int(k): v for k, v in cached["expected"].items()}
                 episode_titles = {int(s): {int(e): t for e, t in eps.items()}
                                   for s, eps in cached.get("episode_titles", {}).items()}
+                season_air_dates = {int(s): d for s, d in cached.get("season_air_dates", {}).items()}
+                episode_air_dates = {int(s): {int(e): d for e, d in eps.items()}
+                                     for s, eps in cached.get("episode_air_dates", {}).items()}
 
             # Anime de muchos episodios (Naruto Shippuden y similares) suele
             # organizarse con numeración absoluta (episodio 262 de corrido)
@@ -9075,6 +9842,12 @@ class App(_AppBase):
                 "unknown_seasons": sorted(unknown_seasons),
                 "present_season_counts": {str(k): v for k, v in present_season_counts.items()},
                 "absolute_numbering": absolute_numbering,
+                "first_air_date": first_air_date,
+                "season_air_dates": {str(s): d for s, d in season_air_dates.items()},
+                "episode_air_dates": {str(s): {str(e): d for e, d in eps.items()}
+                                      for s, eps in episode_air_dates.items()},
+                "ignored_seasons": sorted(cached_ignored_seasons),
+                "ignored_episodes": {str(s): sorted(eps) for s, eps in cached_ignored_episodes.items()},
                 "ignored": ignored,
                 "play_count": usage.get("play_count", 0),
                 "last_played_ts": parse_media_date(usage.get("last_played")),
@@ -9101,6 +9874,11 @@ class App(_AppBase):
                           ai_verdict=self._ai_verdict_from_cache_entry(cached) if cached else None)
                 row["episode_titles"] = episode_titles
                 row["absolute_numbering"] = absolute_numbering
+                row["first_air_date"] = first_air_date
+                row["season_air_dates"] = season_air_dates
+                row["episode_air_dates"] = episode_air_dates
+                row["ignored_seasons"] = cached_ignored_seasons
+                row["ignored_episodes"] = cached_ignored_episodes
                 results.append(row)
                 if on_result_cb:
                     on_result_cb(row)
@@ -9440,7 +10218,8 @@ class App(_AppBase):
             if not new_expected:
                 _log.info("Cruce FTP: '%s' sin lista completa de episodios en caché, no se recalcula", r["name"])
                 continue   # sin la lista completa de episodios de TMDB no se puede recalcular el hueco
-            ftp_present = self._match_ftp_present(ftp_index, r["name"], r.get("folder_name"))
+            ftp_present = self._match_ftp_present(ftp_index, r["name"], r.get("folder_name"),
+                                                  known_year=self._missing_ep_known_year(r))
             if ftp_present is None:
                 _log.info("Cruce FTP: '%s' no se encontró en ninguna carpeta del FTP con confianza suficiente",
                           r["name"])
@@ -9495,7 +10274,8 @@ class App(_AppBase):
                 return result
             info = types.SimpleNamespace(title=result["name"], media_type="tv",
                                          folder_name=result.get("folder_name"))
-            category, folder_name = self._find_category_with_existing_folder(own_ftp, info, force_refresh=True)
+            category, folder_name = self._find_category_with_existing_folder(
+                own_ftp, info, force_refresh=True, known_year=self._missing_ep_known_year(result))
             if not folder_name:
                 _log.info("Cruce FTP (individual): '%s' no se encontró en ninguna categoría del FTP",
                           result["name"])
@@ -9541,16 +10321,20 @@ class App(_AppBase):
         return result
 
     @staticmethod
-    def _match_ftp_present(ftp_index: dict, show_name: str, known_folder_name: str = None):
+    def _match_ftp_present(ftp_index: dict, show_name: str, known_folder_name: str = None,
+                           known_year: str = None):
         """Busca *show_name* entre todas las carpetas de todas las
         categorías del índice FTP (misma confianza que
         _find_category_with_existing_folder: nombre real ya conocido si
         se pasa known_folder_name -- ver get_jellyfin_series::folder_name,
         para series cuyo nombre mostrado está traducido y no se parece en
         nada al de su carpeta real ("Acusado" vs "Accused") --, si no,
-        nombre exacto tras sanear, o ratio >= 0.90). Devuelve el set de
-        episodios encontrados en esa carpeta, o None si no hay ninguna
-        coincidencia de esa confianza."""
+        nombre exacto tras sanear, o ratio >= 0.90; known_year, ver
+        core.series_match.best_match_with_year, para cuando la carpeta
+        real lleva el año de estreno para distinguir un remake del
+        original y show_name no lo trae). Devuelve el set de episodios
+        encontrados en esa carpeta, o None si no hay ninguna coincidencia
+        de esa confianza."""
         sanitized_desired = _ftp_safe(show_name)
         best_candidate, best_ratio = None, 0.0
         for folders in ftp_index.values():
@@ -9566,6 +10350,11 @@ class App(_AppBase):
                 return folders[candidate]
             if candidate and ratio > best_ratio:
                 best_candidate, best_ratio = candidate, ratio
+            if known_year:
+                from core.series_match import best_match_with_year
+                yr_candidate, yr_ratio = best_match_with_year(show_name, list(folders.keys()), known_year)
+                if yr_candidate:
+                    return folders[yr_candidate]
         if best_candidate:
             _log.info("Cruce FTP: '%s' -- candidato más parecido '%s' con ratio %.2f "
                       "(hace falta >= 0.90 para reutilizarlo en silencio)",
@@ -9582,6 +10371,43 @@ class App(_AppBase):
         if key in cache:
             cache[key]["ignored"] = ignored
             save_cache(cache)
+
+    def _set_missing_episode_season_ignored(self, tmdb_id, season: int, ignored: bool) -> None:
+        """Igual que _set_missing_episode_ignored, pero para UNA temporada
+        concreta en vez de la serie entera -- ver
+        _toggle_missing_ep_season_ignore."""
+        from core.missing_episodes_cache import load_cache, save_cache
+        cache = dict(load_cache())
+        key = str(tmdb_id)
+        if key not in cache:
+            return
+        seasons = set(cache[key].get("ignored_seasons", []))
+        if ignored:
+            seasons.add(season)
+        else:
+            seasons.discard(season)
+        cache[key]["ignored_seasons"] = sorted(seasons)
+        save_cache(cache)
+
+    def _set_missing_episode_episode_ignored(self, tmdb_id, season: int, episode: int,
+                                              ignored: bool) -> None:
+        """Igual que _set_missing_episode_ignored, pero para UN episodio
+        suelto -- ver _toggle_missing_ep_episode_ignore."""
+        from core.missing_episodes_cache import load_cache, save_cache
+        cache = dict(load_cache())
+        key = str(tmdb_id)
+        if key not in cache:
+            return
+        ignored_eps = {int(s): set(v) for s, v in (cache[key].get("ignored_episodes") or {}).items()}
+        eps = ignored_eps.setdefault(season, set())
+        if ignored:
+            eps.add(episode)
+        else:
+            eps.discard(episode)
+        if not eps:
+            ignored_eps.pop(season, None)
+        cache[key]["ignored_episodes"] = {str(s): sorted(v) for s, v in ignored_eps.items()}
+        save_cache(cache)
 
     # ── Exportar / Importar configuración ──
 
@@ -12208,7 +13034,7 @@ class App(_AppBase):
             self._render_missing_ep_show_links(self._missing_ep_current_row)
 
     def _set_status(self, msg, color=None):
-        self._status_lbl.configure(text=msg, text_color=color or ACCENT)
+        self._status_bar_center.configure(text=msg, text_color=color or ACCENT)
 
     # ──────────────────────────────────────── Bandeja del sistema ──
 
@@ -12574,7 +13400,15 @@ class App(_AppBase):
             else:
                 menu.add_command(label="📕 Tratar como cómic/manga (ComicVine)",
                                  command=lambda: self._set_book_comic_type(entry, is_comic=True))
-        if entry.media_info and entry.status in ("listo", "renombrado", "error", "omitido"):
+        # Igual de permisivo que el botón ▲ propio de la fila (que nunca
+        # comprueba el estado, ver _refresh_table) -- antes esto excluía
+        # "subido", así que un archivo ya subido no se podía volver a subir
+        # desde el menú contextual (p.ej. tras corregir el título/episodio
+        # o la carpeta de destino después de haberlo subido) aunque el
+        # botón de su fila sí lo permitiera -- solo se descartan los
+        # estados donde ya hay una subida realmente en marcha o en cola,
+        # que repetir no tiene sentido.
+        if entry.media_info and entry.status not in ("subiendo", "en_cola"):
             menu.add_command(label="▲  Subir este archivo", command=lambda: self._upload_one(entry))
         menu.add_command(label="✎  Editar título/episodio detectado…",
                          command=lambda: self._edit_detected(entry))
@@ -12642,6 +13476,41 @@ class App(_AppBase):
         self._refresh_ftp_columns()
 
     # ──────────────────────────────────────── Notificaciones de escritorio ──
+
+    _UPLOAD_NOTIFICATION_DEBOUNCE_MS = 8000   # ver _queue_upload_notification
+
+    def _queue_upload_notification(self, fname: str):
+        """Encola *fname* para la notificación de "Subida completada" en
+        vez de mandarla al momento -- con un lote grande (el usuario
+        vuelve al PC tras dejar muchos archivos subiendo, ya fuera a mano
+        o con el modo automático), notificar uno a uno según van
+        terminando (cada pocos segundos, al ritmo de las subidas) era muy
+        molesto. El temporizador se reinicia con CADA subida completada
+        (self.after_cancel + after de nuevo) -- mientras sigan llegando no
+        se manda nada; solo cuando la racha se queda quieta
+        _UPLOAD_NOTIFICATION_DEBOUNCE_MS de verdad se manda una única
+        notificación resumen (ver _flush_upload_notifications). Con una
+        sola subida suelta, el efecto es el mismo de siempre con un
+        pequeño retraso."""
+        self._pending_upload_notifications.append(fname)
+        if self._upload_notification_after_id is not None:
+            self.after_cancel(self._upload_notification_after_id)
+        self._upload_notification_after_id = self.after(
+            self._UPLOAD_NOTIFICATION_DEBOUNCE_MS, self._flush_upload_notifications)
+
+    def _flush_upload_notifications(self):
+        self._upload_notification_after_id = None
+        pending = self._pending_upload_notifications
+        self._pending_upload_notifications = []
+        if not pending:
+            return
+        if len(pending) == 1:
+            self._send_notification("aRenombrar — Subida completada", pending[0])
+            return
+        preview = ", ".join(pending[:3])
+        if len(pending) > 3:
+            preview += f" y {len(pending) - 3} más"
+        self._send_notification(f"aRenombrar — {len(pending)} subidas completadas", preview)
 
     def _send_notification(self, title: str, msg: str):
         """Envía una notificación de escritorio si está habilitada en config."""
@@ -14046,9 +14915,11 @@ class App(_AppBase):
         reason_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
 
         score = trending_score(item.play_count, item.last_played_ts, _time.time())
-        ctk.CTkLabel(row, text=format_trending_score(score), width=cw("tendencia"),
-                     font=self._cleanup_reason_font, text_color=PENDING_COLOR).pack(
-            side="left", padx=(4, 4), pady=6)
+        trending_lbl = ctk.CTkLabel(row, text=format_trending_score(score), width=cw("tendencia"),
+                     font=self._cleanup_reason_font, text_color=PENDING_COLOR)
+        trending_lbl.pack(side="left", padx=(4, 4), pady=6)
+        attach_tooltip(trending_lbl, lambda it=item: explain_trending_score(
+            it.play_count, it.last_played_ts, _time.time()))
 
         is_fav = self._is_favorite(item.media_type, item.tmdb_id)
         is_res = self._is_reserved(item.media_type, item.tmdb_id)
