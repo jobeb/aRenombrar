@@ -40,6 +40,8 @@ class CleanupItem:
     last_played_ts: Optional[float] = None   # epoch segundos, None = nunca reproducida
     date_added_ts: Optional[float] = None    # epoch segundos, None = fecha desconocida
     loose_file_paths: Optional[list] = None  # rutas completas si es un grupo de archivos sueltos, no una carpeta (ver group_loose_files_by_name)
+    source: str = ""      # "jellyfin" | "plex" | "" si no se encontró en ningún servidor de medios
+    server_id: str = ""   # Id de Jellyfin o ratingKey de Plex -- para "abrir en Jellyfin/Plex" (ver gui/app.py::_open_in_media_server)
 
 
 @dataclass
@@ -155,7 +157,11 @@ def merge_usage_entries(a: dict, b: dict) -> dict:
     vía. "Vista" si CUALQUIERA de las dos lo dice (no ambas), reproduc-
     ciones sumadas, fecha del último visionado la más reciente entre las
     dos, fecha de añadido la más antigua (primera vez que cualquiera de
-    los dos la vio en su biblioteca)."""
+    los dos la vio en su biblioteca). source/server_id (para "abrir en
+    Jellyfin/Plex", ver gui/app.py::_open_in_media_server) se quedan con
+    los de *a* si los tiene -- el llamador procesa Jellyfin antes que Plex,
+    así que por construcción esto respeta la preferencia "Jellyfin primero"
+    ya establecida en el resto de la app."""
     from core.media_server_refresh import parse_media_date
     last_played = max(
         (t for t in (parse_media_date(a.get("last_played")), parse_media_date(b.get("last_played")))
@@ -172,6 +178,8 @@ def merge_usage_entries(a: dict, b: dict) -> dict:
         "last_played": last_played,
         "date_added": date_added,
         "size_bytes": a.get("size_bytes") or b.get("size_bytes") or 0,
+        "source": a.get("source") or b.get("source") or "",
+        "server_id": a.get("server_id") or b.get("server_id") or "",
     }
 
 

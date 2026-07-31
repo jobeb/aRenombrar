@@ -54,6 +54,24 @@ def test_similarity_still_boosts_meaningful_short_titles():
     assert series_similarity("Coco", "Coco (2017)") >= 0.90
 
 
+def test_similarity_does_not_false_positive_on_word_buried_at_the_end():
+    # Caso real: "Arcadia" y "Los 3 de Adabo: Cuentos de Arcadia" se
+    # fusionaron en la misma carpeta del FTP y se subieron episodios de
+    # una serie a la carpeta de la otra -- "arcadia" es una subcadena
+    # literal de "los 3 de adabo cuentos de arcadia" (normalizado), pero
+    # SOLO aparece al final, no como el título corto de verdad. El impulso
+    # de subcadena solo debe dispararse cuando el nombre corto es PREFIJO
+    # del largo (ver "Coco"/"Coco (2017)" arriba), no "aparece en
+    # cualquier parte".
+    assert series_similarity("Arcadia", "Los 3 de Adabo: Cuentos de Arcadia") < 0.55
+    # "Cuentos de Arcadia" vs "Arcadia" comparten más texto (ratio bruto de
+    # difflib un poco por encima de 0.55), pero lo que de verdad protege de
+    # fusionar carpetas sin preguntar es el umbral de 0.90 que usa
+    # find_existing_category_folder -- eso NUNCA debe alcanzarse sin que el
+    # nombre corto sea prefijo del largo.
+    assert series_similarity("Cuentos de Arcadia", "Arcadia") < 0.90
+
+
 # ── Emparejamiento exclusivo (sin robar el mismo target dos veces) ─────────
 
 def test_match_names_exclusively_basic_case():

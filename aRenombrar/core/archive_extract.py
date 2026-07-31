@@ -164,23 +164,32 @@ def _extract_7z(path: Path, dest: Path) -> tuple[bool, str]:
 
 def _extract_rar(path: Path, dest: Path) -> tuple[bool, str]:
     import rarfile
-    with rarfile.RarFile(path) as rf:
-        # namelist() solo lee la cabecera del archivo (Python puro, sin
-        # herramienta externa) -- el binario solo hace falta más abajo, en
-        # extractall(), para descomprimir los datos de verdad.
-        names = rf.namelist()
-        if not all(_is_safe_member(dest, n) for n in names):
-            return False, "Archivo con rutas inseguras (posible zip-slip) -- no se descomprime"
-        dest.mkdir(parents=True, exist_ok=True)
-        try:
+
+    def _do_extract() -> tuple[bool, str]:
+        with rarfile.RarFile(path) as rf:
+            # namelist() NO es puro Python pese a lo que se pensaba antes
+            # (bug real: con un .rar de verdad sin unrar todavía
+            # configurado, esta misma llamada ya lanza RarCannotExec --
+            # algunas cabeceras SÍ necesitan invocar la herramienta
+            # externa para leerse, contra lo que decía este comentario) --
+            # por eso toda la función vive dentro del mismo try/except de
+            # más abajo, no solo extractall().
+            names = rf.namelist()
+            if not all(_is_safe_member(dest, n) for n in names):
+                return False, "Archivo con rutas inseguras (posible zip-slip) -- no se descomprime"
+            dest.mkdir(parents=True, exist_ok=True)
             rf.extractall(dest)
-        except rarfile.RarCannotExec:
-            # Antes de rendirse: en Windows, WinRAR/7-Zip pueden estar
-            # instalados de verdad pero no en el PATH (ver
-            # _configure_windows_rar_fallback_tool) -- reintentar una vez
-            # con lo que se encuentre ahí antes de reportar "no instalado".
-            if not _configure_windows_rar_fallback_tool(rarfile):
-                return False, ("unrar no está instalado en este sistema -- instálalo "
-                                "(o unar/bsdtar) para poder descomprimir archivos .rar")
-            rf.extractall(dest)
-    return True, str(dest)
+        return True, str(dest)
+
+    try:
+        return _do_extract()
+    except rarfile.RarCannotExec:
+        # Antes de rendirse: en Windows, WinRAR/7-Zip pueden estar
+        # instalados de verdad pero no en el PATH (ver
+        # _configure_windows_rar_fallback_tool) -- reintentar la operación
+        # ENTERA (no solo extractall(), ver más arriba) una vez con lo que
+        # se encuentre ahí antes de reportar "no instalado".
+        if not _configure_windows_rar_fallback_tool(rarfile):
+            return False, ("unrar no está instalado en este sistema -- instálalo "
+                            "(o unar/bsdtar) para poder descomprimir archivos .rar")
+        return _do_extract()

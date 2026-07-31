@@ -206,6 +206,25 @@ def test_find_existing_category_folder_known_year_disambiguates_a_remake():
     assert folder == "Ranma (2024)"
 
 
+def test_find_existing_category_folder_does_not_merge_unrelated_series_sharing_a_word():
+    # Caso real: la carpeta "Arcadia" se fusionó con "Los 3 de Adabo:
+    # Cuentos de Arcadia" (dos series sin ninguna relación) y se subieron
+    # episodios de una a la carpeta de la otra -- "arcadia" es una
+    # subcadena literal del segundo título, pero solo al final, no un
+    # título corto de verdad (ver test_similarity_does_not_false_positive_
+    # on_word_buried_at_the_end en test_series_match.py).
+    categories = [{"name": "Series", "root": "/datos2/series", "genre_ids": []}]
+    cat, folder = find_existing_category_folder(
+        categories, "Los 3 de Adabo: Cuentos de Arcadia", None, lambda root: ["Arcadia"])
+    assert cat is None
+    assert folder is None
+
+    cat, folder = find_existing_category_folder(
+        categories, "Arcadia", None, lambda root: ["Los 3 de Adabo: Cuentos de Arcadia"])
+    assert cat is None
+    assert folder is None
+
+
 def test_find_existing_category_folder_without_known_year_still_fails_on_this_case():
     # Sin known_year, el comportamiento previo (fallo) no cambia -- el
     # fallback solo se activa cuando SE PASA un año conocido de antemano.

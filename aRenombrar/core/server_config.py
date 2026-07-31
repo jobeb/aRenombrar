@@ -84,8 +84,9 @@ Excluido a propósito, y por qué (configuración de CLIENTE):
   desde la que se deriva la ruta de este mismo archivo -- no pueden
   formar parte de lo que el archivo transporta.
 - appearance, color_theme, last_dir, table_col_widths,
-  skipped_update_version: preferencias de interfaz o estado de ESTE
-  equipo, sin ningún efecto sobre el servidor.
+  table_hidden_columns, amule_search_type, skipped_update_version:
+  preferencias de interfaz o estado de ESTE equipo, sin ningún efecto
+  sobre el servidor.
 - watch_folder, poll_interval, auto_action, manual_action, auto_extract_archives,
   min_confidence, desktop_notifications, start_with_windows, rename_local: comportamiento
   del modo automático y de la subida manual de CADA equipo -- forzarlo
@@ -151,3 +152,54 @@ def filter_shared_config(data: dict) -> dict:
     extract_shared_config, learned_junk_terms se gestiona aparte, no pasa
     por aquí."""
     return {key: value for key, value in data.items() if key in SHARED_CONFIG_KEYS}
+
+
+_LAST_SYNCED_FILENAME = "server_config_last_synced.json"
+
+
+def _last_synced_path():
+    from core.appdirs import app_data_dir
+    return app_data_dir() / _LAST_SYNCED_FILENAME
+
+
+def load_last_synced_snapshot() -> dict:
+    """Última copia de SHARED_CONFIG_KEYS vista en un sync/publish
+    anterior -- para saber, la próxima vez que se sincronice desde el FTP,
+    qué claves ha tocado el usuario EN LOCAL desde entonces sin haberlas
+    publicado todavía (ver diff_local_changes/gui/app.py::
+    _apply_synced_server_config). Bug real que motivó esto: un enlace
+    personalizable nuevo, guardado en local pero sin publicar, desaparecía
+    al reiniciar la app -- el sync silencioso de arranque sobrescribía
+    TODA la configuración de servidor sin distinguir "esto lo cambié yo
+    hace un momento" de "esto lo publicó otra persona". {} si nunca hubo
+    un sync/publish todavía (primera vez en este cliente, o versión
+    anterior a este arreglo) -- en ese caso no hay base fiable de
+    comparación, así que el llamador debe tratarlo como "aplicar todo",
+    igual que siempre se hizo."""
+    path = _last_synced_path()
+    if not path.exists():
+        return {}
+    try:
+        import json
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_last_synced_snapshot(data: dict) -> None:
+    import json
+    path = _last_synced_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def diff_local_changes(get_fn, last_synced: dict) -> set:
+    """Claves de SHARED_CONFIG_KEYS cuyo valor LOCAL actual (get_fn,
+    normalmente Config.get) ya no coincide con la última copia vista de un
+    sync/publish (last_synced) -- son ediciones locales sin publicar
+    todavía, que _apply_synced_server_config no debe pisar en silencio con
+    lo que llegue del FTP."""
+    return {key for key in SHARED_CONFIG_KEYS if get_fn(key) != last_synced.get(key)}

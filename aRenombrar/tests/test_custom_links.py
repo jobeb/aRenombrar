@@ -33,6 +33,19 @@ def test_build_link_url_empty_template_returns_empty():
     assert build_link_url("", {"serie": "X"}) == ""
 
 
+def test_build_link_url_applies_numeric_format_spec():
+    # {episodio:02d} debe formatear el numero ANTES de URL-encodearlo, no
+    # fallar en silencio como cuando el valor se encodeaba (a str) primero.
+    url = build_link_url("https://ejemplo.com/{serie}/{episodio:02d}",
+                          {"serie": "Naruto", "episodio": 7})
+    assert url == "https://ejemplo.com/Naruto/07"
+
+
+def test_build_link_url_missing_variable_with_format_spec_becomes_empty():
+    url = build_link_url("https://ejemplo.com/{serie}/{episodio:02d}", {"serie": "Naruto"})
+    assert url == "https://ejemplo.com/Naruto/"
+
+
 def test_build_link_url_encodes_literal_spaces_in_template_too():
     # Un espacio que el propio usuario escribe en la plantilla (fuera de
     # cualquier variable, p.ej. entre {serie} y {temporada}) debe salir

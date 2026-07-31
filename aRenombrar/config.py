@@ -105,13 +105,18 @@ DEFAULTS = {
     # nada -- necesario para que "Liberar espacio" no marque como "nunca
     # vista" contenido que sí se ha visto, solo que con OTRO usuario.
     "jellyfin_username": "",
-    # Enlaces personalizables desde el detector de episodios que faltan --
-    # solo informativos (ver core/custom_links.py): abren una URL con
-    # variables sustituidas, nunca se conectan a nada por su cuenta. Una
-    # lista independiente por nivel (serie/temporada/episodio) porque cada
-    # uno tiene sentido con una plantilla distinta -- p.ej. la ficha de
-    # TMDB cambia de "/tv/{tmdb_id}" a ".../season/{temporada}" a
-    # ".../season/{temporada}/episode/{episodio}" según el nivel.
+    # Enlaces personalizables desde el detector de episodios que faltan y
+    # los paneles de detalle de Archivos/Liberar espacio -- solo
+    # informativos (ver core/custom_links.py): abren una URL con variables
+    # sustituidas, nunca se conectan a nada por su cuenta. Una lista
+    # independiente por nivel (serie/temporada/episodio/película) porque
+    # cada uno tiene sentido con una plantilla distinta -- p.ej. la ficha
+    # de TMDB cambia de "/tv/{tmdb_id}" a ".../season/{temporada}" a
+    # ".../season/{temporada}/episode/{episodio}" según el nivel, y las
+    # películas usan "/movie/{tmdb_id}" en vez de "/tv/...". "movie" es su
+    # propio nivel (no reutiliza "episode") porque {temporada}/{episodio}
+    # no existen para una película y una plantilla mixta quedaría rota a
+    # medias.
     "custom_links_show": [
         {"name": "Ver en TMDB", "url_template": "https://www.themoviedb.org/tv/{tmdb_id}"},
     ],
@@ -121,6 +126,10 @@ DEFAULTS = {
     "custom_links_episode": [
         {"name": "Ver en TMDB", "url_template":
             "https://www.themoviedb.org/tv/{tmdb_id}/season/{temporada}/episode/{episodio}"},
+        {"name": "Enviar por WhatsApp", "url_template": "https://wa.me/?text={nombre_archivo}"},
+    ],
+    "custom_links_movie": [
+        {"name": "Ver en TMDB", "url_template": "https://www.themoviedb.org/movie/{tmdb_id}"},
         {"name": "Enviar por WhatsApp", "url_template": "https://wa.me/?text={nombre_archivo}"},
     ],
     # Etiqueta de release (p.ej. "v1.2.0") que el usuario ya descartó en el
@@ -143,6 +152,10 @@ DEFAULTS = {
     # Historial), guardados al soltar un separador -- ver gui/table_view.py
     # y _save_table_col_widths en gui/app.py. {tabla: {columna: ancho_px}}.
     "table_col_widths": {},
+    # Columnas ocultas de las tablas, guardadas desde el menú contextual
+    # de la cabecera (clic derecho) -- ver TableView.set_hidden y
+    # _save_hidden_columns en gui/app.py. {tabla: [claves_ocultas]}.
+    "table_hidden_columns": {},
     # Cuota de reservas por persona, en GB (ver core/reservations.py) --
     # configuración de SERVIDOR (core/server_config.py): el mismo límite
     # para todo el que reserve espacio contra este servidor, no una
@@ -188,7 +201,17 @@ DEFAULTS = {
     "missing_ep_show_ignored": False,
     "missing_ep_hide_ai_dismissed": False,
     "missing_ep_hide_no_dub": False,
+    "missing_ep_pin_favorites": True,
     "auto_watcher_running": False,
+    # amulecmd para descargar episodios que faltan -- host/puerto/contraseña
+    # del External Connections de aMule (Preferencias -> Control Remoto).
+    "amule_host": "localhost",
+    "amule_port": 4712,
+    "amule_password": "",
+    "amulecmd_path": r"C:\Program Files\aMule\bin\amulecmd.exe",
+    # Red de búsqueda elegida en la pestaña Descargas ("Kad"/"Global"/"Local")
+    # -- se persiste para que no vuelva a Kad al reiniciar.
+    "amule_search_type": "Kad",
 }
 
 

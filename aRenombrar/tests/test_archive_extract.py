@@ -202,6 +202,70 @@ def test_extract_rar_falls_back_to_winrar_path_on_windows(tmp_path, monkeypatch)
     assert calls["extractall"] == 2, "debe reintentar extractall() tras configurar el tool"
 
 
+def test_extract_rar_falls_back_when_namelist_itself_fails(tmp_path, monkeypatch):
+    """Bug real (2026-07-28): con un .rar real ("Los Simpson...") en una
+    máquina con WinRAR instalado pero sin el fallback todavía configurado,
+    namelist() -- no solo extractall() -- ya lanzaba RarCannotExec
+    ("Cannot find working tool"), contra lo que decía el comentario de
+    _extract_rar ("namelist() es Python puro, sin herramienta externa").
+    Como el try/except original solo envolvía extractall(), ese fallo de
+    namelist() escapaba sin reintentar nada, con el mensaje genérico "No
+    se pudo descomprimir: Cannot find working tool" en vez de encontrar
+    WinRAR y reintentar. Ahora toda la operación (namelist + extractall)
+    vive dentro del mismo try/except, así que el fallback se prueba sea
+    cual sea la llamada que falle primero."""
+    monkeypatch.setattr("core.archive_extract.is_windows", lambda: True)
+    winrar_path = r"C:\Program Files\WinRAR\UnRAR.exe"
+    monkeypatch.setattr("os.path.isfile", lambda p: p == winrar_path)
+
+    calls = {"namelist": 0, "extractall": 0}
+
+    class _FakeRarFile:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def namelist(self):
+            calls["namelist"] += 1
+            if fake_rarfile.UNRAR_TOOL == "unrar":
+                # Sin el fallback configurado todavía -- falla aquí, no
+                # en extractall() (el caso real que motivó este test).
+                raise fake_rarfile.RarCannotExec("Cannot find working tool")
+            return ["Los Simpson - 1x01.avi"]
+
+        def extractall(self, dest):
+            calls["extractall"] += 1
+            (Path(dest) / "Los Simpson - 1x01.avi").write_bytes(b"contenido")
+
+    class _RarCannotExec(Exception):
+        pass
+
+    def _fake_tool_setup(force=False):
+        if fake_rarfile.UNRAR_TOOL != winrar_path:
+            raise _RarCannotExec("still not found")
+
+    fake_rarfile = type("fake_rarfile", (), {
+        "RarFile": _FakeRarFile, "RarCannotExec": _RarCannotExec,
+        "UNRAR_TOOL": "unrar", "SEVENZIP_TOOL": "7z",
+        "tool_setup": staticmethod(_fake_tool_setup),
+    })
+    monkeypatch.setitem(__import__("sys").modules, "rarfile", fake_rarfile)
+
+    archive = tmp_path / "Los Simpson.rar"
+    archive.write_bytes(b"x")
+    ok, dest = extract_archive(archive)
+
+    assert ok is True, "debería haber encontrado UnRAR.exe de WinRAR tras el fallo de namelist()"
+    assert (Path(dest) / "Los Simpson - 1x01.avi").read_bytes() == b"contenido"
+    assert calls["namelist"] == 2, "namelist() se repite tras configurar el tool, no se salta"
+    assert calls["extractall"] == 1
+
+
 def test_extract_rar_still_fails_when_no_tool_found_anywhere_on_windows(tmp_path, monkeypatch):
     monkeypatch.setattr("core.archive_extract.is_windows", lambda: True)
     monkeypatch.setattr("os.path.isfile", lambda p: False)   # nada instalado en ninguna ruta típica

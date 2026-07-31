@@ -1005,3 +1005,106 @@ def test_get_plex_series_item_returns_none_on_network_failure(monkeypatch):
 
 def test_get_plex_series_item_without_config_returns_none():
     assert msr.get_plex_series_item("", "", "999") is None
+
+
+# ── Buscar por tmdb_id (Archivos -- "Abrir en Jellyfin/Plex") ──────────────
+
+def test_find_jellyfin_item_by_tmdb_id_finds_series(monkeypatch):
+    payload = {"Items": [
+        {"Id": "abc123", "Name": "Serie X", "ProviderIds": {"Tmdb": "9999"}},
+        {"Id": "def456", "Name": "Serie Y", "ProviderIds": {"Tmdb": "1111"}},
+    ]}
+    captured = {}
+    def _fake_get(url, **kw):
+        captured["params"] = kw.get("params")
+        return _FakeResponse(payload)
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    item = msr.find_jellyfin_item_by_tmdb_id("http://jf:8096", "key", 9999, "tv")
+    assert item == {"id": "abc123", "name": "Serie X"}
+    assert captured["params"]["IncludeItemTypes"] == "Series"
+
+
+def test_find_jellyfin_item_by_tmdb_id_uses_movie_type_for_movies(monkeypatch):
+    captured = {}
+    def _fake_get(url, **kw):
+        captured["params"] = kw.get("params")
+        return _FakeResponse({"Items": []})
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    msr.find_jellyfin_item_by_tmdb_id("http://jf:8096", "key", 9999, "movie")
+    assert captured["params"]["IncludeItemTypes"] == "Movie"
+
+
+def test_find_jellyfin_item_by_tmdb_id_returns_none_when_not_found(monkeypatch):
+    payload = {"Items": [{"Id": "abc123", "Name": "Serie Y", "ProviderIds": {"Tmdb": "1111"}}]}
+    monkeypatch.setattr(msr.requests, "get", lambda *a, **kw: _FakeResponse(payload))
+    assert msr.find_jellyfin_item_by_tmdb_id("http://jf:8096", "key", 9999, "tv") is None
+
+
+def test_find_jellyfin_item_by_tmdb_id_without_config_returns_none():
+    assert msr.find_jellyfin_item_by_tmdb_id("", "", 9999, "tv") is None
+
+
+def test_find_jellyfin_item_by_tmdb_id_returns_none_on_network_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "get", _raise)
+    assert msr.find_jellyfin_item_by_tmdb_id("http://jf:8096", "key", 9999, "tv") is None
+
+
+def test_find_plex_item_by_tmdb_id_finds_movie(monkeypatch):
+    sections_payload = {"MediaContainer": {"Directory": [
+        {"key": "1", "type": "show", "title": "Series"},
+        {"key": "2", "type": "movie", "title": "Peliculas"},
+    ]}}
+    movies_payload = {"MediaContainer": {"Metadata": [
+        {"ratingKey": "500", "title": "Peli X", "Guid": [{"id": "tmdb://7777"}]},
+    ]}}
+    captured = {}
+    def _fake_get(url, **kw):
+        if url.endswith("/library/sections"):
+            return _FakeResponse(sections_payload)
+        captured["params"] = kw.get("params")
+        return _FakeResponse(movies_payload)
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    item = msr.find_plex_item_by_tmdb_id("http://plex:32400", "tok", 7777, "movie")
+    assert item == {"rating_key": "500", "name": "Peli X"}
+    assert captured["params"]["type"] == "1"
+
+
+def test_find_plex_item_by_tmdb_id_only_searches_matching_section_type(monkeypatch):
+    sections_payload = {"MediaContainer": {"Directory": [
+        {"key": "1", "type": "show", "title": "Series"},
+    ]}}
+    calls = []
+    def _fake_get(url, **kw):
+        calls.append(url)
+        if url.endswith("/library/sections"):
+            return _FakeResponse(sections_payload)
+        return _FakeResponse({"MediaContainer": {"Metadata": []}})
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    msr.find_plex_item_by_tmdb_id("http://plex:32400", "tok", 7777, "movie")
+    # Sin sección "movie" en la biblioteca -- solo se llama a /library/sections, nunca a /all
+    assert len(calls) == 1
+
+
+def test_find_plex_item_by_tmdb_id_returns_none_when_not_found(monkeypatch):
+    sections_payload = {"MediaContainer": {"Directory": [{"key": "1", "type": "show", "title": "Series"}]}}
+    shows_payload = {"MediaContainer": {"Metadata": [
+        {"ratingKey": "100", "title": "Serie Y", "Guid": [{"id": "tmdb://1111"}]}]}}
+    def _fake_get(url, **kw):
+        if url.endswith("/library/sections"):
+            return _FakeResponse(sections_payload)
+        return _FakeResponse(shows_payload)
+    monkeypatch.setattr(msr.requests, "get", _fake_get)
+    assert msr.find_plex_item_by_tmdb_id("http://plex:32400", "tok", 9999, "tv") is None
+
+
+def test_find_plex_item_by_tmdb_id_without_config_returns_none():
+    assert msr.find_plex_item_by_tmdb_id("", "", 9999, "tv") is None
+
+
+def test_find_plex_item_by_tmdb_id_returns_none_on_network_failure(monkeypatch):
+    def _raise(*a, **kw):
+        raise ConnectionError("sin red")
+    monkeypatch.setattr(msr.requests, "get", _raise)
+    assert msr.find_plex_item_by_tmdb_id("http://plex:32400", "tok", 9999, "tv") is None

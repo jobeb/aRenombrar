@@ -267,6 +267,45 @@ def get_jellyfin_series_item(host: str, api_key: str, item_id: str, timeout: int
             "folder_name": folder_name}
 
 
+def find_jellyfin_item_by_tmdb_id(host: str, api_key: str, tmdb_id: int, media_type: str,
+                                   timeout: int = 15) -> Optional[dict]:
+    """Busca una serie o película en Jellyfin por su tmdb_id -- usado por
+    "Abrir en Jellyfin/Plex" en Archivos (gui/app.py::
+    _open_entry_in_media_server), donde a diferencia de Episodios que
+    faltan/Liberar espacio (que YA traen su server_id de un escaneo
+    previo) un archivo recién subido no tiene ningún id de servidor
+    guardado todavía. Mismo patrón de listado-completo-y-filtrado-en-
+    cliente que get_jellyfin_series (en vez de un parámetro de filtrado
+    por proveedor en la API, no confirmado que exista en todas las
+    versiones de Jellyfin) -- extendido aquí a también cubrir "Movie", no
+    solo "Series". Devuelve {"id": str, "name": str} o None si no está
+    configurado, falla la petición, o no se encuentra."""
+    if not host or not api_key or not tmdb_id:
+        return None
+    base = host.rstrip("/")
+    item_type = "Series" if media_type == "tv" else "Movie"
+    try:
+        resp = requests.get(
+            f"{base}/Items",
+            headers={"X-Emby-Token": api_key},
+            params={"IncludeItemTypes": item_type, "Recursive": "true", "Fields": "ProviderIds"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("Items", []) or []
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al buscar por tmdb_id %s: %s", tmdb_id, e)
+        return None
+    for item in items:
+        tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
+        try:
+            if tmdb_raw and int(tmdb_raw) == tmdb_id:
+                return {"id": item.get("Id"), "name": item.get("Name", "")}
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def get_jellyfin_episodes(host: str, api_key: str, series_id: str, timeout: int = 15) -> Optional[set]:
     """{(temporada, episodio), ...} presentes de verdad en Jellyfin para esa
     serie, o None si falla."""
@@ -371,6 +410,54 @@ def get_plex_series_item(host: str, token: str, rating_key: str, timeout: int = 
     item = items[0]
     tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
     return {"rating_key": item.get("ratingKey"), "name": item.get("title", ""), "tmdb_id": tmdb_id}
+
+
+def find_plex_item_by_tmdb_id(host: str, token: str, tmdb_id: int, media_type: str,
+                               timeout: int = 15) -> Optional[dict]:
+    """Equivalente a find_jellyfin_item_by_tmdb_id pero para Plex -- ver
+    ese docstring para el motivo. Recorre las secciones de la biblioteca
+    del tipo que corresponda ("show" para tv, "movie" para películas,
+    "type": "2"/"1" respectivamente en la búsqueda de esa sección, mismo
+    valor que ya usa get_plex_series para "show") y filtra por tmdb_id en
+    el propio cliente. Devuelve {"rating_key": str, "name": str} o None si
+    no está configurado, falla la petición, o no se encuentra."""
+    if not host or not token or not tmdb_id:
+        return None
+    base = host.rstrip("/")
+    sec_type = "show" if media_type == "tv" else "movie"
+    plex_type = "2" if media_type == "tv" else "1"
+    try:
+        resp = requests.get(
+            f"{base}/library/sections",
+            params={"X-Plex-Token": token},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        sections = resp.json().get("MediaContainer", {}).get("Directory", []) or []
+    except Exception as e:
+        _log.warning("Plex: fallo al listar secciones: %s", e)
+        return None
+    for sec in sections:
+        if sec.get("type") != sec_type:
+            continue
+        sec_id = sec.get("key")
+        try:
+            resp = requests.get(
+                f"{base}/library/sections/{sec_id}/all",
+                params={"X-Plex-Token": token, "type": plex_type, "includeGuids": "1"},
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("MediaContainer", {}).get("Metadata", []) or []
+        except Exception as e:
+            _log.warning("Plex: fallo al buscar por tmdb_id en la sección %s: %s", sec_id, e)
+            continue
+        for item in items:
+            if _plex_tmdb_id_from_guids(item.get("Guid", [])) == tmdb_id:
+                return {"rating_key": item.get("ratingKey"), "name": item.get("title", "")}
+    return None
 
 
 def get_plex_episodes(host: str, token: str, rating_key: str, timeout: int = 15) -> Optional[set]:

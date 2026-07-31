@@ -36,18 +36,24 @@ def series_similarity(a: str, b: str, strict: bool = False) -> float:
     Si solo uno de los dos trae año (o ninguno), esta comprobación no
     aplica.
 
-    Si uno contiene literalmente al otro (nombre corto vs largo) se
+    Si uno es PREFIJO literal del otro (nombre corto vs largo) se
     considera una coincidencia fuerte aunque el ratio de caracteres sea
     bajo -- útil para "El 47" vs "El 47 (2024)", o para encontrar el
     mismo contenido subido con otro nombre de release ("Pelicula (2024)"
-    vs "Pelicula.2024.OtraVersion.WEB-DL"). Con *strict=False* (por
-    defecto, usado para reutilizar carpetas y detectar duplicados de
-    subida) esto se admite siempre. Con *strict=True* (usado para
-    emparejar títulos REALES entre sí, donde una palabra de más SÍ
-    importa) solo se admite si comparten el mismo año, o si lo que sobra
-    en el nombre largo son dígitos/espacios, no letras -- así "Animal" y
-    "Animal Crackers" ya no se consideran el mismo título solo porque uno
-    empiece igual que el otro."""
+    vs "Pelicula.2024.OtraVersion.WEB-DL"). Tiene que ser PREFIJO, no
+    "contenido en cualquier parte" -- con "contenido en cualquier parte"
+    un nombre corto y genérico que aparece al FINAL de un título largo y
+    completamente distinto también disparaba el impulso (caso real: la
+    carpeta "Arcadia" se fusionó con "Los 3 de Adabo: Cuentos de Arcadia",
+    dos series sin ninguna relación, porque "arcadia" es una subcadena
+    literal del segundo nombre; nunca aparecía al principio). Con
+    *strict=False* (por defecto, usado para reutilizar carpetas y
+    detectar duplicados de subida) esto se admite siempre. Con
+    *strict=True* (usado para emparejar títulos REALES entre sí, donde
+    una palabra de más SÍ importa) solo se admite si comparten el mismo
+    año, o si lo que sobra en el nombre largo son dígitos/espacios, no
+    letras -- así "Animal" y "Animal Crackers" ya no se consideran el
+    mismo título solo porque uno empiece igual que el otro."""
     na, nb = normalize_series_name(a), normalize_series_name(b)
     if not na or not nb:
         return 0.0
@@ -61,7 +67,7 @@ def series_similarity(a: str, b: str, strict: bool = False) -> float:
 
     ratio = difflib.SequenceMatcher(None, na, nb).ratio()
     shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
-    if len(shorter) >= _MIN_SUBSTRING_BOOST_LEN and shorter in longer:
+    if len(shorter) >= _MIN_SUBSTRING_BOOST_LEN and longer.startswith(shorter):
         if not strict:
             ratio = max(ratio, 0.90)
         else:

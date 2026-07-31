@@ -45,6 +45,7 @@ from core.kitsu_client import KitsuClient
 from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
+from core.amule_client import AmuleClient, AmuleSearchResult
 from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively
 from core.ftp_categories import choose_category, new_category_id
@@ -110,6 +111,25 @@ def _fmt_size(nbytes):
         if nbytes >= divisor:
             return f"{nbytes / divisor:.1f} {unit}"
     return f"{nbytes} B"
+
+
+def _parse_size_human(s: str) -> float:
+    """Bytes (aprox.) a partir de un size_human de aMule como "450,5 MB"
+    (texto, con coma decimal según la locale) -- para ordenar la tabla de
+    Descargar por tamaño real y no por orden alfabético del texto."""
+    if not s:
+        return 0.0
+    parts = s.strip().split()
+    if not parts:
+        return 0.0
+    try:
+        val = float(parts[0].replace(",", "."))
+    except ValueError:
+        return 0.0
+    if len(parts) > 1:
+        mult = {"KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+        return val * mult.get(parts[1].upper(), 1)
+    return val
 
 
 def _fmt_air_date(iso_date) -> str:
@@ -929,6 +949,13 @@ class App(_AppBase):
                 self._jellyfin_logo_img = ctk.CTkImage(Image.open(jellyfin_png), size=(18, 18))
         except Exception:
             pass
+        # Placeholder transparente real para la columna "logo" de Archivos
+        # cuando ni Jellyfin ni Plex están configurados -- CTkLabel con
+        # image=None mostraba un glifo inesperado en vez de quedar en
+        # blanco (bug real, visto en una captura del usuario). Una imagen
+        # de verdad (aunque sea 100% transparente) evita depender de ese
+        # camino sin imagen de customtkinter.
+        self._blank_logo_img = ctk.CTkImage(Image.new("RGBA", (18, 18), (0, 0, 0, 0)), size=(18, 18))
 
         self._startup_mark = _mark   # usado dentro de _build_ui, ver ahí
         self._build_ui()
@@ -1234,6 +1261,17 @@ class App(_AppBase):
         self._stats_visible = False
         self._stats_view = StatsView(self, self._stats_frame)
         self._startup_mark("  StatsView()")
+
+        # Descargas — buscador de episodios en aMule (antes un diálogo modal,
+        # ahora una pestaña principal como las demás). Construcción completa
+        # aquí (no diferida): los widgets de esta pestaña son pocos y ligeros,
+        # no merece la pena el código extra de construcción perezosa.
+        self._downloads_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
+        self._downloads_frame.grid_columnconfigure(0, weight=1)
+        self._downloads_frame.grid_rowconfigure(2, weight=1)
+        self._downloads_visible = False
+        self._build_downloads_tab(self._downloads_frame)
+        self._startup_mark("  _build_downloads_tab()")
 
         self._build_status_bar()
         self._startup_mark("  _build_status_bar()")
@@ -1794,6 +1832,7 @@ class App(_AppBase):
     _NAV_LABELS = {
         "files": "📁 Archivos",
         "missing_ep": "🔍 Episodios",
+        "downloads": "📥 Descargar",
         "cleanup": "🗑 Liberar espacio",
         "protected": "🔒 Protegidos",
         "history": "📋 Historial",
@@ -1807,6 +1846,8 @@ class App(_AppBase):
             return "config"
         if self._missing_ep_visible:
             return "missing_ep"
+        if self._downloads_visible:
+            return "downloads"
         if self._history_visible:
             return "history"
         if self._cleanup_visible:
@@ -1892,6 +1933,10 @@ class App(_AppBase):
         elif self._watch_sync_top_visible:
             self._watch_sync_top_frame.grid_remove()
             self._watch_sync_top_visible = False
+        elif self._downloads_visible:
+            self._downloads_close_session()
+            self._downloads_frame.grid_remove()
+            self._downloads_visible = False
         elif self._stats_visible:
             self._stats_frame.grid_remove()
             self._stats_visible = False
@@ -1928,6 +1973,9 @@ class App(_AppBase):
             self._watch_sync_top_frame.grid(row=0, column=0, sticky="nsew")
             self._watch_sync_top_visible = True
             self._refresh_watch_sync_history_view()   # por si hay sincronizaciones nuevas desde la última vez
+        elif view_key == "downloads":
+            self._downloads_frame.grid(row=0, column=0, sticky="nsew")
+            self._downloads_visible = True
         elif view_key == "stats":
             self._stats_frame.grid(row=0, column=0, sticky="nsew")
             self._stats_visible = True
@@ -2033,24 +2081,35 @@ class App(_AppBase):
         # según el ancho disponible (ver _compute_cw/_on_table_resize,
         # comportamiento propio de esta tabla, no del componente).
         sw0 = self._saved_col_widths("archivos")   # anchos guardados de una sesión anterior, si hay
-        cw0 = self._compute_cw(dest_w=sw0.get("dest", 140))
+        cw0 = self._compute_cw(dest_w=sw0.get("dest", 140),
+                               hidden=self._saved_hidden_columns("archivos"))
         self._col_widths = cw0   # mirror de self._file_table para el código de filas -- ver _apply_col_widths
         self._file_table = TableView(body, columns=[
-            ColumnSpec("name", "Nombre original", width=sw0.get("name", cw0["name"]), min_width=80, resizable=True),
-            ColumnSpec("det", "Detectado", width=sw0.get("det", cw0["det"]), min_width=55, resizable=True),
-            ColumnSpec("nn", "Nuevo nombre", width=cw0["nn"], expand=True, resizable=True),
-            ColumnSpec("dest", "Destino", width=sw0.get("dest", 140), min_width=60, resizable=True),
-            ColumnSpec("stat", "Estado", width=sw0.get("stat", 74), min_width=50, resizable=True),
+            ColumnSpec("name", "Nombre original", width=sw0.get("name", cw0["name"]), min_width=80,
+                       resizable=True, sortable=True),
+            ColumnSpec("det", "Detectado", width=sw0.get("det", cw0["det"]), min_width=55,
+                       resizable=True, sortable=True),
+            ColumnSpec("nn", "Nuevo nombre", width=cw0["nn"], expand=True, resizable=True, sortable=True),
+            ColumnSpec("dest", "Destino", width=sw0.get("dest", 140), min_width=60,
+                       resizable=True, sortable=True),
+            ColumnSpec("stat", "Estado", width=sw0.get("stat", 74), min_width=50,
+                       resizable=True, sortable=True),
             ColumnSpec("bar", "Subida FTP", width=sw0.get("bar", 110), min_width=50, resizable=True),
             ColumnSpec("spd", "Vel.", width=sw0.get("spd", 80), min_width=50, resizable=True),
-            ColumnSpec("size", "Peso", width=sw0.get("size", 60), min_width=40),
-            ColumnSpec("fav", "", width=28),
-            ColumnSpec("lock", "", width=28),
-            ColumnSpec("btns", "", width=28 * 3 + 6),
-        ])
+            ColumnSpec("size", "Peso", width=sw0.get("size", 60), min_width=40, sortable=True),
+            # logo/fav/lock/btns: columnas de acción (iconos/botones), no
+            # de datos -- no aparecen en el menú contextual de ocultar.
+            ColumnSpec("logo", "", width=24, hideable=False),
+            ColumnSpec("fav", "", width=28, hideable=False),
+            ColumnSpec("lock", "", width=28, hideable=False),
+            ColumnSpec("btns", "", width=28 * 3 + 6, hideable=False),
+        ], header_right_pad=16,   # ver TableView.__init__ -- medido a mano contra esta tabla en concreto
+        on_visibility_changed=self._on_file_table_visibility_changed)
         self._file_table.grid(row=1, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
         self._file_table.on_column_resize = self._apply_col_widths
         self._file_table.on_widths_changed = lambda w: self._save_table_col_widths("archivos", w)
+        self._file_table.on_header_click = self._on_files_header_click
+        self._file_table.set_hidden(self._saved_hidden_columns("archivos"), notify=False)
         # Alias -- el resto de la app (drag&drop, _refresh_table, etc.)
         # ya usaba self._file_list_frame como el contenedor con scroll de
         # las filas; TableView.body es justo eso.
@@ -2065,6 +2124,8 @@ class App(_AppBase):
         self._file_rows = []
         self._files_page = 0
         self._table_resize_debounce_id = None   # ver _on_table_resize
+        self._files_sort_key = None   # ver _on_files_header_click -- sin ordenar hasta que se pulse una cabecera
+        self._files_sort_asc = True
         self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
 
         # Paginado (ver TableView.page_size, calculado dinámicamente según
@@ -2133,7 +2194,22 @@ class App(_AppBase):
         self.config_data.set("table_col_widths", all_saved)
         self.config_data.save()
 
-    def _compute_cw(self, avail_w=None, dest_w=140):
+    def _saved_hidden_columns(self, table_id: str) -> set:
+        """Columnas ocultas guardadas para una tabla (ver
+        _save_hidden_columns) -- vacío si nunca se guardó nada."""
+        return set(self.config_data.get("table_hidden_columns", {}).get(table_id, []))
+
+    def _save_hidden_columns(self, table_id: str, hidden: set):
+        """Callback de TableView.on_visibility_changed: se guarda en disco
+        en cuanto el usuario oculta/muestra una columna (no espera a
+        "Guardar configuración"), igual que los anchos de columna."""
+        all_saved = dict(self.config_data.get("table_hidden_columns", {}))
+        all_saved[table_id] = sorted(hidden)
+        self.config_data.set("table_hidden_columns", all_saved)
+        self.config_data.save()
+
+    def _compute_cw(self, avail_w=None, dest_w=140, name_w=None, det_w=None,
+                     stat_w=None, bar_w=None, spd_w=None, hidden=()):
         """Calcula anchos de columna adaptativos. avail_w = px disponibles en la tabla.
         FIXED incluye los 6 sashes de 4px + padx de botones (4+2+2+2) = 30px constantes,
         más la columna "Destino" y su separador (4px). "Destino" SÍ tiene
@@ -2148,41 +2224,94 @@ class App(_AppBase):
         28*5 (no *3): 5 botones por fila -- favorito, reservar, subir,
         reproducir, quitar -- desde que se añadieron favorito y reservar;
         cada uno de esos dos añade su propio padx aparte de los 30px de
-        los tres originales (ver fav_btn/lock_btn.pack en _refresh_table)."""
-        FIXED = 74 + 110 + 80 + 60 + 28*5 + 4 + 4 + 30 + dest_w + 4  # widgets fijos + spacing constante
+        los tres originales (ver fav_btn/lock_btn.pack en _refresh_table).
+        +24+4: logo de Jellyfin/Plex ("Abrir en Jellyfin/Plex", ver
+        _open_entry_in_media_server), mismo tamaño que en Liberar espacio.
+
+        name_w/det_w/stat_w/bar_w/spd_w: si se dan (ver _on_table_resize),
+        se usan TAL CUAL en vez de recalcularse -- name/det/stat/bar/spd
+        son TODAS resizable=True (el usuario puede arrastrar su propio
+        sash, y ese ancho se guarda entre sesiones, ver sw0 en
+        _build_files_tab), igual que Destino. Antes, CUALQUIER <Configure>
+        del canvas (típicamente el primero, nada más mapearse la ventana
+        al arrancar, o cualquier redimensionado normal de la ventana
+        después) recalculaba name/det con la fórmula de abajo y machacaba
+        en silencio lo que el usuario hubiera ensanchado a mano -- bug
+        real: "ensancho 'Nombre original' para ver nombres largos,
+        reinicio la app y vuelve a su ancho de antes". Ese mismo arreglo
+        (pasar el ancho REAL en vez de recalcularlo) se aplicó a name/det/
+        dest pero no a stat/bar/spd, que se quedaron como constantes fijas
+        (74/110/80) en FIXED aunque también tienen sash -- así, ensanchar
+        "Estado"/"Subida FTP"/"Vel." a mano y luego redimensionar la
+        ventana calculaba "Nuevo nombre" con MÁS espacio del que en
+        realidad quedaba libre (siguiendo asumiendo el ancho pequeño por
+        defecto de esas tres columnas), así que la fila entera se pasaba
+        del ancho visible de la tabla -- lo que se veía "cortado" por el
+        borde derecho eran los botones (▲▶✕, favorito, candado), que van
+        al final de la fila, después de "Nuevo nombre". Solo se recalculan
+        desde cero (parámetro en None) la primera vez que se construye la
+        tabla, antes de que exista ningún ancho guardado/arrastrado que
+        respetar.
+
+        hidden: claves de columnas ocultas (menú contextual de la
+        cabecera, ver TableView.set_hidden) -- su ancho no se cuenta en
+        FIXED, para que el espacio flexible (name/det/nn) se reparta entre
+        las columnas que de verdad se ven. Antes de soportar columnas
+        ocultas, si ocultabas p.ej. "Subida FTP" (110px) el flex seguía
+        descontando esos 110px que ya nadie ocupaba, y name/det/nn se
+        quedaban más estrechos de lo necesario (texto truncado antes de
+        tiempo)."""
+        hidden = set(hidden)
+        FIXED = 0
+        if "stat" not in hidden:
+            FIXED += stat_w if stat_w is not None else 74
+        if "bar" not in hidden:
+            FIXED += bar_w if bar_w is not None else 110
+        if "spd" not in hidden:
+            FIXED += spd_w if spd_w is not None else 80
+        if "size" not in hidden:
+            FIXED += 60
+        if "logo" not in hidden:
+            FIXED += 24
+        FIXED += 28*5   # fav/lock/btns -- columnas de acción, no ocultables
+        if "dest" not in hidden:
+            FIXED += dest_w
+        FIXED += 4 + 4 + 4 + 30 + 4  # widgets fijos + spacing constante
         PAD   = 16                           # padding interno CTkScrollableFrame
         if avail_w is None:
             avail_w = 900
         flex = max(0, avail_w - FIXED - PAD)
-        name = max(80, int(flex * 0.26))
-        det  = max(55, int(flex * 0.12))
-        nn   = max(0,  flex - name - det)
-        return dict(name=name, det=det, nn=nn, dest=dest_w, stat=74, bar=110, spd=80, size=60, btn=28)
+        if name_w is None:
+            name = max(80, int(flex * 0.26))
+            det  = max(55, int(flex * 0.12))
+        else:
+            name, det = name_w, det_w
+        nn = max(0, flex - name - det)
+        return dict(name=name, det=det, nn=nn, dest=dest_w,
+                    stat=stat_w if stat_w is not None else 74,
+                    bar=bar_w if bar_w is not None else 110,
+                    spd=spd_w if spd_w is not None else 80,
+                    size=60, btn=28, logo=24)
 
     _TABLE_RESIZE_DEBOUNCE_MS = 150   # ver _on_table_resize
 
     def _on_table_resize(self, event):
-        """Reescala columnas al cambiar el ancho del canvas."""
-        # Ancho REAL actual de "Destino" (puede haberse arrastrado a mano
-        # por su propio sash desde el último cálculo, ver _compute_cw) --
-        # nunca el valor por defecto.
-        dest_w = self._file_table.col_width("dest")
-        new_cw = self._compute_cw(event.width, dest_w=dest_w)
-        # "name"/"det" tienen un mínimo (max(80, ...)/max(55, ...)) -- con la
-        # ventana ya estrecha, ambos se quedan clavados en ese mínimo aunque
-        # siga estrechándose más, así que compararlos SOLO a ellos para
-        # decidir "¿hizo falta cambiar algo?" dejaba "nn" (sin mínimo propio,
-        # max(0, flex - name - det)) congelado con un ancho viejo demasiado
-        # generoso -- el texto dejaba de truncarse lo suficiente para el
-        # hueco real y desbordaba la columna (CTkLabel: width es un mínimo,
-        # no un máximo, así que el label se ensanchaba y desplazaba el resto
-        # de la fila). Hay que comprobar también "nn".
-        if (new_cw["name"] == self._col_widths["name"] and new_cw["det"] == self._col_widths["det"]
-                and new_cw["nn"] == self._col_widths["nn"]):
+        """Reajusta las columnas al cambiar el ancho del canvas.
+
+        Toda la aritmética vive ahora en TableView.fit_to_width (que conoce
+        anchos, paddings y mínimos reales de cada columna) en vez de en la
+        fórmula de _compute_cw, que llevaba una lista de constantes a mano
+        ("74 + 110 + 80 + ...") y había que acordarse de actualizar cada vez
+        que una columna cambiaba de ancho por defecto o se volvía
+        arrastrable -- olvidarlo era justo lo que dejaba la fila más ancha
+        que la tabla y escondía los botones del final por la derecha.
+        fit_to_width encoge las columnas arrastrables solo lo necesario (sin
+        bajar de su mínimo) y las devuelve a su ancho elegido en cuanto
+        vuelve a haber sitio."""
+        prev_nn = self._col_widths.get("nn")
+        changed = self._file_table.fit_to_width(event.width)
+        if not changed and self._file_table.col_width("nn") == prev_nn:
             return
-        for key in ("name", "det", "nn"):
-            self._file_table.set_width(key, new_cw[key], refresh=False)
-        self._file_table.refresh_header()
         # _apply_col_widths() (el reflow caro: font.measure() + varios
         # .configure() POR FILA visible) se aplaza con antirrebote -- este
         # handler se dispara en CADA píxel mientras se arrastra el
@@ -2197,6 +2326,13 @@ class App(_AppBase):
         self._table_resize_debounce_id = self.after(
             self._TABLE_RESIZE_DEBOUNCE_MS, self._apply_col_widths_debounced)
 
+    def _on_file_table_visibility_changed(self):
+        """Callback de TableView.on_visibility_changed (menú contextual de
+        la cabecera): redibuja las filas con las columnas ocultas quitadas
+        y persiste el estado, igual que hacen los anchos de columna."""
+        self._refresh_table()
+        self._save_hidden_columns("archivos", self._file_table.hidden_columns())
+
     def _apply_col_widths_debounced(self):
         self._table_resize_debounce_id = None
         self._apply_col_widths()
@@ -2206,26 +2342,31 @@ class App(_AppBase):
         fuente real de los anchos, ver TableView.set_width/col_width) y
         actualiza las filas ya pintadas -- se llama tanto tras
         _on_table_resize como tras arrastrar un separador a mano (ver
-        self._file_table.on_column_resize)."""
+        self._file_table.on_column_resize).
+
+        Ya NO toca el ancho de ningún widget: el ancho lo tiene la celda
+        que envuelve a cada etiqueta (TableView.cell), y de reajustarlas se
+        encarga el propio componente (_apply_cell_widths, llamado desde
+        set_width/_sash_motion). Aquí solo se vuelve a recortar el TEXTO
+        para que el "…" caiga donde toca con el ancho nuevo -- puramente
+        cosmético: si se quedara corto o largo, la celda lo recorta igual y
+        la tabla no se descuadra."""
         for key in ("name", "det", "nn", "dest", "stat", "bar", "spd", "size"):
             self._col_widths[key] = self._file_table.col_width(key)
         cw = self._col_widths
         for row in self._file_rows:
-            row["name"].configure(
-                width=cw["name"],
-                text=_fit_text(row.get("_raw_name", ""), cw["name"], self._font_name))
-            row["detected"].configure(
-                width=cw["det"],
-                text=_fit_text(row.get("_raw_det", ""), cw["det"], self._font_det))
-            row["new_name"].configure(
-                text=_fit_text(row["entry"].new_name, cw["nn"], self._font_nn))
-            row["dest"].configure(
-                width=cw["dest"],
-                text=_fit_text(self._preview_remote_path(row["entry"]), cw["dest"], self._font_det))
-            row["status"].configure(width=cw["stat"])
-            row["ftp_bar"].configure(width=cw["bar"])
-            row["ftp_speed"].configure(width=cw["spd"])
-            row["size"].configure(width=cw["size"])
+            if row["name"] is not None:
+                row["name"].configure(
+                    text=_fit_text(row.get("_raw_name", ""), cw["name"], self._font_name))
+            if row["detected"] is not None:
+                row["detected"].configure(
+                    text=_fit_text(row.get("_raw_det", ""), cw["det"], self._font_det))
+            if row["new_name"] is not None:
+                row["new_name"].configure(
+                    text=_fit_text(row["entry"].new_name, cw["nn"], self._font_nn))
+            if row["dest"] is not None:
+                row["dest"].configure(
+                    text=_fit_text(self._preview_remote_path(row["entry"]), cw["dest"], self._font_det))
 
     _DETAIL_PANEL_MIN_W = 180
     _DETAIL_PANEL_MAX_W = 500
@@ -2280,6 +2421,8 @@ class App(_AppBase):
         self._detail_episode.configure(wraplength=content_w)
         self._detail_overview.configure(width=content_w)
         self._detail_error.configure(width=content_w)
+        self._detail_ftp_path_lbl.configure(wraplength=content_w)
+        self._detail_ftp_tree_box.configure(width=content_w)
         # El wrap cambia con el ancho, así que el número de líneas (y por
         # tanto el alto que necesitan) también cambia.
         self._autosize_textbox(self._detail_title)
@@ -2380,11 +2523,18 @@ class App(_AppBase):
                       command=lambda: self._manual_search(use_ai_fallback=True)).grid(row=2, column=1, padx=(4, 0))
         # Texto dinámico: "Asignar" con un solo archivo (ancla), "Asignar a
         # la selección (N)" con varios marcados vía Ctrl/Shift+clic -- ver
-        # _update_assign_button_label/_current_selection.
-        self._assign_btn = ctk.CTkButton(search_top, text="Asignar", width=200,
+        # _update_assign_button_label/_current_selection. "Asignar y
+        # subir" al lado hace lo mismo y además encola la subida al
+        # momento (mismo _upload_one de siempre, ver
+        # _assign_selected_result) -- para no tener que pulsar "Asignar" y
+        # luego ir a subir el archivo aparte.
+        self._assign_btn = ctk.CTkButton(search_top, text="Asignar", width=95,
                       command=self._assign_selected_result)
-        self._assign_btn.grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self._assign_btn.grid(row=3, column=0, sticky="ew", pady=(4, 0), padx=(0, 4))
+        self._assign_and_upload_btn = ctk.CTkButton(
+            search_top, text="Asignar y subir", width=95,
+            command=lambda: self._assign_selected_result(also_upload=True))
+        self._assign_and_upload_btn.grid(row=3, column=1, sticky="ew", pady=(4, 0))
         # Solo para cómics (ver _reset_search_panel, que la muestra/oculta
         # al cambiar de selección) -- ComicVine falla casi siempre con el
         # título detectado localmente en castellano, este botón pide a la
@@ -2432,6 +2582,16 @@ class App(_AppBase):
         self._blank_poster_image = ctk.CTkImage(
             Image.new("RGBA", (1, 1), (0, 0, 0, 0)), size=(180, 260))
         self._overview_token = None   # token de la carga en curso de sinopsis de OpenLibrary (ver _load_openlibrary_description)
+        # Árbol de archivos FTP del panel de detalle -- token PROPIO, no
+        # self._poster_token: ese se pone a None (no a un object() nuevo)
+        # cuando el resultado no trae póster (ver _apply_overview_and_poster),
+        # así que dos selecciones seguidas sin póster dejarían el mismo
+        # "token" las dos veces y una respuesta FTP obsoleta no se detectaría
+        # como tal. Ver _update_detail_ftp_path_label/_toggle_detail_ftp_tree.
+        self._detail_ftp_token = None
+        self._detail_ftp_tree_expanded = False
+        self._detail_ftp_tree_ruta = None
+        self._detail_ftp_tree_loaded_for = None
         # CTkTextbox (no CTkLabel) para el título, la sinopsis y el error: de
         # solo lectura (state="disabled") pero seleccionable y copiable con
         # ratón/teclado, a diferencia de un CTkLabel normal.
@@ -2460,6 +2620,28 @@ class App(_AppBase):
             text_color=ERROR_COLOR, activate_scrollbars=False)
         self._detail_error.configure(state="disabled")
         self._detail_error.pack(pady=(0, 4), fill="x")
+
+        # Ruta de la serie/película en el FTP (si ya existe de una subida
+        # anterior) -- mismo patrón que el panel de Episodios que faltan:
+        # clicable, despliega el árbol de archivos de esa carpeta. Ver
+        # _update_detail_ftp_path_label/_toggle_detail_ftp_tree.
+        self._detail_ftp_path_lbl = ctk.CTkLabel(
+            scroll, text="", font=ctk.CTkFont(size=11), text_color=PENDING_COLOR,
+            wraplength=215, justify="left", anchor="w", cursor="hand2")
+        self._detail_ftp_path_lbl.pack(pady=(0, 4), fill="x")
+        self._detail_ftp_path_lbl.bind("<Button-1>", lambda ev: self._toggle_detail_ftp_tree())
+
+        self._detail_ftp_tree_box = ctk.CTkTextbox(
+            scroll, width=215, height=180, wrap="word", font=ctk.CTkFont(size=10))
+        self._detail_ftp_tree_box.configure(state="disabled")
+        # sin pack -- solo se empaqueta al desplegar (ver _toggle_detail_ftp_tree)
+
+        # Enlaces personalizables (Ajustes > Plantillas, nivel episodio) --
+        # un archivo de Archivos es siempre un único episodio/película/
+        # emisión, así que usa el mismo nivel que los botones POR EPISODIO
+        # de Episodios que faltan (ver _render_detail_links).
+        self._detail_links_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self._detail_links_frame.pack(pady=(0, 4), fill="x")
 
         return panel
 
@@ -2851,9 +3033,43 @@ class App(_AppBase):
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_synced_server_config(self, updates: dict, learned_terms=None):
-        self.config_data.set_many(updates)
-        self.config_data.save()
+    def _apply_synced_server_config(self, updates: dict, learned_terms=None, force: bool = False):
+        """force=True (ver _discard_local_server_config) aplica *updates*
+        tal cual, sin proteger ninguna clave -- el usuario ya confirmó
+        explícitamente que quiere descartar TODOS sus cambios locales sin
+        publicar y adoptar la del servidor. force=False (el sync
+        silencioso de arranque) sí protege claves con cambios locales sin
+        publicar, ver más abajo."""
+        from core.server_config import load_last_synced_snapshot, save_last_synced_snapshot, diff_local_changes
+        last_synced = {} if force else load_last_synced_snapshot()
+        if last_synced:
+            # No pisar en silencio una clave que el usuario ya cambió en
+            # local desde el último sync/publish y todavía no ha
+            # publicado (bug real: un enlace personalizable nuevo,
+            # guardado pero sin publicar, desaparecía al reiniciar
+            # porque este sync sobrescribía todo sin distinguir) -- se
+            # queda tal cual está en local hasta que decida publicarla o
+            # descartarla a mano (ver _discard_local_server_config, que
+            # SÍ sobrescribe sin distinguir, porque ahí lo pide
+            # explícitamente).
+            locally_changed = diff_local_changes(self.config_data.get, last_synced)
+        else:
+            # Primera vez que se sincroniza en este cliente (o versión
+            # anterior a este arreglo, sin snapshot todavía) -- sin base
+            # fiable de comparación, se aplica todo tal cual siempre se
+            # hizo; el snapshot que se guarda al final ya deja
+            # preparada la protección para el PRÓXIMO sync.
+            locally_changed = set()
+        to_apply = {k: v for k, v in updates.items() if k not in locally_changed}
+        skipped = locally_changed & updates.keys()
+        if to_apply:
+            self.config_data.set_many(to_apply)
+            self.config_data.save()
+        # El snapshot se actualiza con TODO lo descargado, se haya
+        # aplicado o no -- así, si el usuario publica más tarde o su
+        # valor local vuelve a coincidir con el remoto, deja de
+        # protegerse sin necesidad para siempre.
+        save_last_synced_snapshot({**last_synced, **updates})
         if learned_terms is not None:
             from core.learned_terms import set_learned_terms
             set_learned_terms(learned_terms)
@@ -2861,10 +3077,15 @@ class App(_AppBase):
         # el usuario nunca lo ha abierto todavía, no hay widgets que
         # refrescar; se leerán ya actualizados de self.config_data la
         # primera vez que se construya.
-        if self._config_panel_built:
+        if self._config_panel_built and to_apply:
             self._reload_settings_widgets()
-        self._set_status(
-            f"Configuración de servidor actualizada ({len(updates)} parámetro(s))", PENDING_COLOR)
+        if skipped:
+            self._set_status(
+                f"Configuración de servidor actualizada ({len(to_apply)} parámetro(s)) -- "
+                f"{len(skipped)} sin tocar porque tienes cambios locales sin publicar", WARNING_COLOR)
+        elif to_apply:
+            self._set_status(
+                f"Configuración de servidor actualizada ({len(to_apply)} parámetro(s))", PENDING_COLOR)
 
     def _discard_local_server_config(self):
         """Botón "Descartar cambios y recuperar del servidor" en Ajustes →
@@ -2925,7 +3146,7 @@ class App(_AppBase):
                     return
                 updates = filter_shared_config(remote_data)
                 learned_terms = remote_data.get("learned_junk_terms")
-                self.after(0, lambda: self._apply_synced_server_config(updates, learned_terms))
+                self.after(0, lambda: self._apply_synced_server_config(updates, learned_terms, force=True))
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
@@ -2982,6 +3203,12 @@ class App(_AppBase):
             finally:
                 own_ftp.disconnect()
             if up_ok:
+                # Local YA es la configuración publicada -- actualizar el
+                # snapshot de referencia para que el próximo sync de
+                # arranque no la trate como "cambio local sin publicar"
+                # (ver _apply_synced_server_config).
+                from core.server_config import save_last_synced_snapshot
+                save_last_synced_snapshot(data)
                 self.after(0, lambda: self._set_status("Configuración de servidor publicada", SUCCESS_COLOR))
             else:
                 self.after(0, lambda: self._set_status(f"No se pudo publicar: {up_msg}", ERROR_COLOR))
@@ -3925,14 +4152,21 @@ class App(_AppBase):
         arranque (_load_missing_episodes_from_cache), para no duplicar
         esa derivación."""
         from core.missing_episodes_cache import load_cache, save_cache, merge_remote_into_local
-        merged = merge_remote_into_local(load_cache(), remote_cache)
+        previous = load_cache()
+        merged = merge_remote_into_local(previous, remote_cache)
+        changed = merged != previous
         try:
             save_cache(merged)
         except Exception:
             _log.warning("Episodios que faltan: no se pudo guardar el mirror local tras sincronizar",
                          exc_info=True)
             return
-        if getattr(self, "_missing_ep_visible", False):
+        # Igual que _apply_synced_favorites: si el merge no trajo nada
+        # nuevo de verdad, no repintar la tabla entera solo porque la
+        # sincronización se disparó -- eso es lo que se veía como "se
+        # recarga 2-3 veces" al entrar en la pestaña (favoritos/veredictos/
+        # episodios completan cada uno en su propio momento).
+        if changed and getattr(self, "_missing_ep_visible", False):
             self._missing_ep_results = self._load_missing_episodes_from_cache()
             self._render_missing_episodes_table(reset_page=False)
             self._update_missing_ep_status_text()
@@ -4497,9 +4731,11 @@ class App(_AppBase):
         """Actualiza barra / velocidad / estado FTP para todos los file_rows."""
         for row in self._file_rows:
             entry = row["entry"]
-            row["ftp_bar"].set(entry.ftp_progress)
-            spd = _fmt_speed(entry.ftp_speed) if entry.ftp_speed > 0 else ""
-            row["ftp_speed"].configure(text=spd)
+            if row["ftp_bar"] is not None:
+                row["ftp_bar"].set(entry.ftp_progress)
+            if row["ftp_speed"] is not None:
+                spd = _fmt_speed(entry.ftp_speed) if entry.ftp_speed > 0 else ""
+                row["ftp_speed"].configure(text=spd)
 
     def _queue_stop_all(self):
         self._upload_cancel.set()
@@ -4602,6 +4838,32 @@ class App(_AppBase):
         from core.ftp_categories import find_existing_category_folder
         return find_existing_category_folder(cats, info.title, known_folder_name, dir_lookup,
                                               known_year=known_year)
+
+    def _existing_ftp_path_for_info(self, ftp_conn, info, use_cache_only: bool = True,
+                                     known_year=None) -> str:
+        """Ruta "root/carpeta" ya existente en el FTP para *info* (según su
+        media_type), o "" si no hay ninguna coincidencia -- envoltorio fino
+        sobre _find_category_with_existing_folder que solo da formato al
+        resultado. Compartido por _missing_ep_series_path (Episodios que
+        faltan, siempre media_type="tv") y los paneles de detalle de
+        Archivos/Liberar espacio (que pueden pasar cualquier MediaInfo real,
+        tv/movie/libro) -- antes cada uno tenía su propia copia de esta
+        cola. use_cache_only=False limpia primero las raíces con caché
+        vacía de self._ftp_dir_cache (ver el docstring de
+        _find_category_with_existing_folder, force_refresh) para forzar un
+        listado fresco de verdad."""
+        if not use_cache_only:
+            cats = self.config_data.get(
+                "ftp_categories", {"tv": [], "movie": [], "libro": []}).get(info.media_type, [])
+            for cat in cats:
+                root = cat.get("root", "")
+                if root and not self._ftp_dir_cache.get(root):
+                    self._ftp_dir_cache.pop(root, None)
+        category, folder_name = self._find_category_with_existing_folder(
+            ftp_conn, info, use_cache_only=use_cache_only, known_year=known_year)
+        if not category or not folder_name:
+            return ""
+        return f"{category.get('root', '').rstrip('/')}/{folder_name}"
 
     def _resolve_series_folder(self, ftp_conn, category: dict, info, entry=None) -> str:
         """Si ya existe en la raíz de *category* una carpeta con nombre
@@ -5277,8 +5539,10 @@ class App(_AppBase):
         """Actualiza barra y velocidad durante la subida (llamado desde after)."""
         for row in self._file_rows:
             if row["entry"] is entry:
-                row["ftp_bar"].set(pct)
-                row["ftp_speed"].configure(text=_fmt_speed(speed_bps) if speed_bps > 0 else "")
+                if row["ftp_bar"] is not None:
+                    row["ftp_bar"].set(pct)
+                if row["ftp_speed"] is not None:
+                    row["ftp_speed"].configure(text=_fmt_speed(speed_bps) if speed_bps > 0 else "")
                 break
         # Velocidad total en la barra de estado (ver _update_status_bar) --
         # _update_status_bar() en realidad recorre TODO self.files (no solo
@@ -5305,8 +5569,10 @@ class App(_AppBase):
         def _do():
             for row in self._file_rows:
                 if row["entry"] is entry:
-                    row["ftp_bar"].set(pct)
-                    row["ftp_speed"].configure(text="", text_color=PENDING_COLOR)
+                    if row["ftp_bar"] is not None:
+                        row["ftp_bar"].set(pct)
+                    if row["ftp_speed"] is not None:
+                        row["ftp_speed"].configure(text="", text_color=PENDING_COLOR)
                     self._ftp_row_done(entry)
                     break
         self.after(0, _do)
@@ -5368,7 +5634,11 @@ class App(_AppBase):
         # aRenombrar contra este mismo FTP, se sincroniza sola al arrancar
         # y "Publicar" (cabecera de esta pestaña, ver
         # _build_server_publish_header) la sobrescribe para todos.
-        tabs = ctk.CTkTabview(panel)
+        # command=: ver el mismo motivo en server_tabs más abajo -- cambiar
+        # entre "Cliente"/"Servidor" también puede dejar visible por
+        # primera vez la pestaña "Plantillas" (si ya estaba seleccionada
+        # de una visita anterior dentro de "Servidor").
+        tabs = ctk.CTkTabview(panel, command=lambda: self._apply_custom_links_desc_wraplength())
         tabs.grid(row=0, column=0, sticky="nsew")
         self._config_tabs = tabs
 
@@ -5385,7 +5655,13 @@ class App(_AppBase):
         server_wrap = ctk.CTkFrame(server_tab, fg_color="transparent")
         server_wrap.pack(fill="both", expand=True)
         self._build_server_publish_header(server_wrap)
-        server_tabs = ctk.CTkTabview(server_wrap)
+        # command=: al entrar en "Plantillas" (o cualquier otra pestaña de
+        # aquí) se recalcula el wraplength del texto de enlaces
+        # personalizables -- su contenedor solo tiene geometría real
+        # mientras está seleccionado (ver _apply_custom_links_desc_wraplength),
+        # así que el primer redimensionado de VENTANA no basta si el
+        # usuario todavía no había entrado nunca en esta pestaña concreta.
+        server_tabs = ctk.CTkTabview(server_wrap, command=lambda: self._apply_custom_links_desc_wraplength())
         server_tabs.pack(fill="both", expand=True)
         self._build_tmdb_tab(server_tabs.add("TMDB / IA"))
         self._build_templates_tab(server_tabs.add("Plantillas"))
@@ -5540,6 +5816,32 @@ class App(_AppBase):
         self._manual_action_combo.set(self.config_data.get(
             "manual_action", "Mantener original"))
         self._manual_action_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(0, 12))
+
+        # ── aMule / Descargas ──
+        amule_fr = ctk.CTkFrame(scroll)
+        amule_fr.pack(fill="both", expand=True, padx=0, pady=(0, 8))
+        amule_fr.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(amule_fr, text="Descargas con aMule",
+                     font=self._cfg_font_title).grid(
+            row=0, column=0, columnspan=2, pady=(12, 6))
+        ctk.CTkLabel(amule_fr,
+                     text="Conexión a aMule para buscar y descargar episodios que faltan "
+                          "desde la red eDonkey/Kad. Necesitas tener aMule en ejecución "
+                          "y las External Connections activadas (Preferencias > Control Remoto).",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=600).grid(
+            row=1, column=0, columnspan=2, pady=(0, 10))
+        self._amule_entries = {}
+        for i, (label, key, secret) in enumerate([
+            ("amulecmd (ruta):", "amulecmd_path", False),
+            ("Host:",            "amule_host",    False),
+            ("Puerto:",          "amule_port",    False),
+            ("Contraseña:",      "amule_password", True),
+        ], start=2):
+            ctk.CTkLabel(amule_fr, text=label).grid(row=i, column=0, sticky="e", padx=10, pady=6)
+            e = ctk.CTkEntry(amule_fr, show="*" if secret else "", width=200)
+            e.insert(0, str(self.config_data.get(key, "")))
+            e.grid(row=i, column=1, padx=10, pady=6, sticky="ew")
+            self._amule_entries[key] = e
 
     def _build_ftp_connection_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -6862,17 +7164,49 @@ class App(_AppBase):
         links_sec.pack(fill="both", expand=True, padx=0, pady=(0, 8))
         ctk.CTkLabel(links_sec, text="Enlaces personalizables (episodios que faltan)",
                      font=self._cfg_font_title).pack(padx=12, pady=(12, 4), anchor="w")
-        ctk.CTkLabel(links_sec, text=("Botones para abrir una URL con variables sustituidas -- solo "
-                                      "eso, nunca se conectan a nada por su cuenta. Variables "
-                                      "disponibles: {serie}, {tmdb_id}, {temporada}, {episodio}, "
-                                      "{titulo}, {nombre_archivo}, {ruta} (carpeta de la serie en el "
-                                      "FTP, si ya existe) -- las que no apliquen al nivel del botón "
-                                      "-- p.ej. {episodio} a nivel serie -- quedan vacías. Marca "
-                                      "\"Segundo plano\" para que, en vez de abrir una pestaña del "
-                                      "navegador, se haga una petición silenciosa a la URL (útil para "
-                                      "webhooks o disparar una búsqueda en otra herramienta)."),
-                     font=self._cfg_font_desc, text_color=PENDING_COLOR,
-                     wraplength=520, justify="left").pack(padx=12, pady=(0, 8), anchor="w")
+        self._custom_links_desc_lbl = ctk.CTkLabel(
+            links_sec, text=("Botones para abrir una URL con variables sustituidas -- solo "
+                             "eso, nunca se conectan a nada por su cuenta. Variables "
+                             "disponibles: {serie}, {tmdb_id}, {temporada}, {episodio}, "
+                             "{titulo}, {nombre_archivo}, {ruta} (carpeta de la serie en el "
+                             "FTP, si ya existe) -- las que no apliquen al nivel del botón "
+                             "-- p.ej. {episodio} a nivel serie -- quedan vacías. Marca "
+                             "\"Segundo plano\" para que, en vez de abrir una pestaña del "
+                             "navegador, se haga una petición silenciosa a la URL (útil para "
+                             "webhooks o disparar una búsqueda en otra herramienta)."),
+            font=self._cfg_font_desc, text_color=PENDING_COLOR, justify="left")
+        self._custom_links_desc_lbl.pack(padx=12, pady=(0, 8), anchor="w", fill="x")
+        # wraplength dinámico -- antes fijo (520px), dejaba un hueco enorme
+        # sin usar con la ventana ancha y podía recortarse con la ventana
+        # estrecha. links_sec vive dentro de un CTkScrollableFrame (la
+        # pestaña de Ajustes) anidado a su vez en dos CTkTabview -- su
+        # propio <Configure> no llega de forma fiable ahí dentro
+        # (confirmado con introspección directa: nunca se disparó al
+        # redimensionar la ventana, con o sin la pestaña "Plantillas"
+        # seleccionada). Se engancha en su lugar al <Configure> de la
+        # ventana raíz (self, ya usado para la cabecera responsiva, ver
+        # _on_root_resize) con el mismo antirrebote, y se mide
+        # links_sec.winfo_width() en el momento -- ese sí refleja el ancho
+        # real disponible cuando de verdad hace falta usarlo.
+        # El propio CTkScrollableFrame (o links_sec, dentro de él) informa
+        # un ancho "de contenido" que crece para acomodar lo que sea que
+        # quiera mostrar (útil para poder hacer scroll horizontal si
+        # hiciera falta, pero aquí es justo el problema: con wraplength=0
+        # de fábrica el texto pide una sola línea kilométrica, y el
+        # contenedor "crece" a juego, dando un ancho inútil para medir
+        # cuánto hay disponible de VERDAD -- comprobado con introspección
+        # directa). scroll._parent_canvas sí es el viewport real visible,
+        # no el contenido -- mismo criterio ya confirmado esta sesión con
+        # el árbol de archivos de Episodios que faltan.
+        self._custom_links_canvas = scroll._parent_canvas
+        self._custom_links_desc_resize_after_id = None
+        self.bind("<Configure>", self._on_custom_links_desc_resize, add="+")
+        # Primera medida real -- diferida, la geometría todavía no está
+        # asentada en este mismo ciclo de construcción (mismo motivo que
+        # _measure_header_full_width). Sin esto, el texto se queda sin
+        # envolver (wraplength=0, el de fábrica) hasta el primer
+        # redimensionado de la ventana.
+        self.after(0, self._apply_custom_links_desc_wraplength)
 
         self._custom_links_rows_frame = {}
         self._custom_links_widgets = {}
@@ -6880,6 +7214,7 @@ class App(_AppBase):
             ("show", "custom_links_show", "Nivel serie"),
             ("season", "custom_links_season", "Nivel temporada"),
             ("episode", "custom_links_episode", "Nivel episodio"),
+            ("movie", "custom_links_movie", "Nivel película"),
         ):
             ctk.CTkLabel(links_sec, text=title, font=self._cfg_font_small_bold).pack(
                 padx=12, pady=(4, 2), anchor="w")
@@ -6893,6 +7228,23 @@ class App(_AppBase):
             ctk.CTkButton(links_sec, text="+ Añadir enlace", width=140,
                           command=lambda lvl=level: self._add_custom_link_row(lvl, "", "")).pack(
                 pady=(4, 12), padx=12, anchor="w")
+
+    _CUSTOM_LINKS_DESC_RESIZE_DEBOUNCE_MS = 150
+
+    def _on_custom_links_desc_resize(self, event):
+        if event.widget is not self:
+            return   # <Configure> también burbujea desde widgets hijos -- solo interesa el de la ventana
+        if self._custom_links_desc_resize_after_id is not None:
+            self.after_cancel(self._custom_links_desc_resize_after_id)
+        self._custom_links_desc_resize_after_id = self.after(
+            self._CUSTOM_LINKS_DESC_RESIZE_DEBOUNCE_MS, self._apply_custom_links_desc_wraplength)
+
+    def _apply_custom_links_desc_wraplength(self):
+        self._custom_links_desc_resize_after_id = None
+        self._custom_links_canvas.update_idletasks()
+        w = self._custom_links_canvas.winfo_width()
+        if w > 1:   # todavía sin geometría real (p.ej. pestaña nunca visitada) -- nada que ajustar aún
+            self._custom_links_desc_lbl.configure(wraplength=max(200, w - 24))
 
     def _add_custom_link_row(self, level: str, name: str, url_template: str, background: bool = False):
         row = ctk.CTkFrame(self._custom_links_rows_frame[level], fg_color="transparent")
@@ -7136,6 +7488,18 @@ class App(_AppBase):
                 "missing_ep_hide_no_dub", self._missing_ep_hide_no_dub_var,
                 self._on_toggle_hide_no_dub))
         self._missing_ep_hide_no_dub_switch.pack(side="right", padx=4, pady=8)
+        # Favoritos/protegidos siempre arriba (ver _missing_ep_visible_rows)
+        # -- activado por defecto (mismo comportamiento de antes de que
+        # existiera este interruptor), pero desactivable si el usuario
+        # prefiere el orden de columna "puro", sin ese grupo fijado arriba.
+        self._missing_ep_pin_favorites_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_ep_pin_favorites", True))
+        self._missing_ep_pin_favorites_switch = ctk.CTkSwitch(
+            right_fr, text="Favoritos/protegidos primero", variable=self._missing_ep_pin_favorites_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_ep_pin_favorites", self._missing_ep_pin_favorites_var,
+                self._render_missing_episodes_table))
+        self._missing_ep_pin_favorites_switch.pack(side="right", padx=4, pady=8)
         # El recuento de series ocultas se funde en el propio texto del
         # interruptor (ver _update_missing_ep_dub_hidden_counter) en vez de
         # una etiqueta aparte al lado -- esa ocupaba demasiado sitio.
@@ -7190,15 +7554,21 @@ class App(_AppBase):
             ColumnSpec("toggle", "", width=28),
             ColumnSpec("logo", "", width=28),
             ColumnSpec("fav", "", width=28),
-            ColumnSpec("name", "Serie", expand=True, resizable=True),
-            ColumnSpec("premiere", "Estreno", width=80),
-            ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100),
-            ColumnSpec("trending", "Tendencia", width=70),
+            ColumnSpec("lock", "", width=28),
+            ColumnSpec("name", "Serie", expand=True, resizable=True, sortable=True),
+            ColumnSpec("premiere", "Estreno", width=80, sortable=True),
+            ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100,
+                       sortable=True),
+            ColumnSpec("trending", "Tendencia", width=70, sortable=True),
             ColumnSpec("ignore", "", width=90),
             ColumnSpec("rescan", "", width=36),
             ColumnSpec("delete", "", width=36),
-        ])
+        ], header_right_pad=30)   # ver TableView.__init__ -- medido a mano contra esta tabla en concreto
+        self._missing_ep_table.on_header_click = self._on_missing_ep_header_click
+        self._missing_ep_sort_key = "name"   # arranca igual que el comportamiento previo (alfabético)
+        self._missing_ep_sort_asc = True
         self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
+        self._missing_ep_table.set_sort_indicator(self._missing_ep_sort_key, self._missing_ep_sort_asc)
         self._missing_ep_table.on_column_resize = self._on_missing_ep_column_resize
         self._missing_ep_table.on_widths_changed = lambda w: self._save_table_col_widths("episodios", w)
         self._missing_ep_table.enable_dynamic_page_size(lambda _size: self._missing_ep_render_page())
@@ -7959,7 +8329,42 @@ class App(_AppBase):
     def _missing_ep_visible_rows(self) -> list:
         rows = [row for row in (self._visible_missing_ep_row(r) for r in self._missing_ep_results)
                 if row is not None]
-        return sorted(rows, key=lambda r: r["name"].lower())
+        rows.sort(key=self._missing_ep_sort_key_fn(self._missing_ep_sort_key),
+                  reverse=not self._missing_ep_sort_asc)
+        # Favoritos Y protegidos arriba (mismo grupo, sin distinguir entre
+        # ellos), sea cual sea la columna elegida -- desactivable con el
+        # interruptor "Favoritos/protegidos primero" (activado por
+        # defecto). Un segundo sort ESTABLE (nunca reverse) que solo
+        # reagrupa, preservando dentro de cada grupo el orden que ya se
+        # calculó arriba (Python garantiza sort() estable).
+        if self._missing_ep_pin_favorites_var.get():
+            rows.sort(key=lambda r: not (self._is_favorite("tv", r["tmdb_id"])
+                                          or self._is_reserved("tv", r["tmdb_id"])))
+        return rows
+
+    @staticmethod
+    def _missing_ep_sort_key_fn(key: str):
+        """Función de clave de orden para _missing_ep_visible_rows según
+        la columna elegida (ver _on_missing_ep_header_click) -- "premiere"
+        usa el ISO "AAAA-MM-DD" tal cual (ordena bien como texto),
+        "summary" usa el total de episodios que faltan (el texto mostrado
+        es un resumen, no algo con sentido ordenar letra a letra), y
+        "trending" reutiliza la misma función que ya pinta la celda
+        (core.trending.trending_score), para que el orden coincida
+        siempre con lo que se ve."""
+        if key == "premiere":
+            return lambda r: r.get("first_air_date") or ""
+        if key == "summary":
+            return lambda r: sum(len(eps) for eps in r["missing"].values())
+        if key == "trending":
+            return lambda r: trending_score(r.get("play_count", 0), r.get("last_played_ts"), _time.time())
+        return lambda r: r["name"].lower()
+
+    def _on_missing_ep_header_click(self, key: str):
+        self._missing_ep_sort_key, self._missing_ep_sort_asc = self._next_sort_state(
+            self._missing_ep_sort_key, self._missing_ep_sort_asc, key)
+        self._missing_ep_table.set_sort_indicator(self._missing_ep_sort_key, self._missing_ep_sort_asc)
+        self._render_missing_episodes_table(reset_page=False)
 
     def _missing_ep_render_page(self, scroll_top: bool = True):
         """Dibuja solo self._missing_ep_page de las filas que pasan los
@@ -8224,14 +8629,21 @@ class App(_AppBase):
         # relleno coincide exactamente con el de la fila, no es un fallo de
         # color de customtkinter, es un artefacto de la fuente con ESE
         # glifo concreto). Mismo motivo en los botones "Anterior"/"Siguiente".
-        toggle_btn = ctk.CTkLabel(header_row, text=("v" if expanded else ">"), width=cw("toggle"), cursor="hand2")
-        toggle_btn.pack(side="left", padx=(6, 0), pady=6)
+        # Celdas con recorte (ver TableView.cell) -- header_row es una tira
+        # horizontal de una sola línea; el detalle desplegable va DEBAJO,
+        # dentro de row_fr, así que no le afecta el alto fijo de las celdas.
+        _cell = lambda key, pady=6, **kw: self._missing_ep_table.cell(header_row, key, pady=pady, **kw)
+
+        c = _cell("toggle")
+        toggle_btn = ctk.CTkLabel(c, text=("v" if expanded else ">"), cursor="hand2")
+        toggle_btn.pack(fill="both", expand=True)
         toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id: self._toggle_missing_ep_expand(tid))
 
         source_img = self._plex_logo_img if r["source"] == "plex" else self._jellyfin_logo_img
-        logo_lbl = ctk.CTkLabel(header_row, image=source_img, text="", width=cw("logo"), cursor="hand2")
-        logo_lbl.pack(side="left", pady=6)
-        logo_lbl.bind("<Button-1>", lambda ev, row=r: self._open_source_server_link(row))
+        c = _cell("logo")
+        logo_lbl = ctk.CTkLabel(c, image=source_img, text="", cursor="hand2")
+        logo_lbl.pack(fill="both", expand=True)
+        logo_lbl.bind("<Button-1>", lambda ev, row=r: self._open_in_media_server(row["source"], row.get("server_id")))
 
         # "Episodios que faltan" es siempre sobre series (huecos de
         # temporada/episodio) -- no aplica a películas.
@@ -8241,24 +8653,38 @@ class App(_AppBase):
         # por fila (con su dibujo de hover/relleno) multiplicaba tanto el
         # trabajo síncrono de ese arranque que llegaba a impedir que el
         # resto de la ventana (cabecera incluida) terminase de pintarse.
+        c = _cell("fav")
         fav_btn = ctk.CTkLabel(
-            header_row, text="★" if self._is_favorite("tv", tmdb_id) else "☆",
-            width=cw("fav"), cursor="hand2",
+            c, text="★" if self._is_favorite("tv", tmdb_id) else "☆", cursor="hand2",
             text_color=ACCENT if self._is_favorite("tv", tmdb_id) else PENDING_COLOR)
-        fav_btn.pack(side="left", pady=6)
+        fav_btn.pack(fill="both", expand=True)
         fav_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["name"]:
                       self._toggle_missing_ep_favorite(tid, name))
 
+        # Igual que en Archivos/Liberar espacio (ver _lock_symbol/
+        # _toggle_cleanup_item_reservation) -- CTkLabel + bind, no
+        # CTkButton, mismo motivo de rendimiento que fav_btn arriba (~500
+        # series cacheadas de golpe al arrancar).
+        c = _cell("lock")
+        lock_btn = ctk.CTkLabel(
+            c, text="🔒" if self._is_reserved("tv", tmdb_id) else "🔓", cursor="hand2",
+            text_color=ACCENT if self._is_reserved("tv", tmdb_id) else PENDING_COLOR)
+        lock_btn.pack(fill="both", expand=True)
+        lock_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["name"]:
+                       self._toggle_missing_ep_reservation(tid, name))
+
         name_color = PENDING_COLOR if r.get("ignored") else None
-        name_lbl = ctk.CTkLabel(header_row, text=r["name"], font=self._missing_ep_name_font,
+        c = _cell("name")
+        name_lbl = ctk.CTkLabel(c, text=r["name"], font=self._missing_ep_name_font,
                                 anchor="w", text_color=name_color, cursor="hand2")
-        name_lbl.pack(side="left", padx=4, pady=6, fill="x", expand=True)
+        name_lbl.pack(fill="both", expand=True)
         name_lbl.bind("<Button-1>", lambda e, tid=tmdb_id, row=r: self._on_missing_ep_name_click(tid, row))
 
-        premiere_lbl = ctk.CTkLabel(header_row, text=_fmt_air_date(r.get("first_air_date")),
-                                    width=cw("premiere"), font=self._missing_ep_summary_font,
+        c = _cell("premiere")
+        premiere_lbl = ctk.CTkLabel(c, text=_fmt_air_date(r.get("first_air_date")),
+                                    font=self._missing_ep_summary_font,
                                     text_color=PENDING_COLOR)
-        premiere_lbl.pack(side="left", padx=(0, 4), pady=6)
+        premiere_lbl.pack(fill="both", expand=True)
 
         n_missing = sum(len(eps) for eps in r["missing"].values())
         n_seasons = len(r["missing"])
@@ -8281,35 +8707,40 @@ class App(_AppBase):
             summary_color = WARNING_COLOR
         else:
             summary_color = PENDING_COLOR
-        # padx=(4, 4) espeja el separador de 4px de la cabecera (TableView,
-        # ver gui/table_view.py) para que ambas queden alineadas.
-        summary_lbl = ctk.CTkLabel(header_row, text=summary, font=self._missing_ep_summary_font,
-                                   width=cw("summary"),
+        c = _cell("summary")
+        summary_lbl = ctk.CTkLabel(c, text=summary, font=self._missing_ep_summary_font,
                                    text_color=summary_color, anchor="w")
-        summary_lbl.pack(side="left", padx=(4, 4), pady=6)
+        summary_lbl.pack(fill="both", expand=True)
 
         score = trending_score(r.get("play_count", 0), r.get("last_played_ts"), _time.time())
-        trending_lbl = ctk.CTkLabel(header_row, text=format_trending_score(score), width=cw("trending"),
+        c = _cell("trending")
+        trending_lbl = ctk.CTkLabel(c, text=format_trending_score(score),
                                     font=self._missing_ep_summary_font, text_color=PENDING_COLOR)
-        trending_lbl.pack(side="left", padx=(0, 4), pady=6)
+        trending_lbl.pack(fill="both", expand=True)
         attach_tooltip(trending_lbl, lambda row=r: explain_trending_score(
             row.get("play_count", 0), row.get("last_played_ts"), _time.time()))
 
         btn_text = "Restaurar" if r.get("ignored") else "Ignorar"
-        ctk.CTkButton(header_row, text=btn_text, width=cw("ignore"), fg_color="transparent", border_width=1,
+        c = _cell("ignore")
+        ctk.CTkButton(c, text=btn_text, fg_color="transparent", border_width=1,
                       command=lambda tid=tmdb_id, ig=not r.get("ignored"):
-                      self._toggle_missing_ep_ignore(tid, ig)).pack(side="left", padx=(4, 4), pady=6)
+                      self._toggle_missing_ep_ignore(tid, ig)).pack(fill="both", expand=True)
 
-        rescan_btn = ctk.CTkButton(header_row, text="🔄", width=cw("rescan"), height=24,
+        c = _cell("rescan")
+        rescan_btn = ctk.CTkButton(c, text="🔄", height=24,
                       fg_color="transparent", border_width=1,
                       command=lambda row=r: self._rescan_single_missing_ep_series(row))
-        rescan_btn.pack(side="left", padx=(0, 4), pady=6)
+        rescan_btn.pack(fill="both", expand=True)
 
-        ctk.CTkButton(header_row, text="🗑", width=cw("delete"), height=24,
+        # padx trailing=12 (no 0): margen deliberado al final de la fila,
+        # nada que ver con los sashes -- se conserva a mano, col_padx()
+        # solo modela el margen IZQUIERDO de cada columna.
+        c = _cell("delete", padx=(self._missing_ep_table.col_padx("delete")[0], 12))
+        ctk.CTkButton(c, text="🗑", height=24,
                       fg_color="transparent", border_width=1,
                       text_color=ERROR_COLOR, hover_color=("gray85", "#3d1010"),
                       command=lambda row=r: self._confirm_delete_missing_ep_series(row)
-                      ).pack(side="left", padx=(0, 12), pady=6)
+                      ).pack(fill="both", expand=True)
 
         detail_fr = None
         if expanded:
@@ -8319,7 +8750,7 @@ class App(_AppBase):
         self._missing_ep_row_widgets[tmdb_id] = {
             "row_fr": row_fr, "toggle_btn": toggle_btn, "detail_fr": detail_fr, "r": r,
             "summary_lbl": summary_lbl, "trending_lbl": trending_lbl, "fav_btn": fav_btn,
-            "rescan_btn": rescan_btn,
+            "lock_btn": lock_btn, "rescan_btn": rescan_btn,
         }
 
     def _toggle_missing_ep_favorite(self, tmdb_id: int, name: str):
@@ -8332,27 +8763,49 @@ class App(_AppBase):
                                           text_color=ACCENT if is_fav else PENDING_COLOR)
         self._toggle_favorite("tv", tmdb_id, name, on_done=_refresh)
 
-    def _open_source_server_link(self, r: dict):
-        """Al pulsar el logo de Plex/Jellyfin de una fila en Episodios que
-        faltan, abre esa serie en la web del servidor correspondiente --
-        solo informativo, no descarga ni cambia nada. server_id es el Id
-        de Jellyfin o el ratingKey de Plex (ver _scan_missing_episodes/
-        _load_missing_episodes_from_cache); si falta (series cacheadas
-        antes de que se empezara a guardar este campo), pide reanalizar."""
-        server_id = r.get("server_id")
+    def _toggle_missing_ep_reservation(self, tmdb_id: int, name: str):
+        """Igual que _toggle_missing_ep_favorite, pero con cuota
+        configurable por usuario (ver core/reservations.py) -- necesita un
+        tamaño para cargar la cuota, que aquí no se conoce directamente
+        (una serie con huecos puede no tener nada descargado todavía):
+        se reutiliza _best_known_size_bytes, el mismo atajo que ya usa
+        Archivos para reservar desde un solo episodio (mira si "Liberar
+        espacio" ya tiene el tamaño real de la carpeta completa en su
+        caché de último análisis; 0 si no se conoce, _toggle_reservation
+        ya sabe tratar eso como "no ocupa nada de cuota todavía")."""
+        def _refresh():
+            widgets = self._missing_ep_row_widgets.get(tmdb_id)
+            if not widgets:
+                return
+            is_res = self._is_reserved("tv", tmdb_id)
+            widgets["lock_btn"].configure(text="🔒" if is_res else "🔓",
+                                          text_color=ACCENT if is_res else PENDING_COLOR)
+        size_bytes = self._best_known_size_bytes("tv", tmdb_id, 0)
+        self._toggle_reservation("tv", tmdb_id, name, size_bytes, on_done=_refresh)
+
+    def _open_in_media_server(self, source: str, server_id: str):
+        """Abre un ítem en la web de Jellyfin/Plex -- solo informativo, no
+        descarga ni cambia nada. server_id es el Id de Jellyfin o el
+        ratingKey de Plex. Compartido por las 3 listas que ya saben
+        source/server_id de un ítem concreto (Episodios que faltan,
+        Liberar espacio, Archivos ya subidos -- ver
+        _open_entry_in_media_server para Archivos, que primero tiene que
+        AVERIGUAR source/server_id con una búsqueda por tmdb_id, ya que un
+        archivo no viene de un escaneo a Jellyfin/Plex como las otras
+        dos)."""
         if not server_id:
             self._set_status(
                 "No se pudo abrir: vuelve a analizar para que esta serie tenga el enlace guardado",
                 WARNING_COLOR)
             return
 
-        if r["source"] == "jellyfin":
+        if source == "jellyfin":
             host = self.config_data.get("jellyfin_host", "").rstrip("/")
             if not host:
                 return
             import webbrowser
             webbrowser.open(f"{host}/web/#/details?id={server_id}")
-        elif r["source"] == "plex":
+        elif source == "plex":
             host = self.config_data.get("plex_host", "").rstrip("/")
             token = self.config_data.get("plex_token", "")
             if not host or not token:
@@ -8378,6 +8831,44 @@ class App(_AppBase):
             webbrowser.open(url)
             self._set_status("", PENDING_COLOR)
         self.after(0, _open)
+
+    def _open_entry_in_media_server(self, entry):
+        """Logo "Abrir en Jellyfin/Plex" de una fila de Archivos (ver
+        _refresh_table) -- a diferencia de Episodios que faltan/Liberar
+        espacio (CleanupItem.source/server_id, ya rellenos de un escaneo
+        previo a Jellyfin/Plex), un archivo se identificó buscando
+        directamente en TMDB, sin pasar nunca por ninguno de los dos --
+        aquí hace falta una búsqueda NUEVA por tmdb_id en el momento del
+        clic (ver core/media_server_refresh.py::
+        find_jellyfin_item_by_tmdb_id/find_plex_item_by_tmdb_id). Jellyfin
+        primero, Plex como alternativa si no aparece -- misma preferencia
+        que en el resto de la app."""
+        if not entry.media_info or not entry.media_info.tmdb_id:
+            return
+        tmdb_id = entry.media_info.tmdb_id
+        media_type = entry.media_info.media_type
+        self._set_status("Buscando en Jellyfin/Plex...", PENDING_COLOR)
+
+        def worker():
+            from core.media_server_refresh import find_jellyfin_item_by_tmdb_id, find_plex_item_by_tmdb_id
+            if self.config_data.get("jellyfin_enabled"):
+                found = find_jellyfin_item_by_tmdb_id(
+                    self.config_data.get("jellyfin_host", ""), self.config_data.get("jellyfin_api_key", ""),
+                    tmdb_id, media_type)
+                if found:
+                    self.after(0, lambda: self._open_in_media_server("jellyfin", found["id"]))
+                    return
+            if self.config_data.get("plex_enabled"):
+                found = find_plex_item_by_tmdb_id(
+                    self.config_data.get("plex_host", ""), self.config_data.get("plex_token", ""),
+                    tmdb_id, media_type)
+                if found:
+                    self.after(0, lambda: self._open_in_media_server("plex", found["rating_key"]))
+                    return
+            self.after(0, lambda: self._set_status(
+                "No se encontró en Jellyfin/Plex -- puede que la biblioteca aún no se haya actualizado",
+                WARNING_COLOR))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_missing_ep_detail_frame(self, parent, r: dict):
         """Construye (una sola vez por fila, la primera vez que se expande)
@@ -8458,10 +8949,16 @@ class App(_AppBase):
                             self._toggle_missing_ep_season_expand(tid, s))
             season_ignored = season in (r.get("ignored_seasons") or set())
             ctk.CTkButton(
-                header_fr, text="Restaurar" if season_ignored else "Ignorar temporada",
+                header_fr, text="Restaurar" if season_ignored else "Ignorar",
                 width=110, height=22, fg_color="transparent", border_width=1,
                 command=lambda tid=tmdb_id, s=season, ig=not season_ignored:
                 self._toggle_missing_ep_season_ignore(tid, s, ig)).pack(side="left", padx=(6, 0))
+            season_search_query = f"{r['name']} {season}x"
+            ctk.CTkButton(header_fr, text="🔍 aMule", width=70, height=22,
+                          fg_color="transparent", border_width=1,
+                          command=lambda sq=season_search_query, sn=r['name']:
+                          self._search_missing_ep_on_amule(sq, sn)).pack(
+                side="left", padx=(4, 0))
             season_vars = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season}
             for link in season_links:
                 template = link.get("url_template", "")
@@ -8534,6 +9031,12 @@ class App(_AppBase):
                 command=lambda tid=tmdb_id, s=season, e=ep, ig=not ep_ignored:
                 self._toggle_missing_ep_episode_ignore(tid, s, e, ig)).grid(
                 row=ep_row, column=btn_col, padx=(4, 0), pady=1)
+            btn_col += 1
+            ctk.CTkButton(episodes_fr, text="🔍 aMule", width=70, height=22,
+                          fg_color="transparent", border_width=1,
+                          command=lambda n=name, sn=r["name"]:
+                          self._search_missing_ep_on_amule(n, sn)).grid(
+                row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             variables = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season,
                         "episodio": ep, "titulo": title, "nombre_archivo": name}
             for link in episode_links:
@@ -8576,6 +9079,406 @@ class App(_AppBase):
         self.clipboard_append(text)
         self._set_status(f"Copiado: {text}", SUCCESS_COLOR)
 
+    def _search_missing_ep_on_amule(self, filename: str, series_name: str):
+        amule = AmuleClient(
+            host=self.config_data.get("amule_host", "localhost"),
+            port=self.config_data.get("amule_port", 4712),
+            password=self.config_data.get("amule_password", ""),
+            amulecmd_path=self.config_data.get("amulecmd_path", "amulecmd"),
+        )
+        if not amule.is_available:
+            messagebox.showwarning("aMule no disponible",
+                "No se encontró 'amulecmd' en el sistema.\n\n"
+                "Instálalo con: sudo apt install amule-utils  (Linux/macOS)\n"
+                "o asegúrate de que esté en el PATH.", parent=self)
+            return
+        ok, msg = amule.test_connection()
+        if not ok:
+            messagebox.showerror("Error de conexión",
+                f"No se pudo conectar con aMule:\n{msg}\n\n"
+                "Revisa los ajustes en Configuración -> General.",
+                parent=self)
+            return
+        self._show_amule_search_results(filename, series_name)
+
+    def _show_amule_search_results(self, filename: str, series_name: str):
+        self._downloads_close_session()
+        self._show_view("downloads")
+        self._downloads_search_var.set(filename)
+        self._downloads_do_search()
+
+    # ---- Métodos de la pestaña Descargas ----
+
+    def _build_downloads_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.grid_columnconfigure(0, weight=1)
+
+        self._downloads_search_var = ctk.StringVar(value="")
+        search_entry = ctk.CTkEntry(top, textvariable=self._downloads_search_var, font=ctk.CTkFont(size=11))
+        search_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        search_entry.bind("<Return>", lambda e: self._downloads_do_search())
+
+        ctk.CTkLabel(top, text="Tipo:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
+        self._downloads_file_type_var = ctk.StringVar(value="Cualquiera")
+        self._downloads_file_type_menu = ctk.CTkOptionMenu(
+            top, values=["Cualquiera", "Video", "Audio", "Imagen", "Documento", "Programa", "Archivo", "ISO"],
+            variable=self._downloads_file_type_var, width=100)
+        self._downloads_file_type_menu.pack(side="left", padx=(0, 6))
+
+        ctk.CTkLabel(top, text="Red:", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
+        self._downloads_search_type_var = ctk.StringVar(
+            value=self.config_data.get("amule_search_type", "Kad"))
+        self._downloads_type_menu = ctk.CTkOptionMenu(
+            top, values=["Kad", "Global", "Local"],
+            variable=self._downloads_search_type_var, width=80,
+            command=self._on_downloads_red_changed)
+        self._downloads_type_menu.pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(top, text="Buscar", width=70, height=28,
+                      command=self._downloads_do_search).pack(side="left", padx=(0, 6))
+
+        self._downloads_status_lbl = ctk.CTkLabel(parent, text="",
+                                                   font=ctk.CTkFont(size=11), anchor="w")
+        self._downloads_status_lbl.grid(row=1, column=0, sticky="ew", pady=(0, 2))
+
+        table_fr = ctk.CTkFrame(parent, fg_color="transparent")
+        table_fr.grid(row=2, column=0, sticky="nsew")
+        table_fr.grid_columnconfigure(0, weight=1)
+        table_fr.grid_rowconfigure(1, weight=1)
+
+        # TableView como el resto de tablas de la app (antes era una
+        # cabecera + CTkScrollableFrame a mano, con los anchos escritos dos
+        # veces -- y ya no coincidían: la cabecera reservaba 90px para la
+        # última columna y la fila gastaba 80+6+12=98, así que cabecera y
+        # filas iban desalineadas de fábrica). Igual que las demás tablas:
+        # separadores arrastrables (resizable), ordenación por cabecera
+        # (sortable) y ocultar/mostrar columnas con el menú contextual del
+        # clic derecho (on_visibility_changed).
+        sw0 = self._saved_col_widths("descargar")   # anchos guardados de una sesión anterior, si hay
+        self._downloads_table = TableView(table_fr, columns=[
+            ColumnSpec("name", "Nombre de archivo", width=sw0.get("name", 300), min_width=80,
+                       expand=True, resizable=True, sortable=True),
+            ColumnSpec("size", "Tamaño", width=sw0.get("size", 100), min_width=60,
+                       resizable=True, sortable=True),
+            ColumnSpec("sources", "Fuentes", width=sw0.get("sources", 70), min_width=50,
+                       resizable=True, sortable=True),
+            ColumnSpec("tipo", "Tipo", width=sw0.get("tipo", 80), min_width=60,
+                       resizable=True, sortable=True),
+            ColumnSpec("accion", "", width=98, hideable=False),
+        ], header_right_pad=24,   # ver TableView.__init__ -- la barra de scroll del body
+        # roba 22px (border_spacing 6 + scrollbar 16) que la cabecera no
+        # tiene, +2 por el padx=2 de las filas; medido contra esta tabla en
+        # concreto (mismo procedimiento que Archivos/Episodios).
+           on_visibility_changed=self._on_downloads_table_visibility_changed)
+        self._downloads_table.row_height = 24
+        self._downloads_table.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self._downloads_table_body = self._downloads_table.body
+        # Fuente compartida de las filas -- una sola instancia, la misma que
+        # usa _fit_text para recortar (ver _downloads_rebuild_page).
+        self._downloads_font = ctk.CTkFont(size=11)
+        self._downloads_table.set_hidden(self._saved_hidden_columns("descargar"), notify=False)
+        self._downloads_table.on_widths_changed = lambda w: self._save_table_col_widths("descargar", w)
+        self._downloads_table.on_header_click = self._on_downloads_header_click
+        self._downloads_sort_key = None   # ver _on_downloads_header_click -- sin ordenar hasta pulsar una cabecera
+        self._downloads_sort_asc = True
+
+        pag = ctk.CTkFrame(parent, fg_color="transparent")
+        pag.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self._downloads_prev_btn = ctk.CTkButton(pag, text="< Anterior", width=100, height=26,
+                                                  command=self._downloads_prev_page, state="disabled")
+        self._downloads_prev_btn.pack(side="left", padx=(0, 8))
+        self._downloads_page_lbl = ctk.CTkLabel(pag, text="", font=ctk.CTkFont(size=11), anchor="center")
+        self._downloads_page_lbl.pack(side="left", expand=True)
+        self._downloads_next_btn = ctk.CTkButton(pag, text="Siguiente >", width=100, height=26,
+                                                  command=self._downloads_next_page, state="disabled")
+        self._downloads_next_btn.pack(side="right")
+
+        self._downloads_results = []
+        self._downloads_page = 0
+        self._downloads_per_page = 25
+        self._downloads_session = None
+        self._downloads_amule = None
+
+    def _downloads_close_session(self):
+        if self._downloads_session:
+            try:
+                self._downloads_session.close()
+            except Exception:
+                pass
+            self._downloads_session = None
+            self._downloads_amule = None
+
+    def _downloads_ensure_session(self) -> bool:
+        if self._downloads_session and self._downloads_session.is_alive():
+            return True
+        self._downloads_close_session()
+        amule = AmuleClient(
+            host=self.config_data.get("amule_host", "localhost"),
+            port=self.config_data.get("amule_port", 4712),
+            password=self.config_data.get("amule_password", ""),
+            amulecmd_path=self.config_data.get("amulecmd_path", "amulecmd"),
+        )
+        if not amule.is_available:
+            return False
+        sess = amule.create_session()
+        if sess is None or not sess.is_alive():
+            return False
+        self._downloads_amule = amule
+        self._downloads_session = sess
+        return True
+
+    def _on_downloads_red_changed(self, value: str):
+        """Persiste la red elegida en el selector "Red" (Kad/Global/Local)
+        -- se guarda en disco al elegirla, no al buscar, y se restaura al
+        arrancar la app (config amule_search_type)."""
+        if self.config_data.get("amule_search_type") != value:
+            self.config_data.set("amule_search_type", value)
+            self.config_data.save()
+
+    def _downloads_do_search(self):
+        self._downloads_type_menu.configure(state="disabled")
+        self._downloads_file_type_menu.configure(state="disabled")
+        query = self._downloads_search_var.get().strip()
+        if not query:
+            self._downloads_status_lbl.configure(text="Introduce un término de búsqueda",
+                                                  text_color=ERROR_COLOR)
+            self._downloads_type_menu.configure(state="normal")
+            self._downloads_file_type_menu.configure(state="normal")
+            return
+        st = self._downloads_search_type_var.get()
+        self._on_downloads_red_changed(st)
+        self._downloads_status_lbl.configure(
+            text=f'Buscando "{query}" en {st}... (espera ~10 segundos)', text_color=PENDING_COLOR)
+        self._downloads_status_lbl.update()
+        threading.Thread(target=self._downloads_perform_search, args=(query,), daemon=True).start()
+
+    _downloads_type_map = {
+        "Cualquiera": "",
+        "Video": "Video",
+        "Audio": "Audio",
+        "Imagen": "Image",
+        "Documento": "Doc",
+        "Programa": "Pro",
+        "Archivo": "Arc",
+        "ISO": "Iso",
+    }
+
+    _downloads_type_map = {
+        "Cualquiera": "",
+        "Video": "Video",
+        "Audio": "Audio",
+        "Imagen": "Image",
+        "Documento": "Doc",
+        "Programa": "Pro",
+        "Archivo": "Arc",
+        "ISO": "Iso",
+    }
+
+    def _downloads_perform_search(self, query: str):
+        st = self._downloads_search_type_var.get()
+        if not self._downloads_ensure_session():
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
+            self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
+            self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
+            return
+        ft_label = self._downloads_file_type_var.get()
+        ft = self._downloads_type_map.get(ft_label, "")
+        try:
+            results = self._downloads_amule.search_in_session(
+                self._downloads_session, query, search_type=st, wait_seconds=10, file_type=ft)
+        except Exception as e:
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text=f"Error: {e}", text_color=ERROR_COLOR))
+            self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
+            self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
+            return
+        self.after(0, lambda: self._downloads_display_results(results))
+        self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
+        self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
+
+    @staticmethod
+    def _downloads_truncate(text: str, max_len: int = 100) -> str:
+        return text if len(text) <= max_len else text[:max_len - 3] + "..."
+
+    def _downloads_display_results(self, results: list):
+        self._downloads_results = results
+        self._downloads_page = 0
+        # Una búsqueda nueva trae resultados en su orden natural (por
+        # número/antigüedad): se limpia el orden manual elegido antes.
+        self._downloads_sort_key = None
+        self._downloads_sort_asc = True
+        self._downloads_table.set_sort_indicator(None, True)
+        if not results:
+            self._downloads_status_lbl.configure(
+                text="Sin resultados. (intenta cambiar el tipo de búsqueda)", text_color=PENDING_COLOR)
+            self._downloads_rebuild_page()
+            return
+        self._downloads_status_lbl.configure(
+            text=f"{len(results)} resultado(s) encontrado(s)", text_color=SUCCESS_COLOR)
+        self._downloads_rebuild_page()
+
+    def _downloads_clear_rows(self):
+        for w in list(self._downloads_table_body.winfo_children()):
+            w.destroy()
+
+    def _downloads_rebuild_page(self):
+        self._downloads_clear_rows()
+        results = self._downloads_results
+        if not results:
+            self._downloads_page_lbl.configure(text="")
+            self._downloads_prev_btn.configure(state="disabled")
+            self._downloads_next_btn.configure(state="disabled")
+            return
+        total = len(results)
+        pp = self._downloads_per_page
+        max_page = (total - 1) // pp
+        page = self._downloads_page
+        if page > max_page:
+            page = max_page
+            self._downloads_page = page
+        start = page * pp
+        end = min(start + pp, total)
+        hidden = self._downloads_table.hidden_columns()
+        for res in results[start:end]:
+            row_fr = ctk.CTkFrame(self._downloads_table_body, fg_color=("gray95", "gray17"))
+            row_fr.pack(fill="x", pady=2, padx=2)
+            # Celdas con recorte (ver TableView.cell): el nombre de un
+            # resultado de búsqueda puede ser larguísimo, y antes empujaba
+            # a Tamaño/Fuentes/Tipo y dejaba el botón "Descargar" fuera de
+            # la vista. El tooltip sigue mostrando el nombre completo.
+            # name es expand=True, así que su ancho no está fijado de
+            # antemano: _fit_text se aplica al ancho REAL de la celda
+            # (event.width) y se re-ajusta al redimensionar la ventana o
+            # arrastrar un separador -- el corte sale con "…" igual que en
+            # Archivos, nunca cortado a lo bruto por el recorte de la celda.
+            # Las columnas ocultas (menú contextual de la cabecera, ver
+            # TableView._show_column_menu) no se construyen ni se empaquetan.
+            def _refit(ev, lbl, raw):
+                if ev.width > 1:
+                    txt = _fit_text(raw, ev.width, self._downloads_font)
+                    if lbl.cget("text") != txt:
+                        lbl.configure(text=txt)
+
+            if "name" not in hidden:
+                c = self._downloads_table.cell(row_fr, "name", pady=6)
+                lbl = ctk.CTkLabel(c, text=res.name, font=self._downloads_font, anchor="w")
+                lbl.pack(fill="both", expand=True)
+                attach_tooltip(lbl, lambda n=res.name: n)
+                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=res.name: _refit(ev, lbl, raw))
+
+            if "size" not in hidden:
+                c = self._downloads_table.cell(row_fr, "size", pady=6)
+                lbl = ctk.CTkLabel(c, text=res.size_human, font=self._downloads_font, anchor="w")
+                lbl.pack(fill="both", expand=True)
+                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=res.size_human: _refit(ev, lbl, raw))
+
+            if "sources" not in hidden:
+                c = self._downloads_table.cell(row_fr, "sources", pady=6)
+                lbl = ctk.CTkLabel(c, text=str(res.sources), font=self._downloads_font, anchor="w")
+                lbl.pack(fill="both", expand=True)
+                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=str(res.sources): _refit(ev, lbl, raw))
+
+            if "tipo" not in hidden:
+                tipo = "Completo" if res.complete else "Parcial"
+                c = self._downloads_table.cell(row_fr, "tipo", pady=6)
+                ctk.CTkLabel(c, text=tipo, font=self._downloads_font, anchor="w",
+                             text_color=SUCCESS_COLOR if res.complete else PENDING_COLOR).pack(
+                    fill="both", expand=True)
+
+            # accion no es ocultable (ColumnSpec hideable=False) -- el botón
+            # de la última columna siempre está.
+            c = self._downloads_table.cell(row_fr, "accion", pady=6)
+            ctk.CTkButton(c, text="Descargar", width=80, height=24,
+                         command=lambda n=res.number: self._downloads_do_download(n)).pack(
+                side="left")
+        self._downloads_update_pagination()
+
+    def _on_downloads_header_click(self, key: str):
+        """Ordena los resultados de la búsqueda por la columna pulsada --
+        mismo comportamiento que las demás tablas (ver _next_sort_state):
+        alterna dirección si ya está activa, ascendente si es otra."""
+        self._downloads_sort_key, self._downloads_sort_asc = self._next_sort_state(
+            self._downloads_sort_key, self._downloads_sort_asc, key)
+        self._downloads_table.set_sort_indicator(self._downloads_sort_key, self._downloads_sort_asc)
+
+        def _sort_key(res):
+            if key == "name":
+                return res.name.lower()
+            if key == "size":
+                return _parse_size_human(res.size_human)
+            if key == "sources":
+                return res.sources
+            if key == "tipo":
+                return res.complete
+            return 0
+
+        self._downloads_results.sort(key=_sort_key, reverse=not self._downloads_sort_asc)
+        self._downloads_page = 0   # el orden nuevo se ve desde el principio
+        self._downloads_rebuild_page()
+
+    def _on_downloads_table_visibility_changed(self):
+        """Callback de TableView.on_visibility_changed (menú contextual de
+        la cabecera): redibuja las filas sin las columnas ocultas y
+        persiste el estado, igual que hacen los anchos de columna."""
+        self._downloads_rebuild_page()
+        self._save_hidden_columns("descargar", self._downloads_table.hidden_columns())
+
+    def _downloads_update_pagination(self):
+        total = len(self._downloads_results)
+        pp = self._downloads_per_page
+        if total == 0:
+            self._downloads_page_lbl.configure(text="")
+            self._downloads_prev_btn.configure(state="disabled")
+            self._downloads_next_btn.configure(state="disabled")
+            return
+        max_page = (total - 1) // pp
+        cur = self._downloads_page + 1
+        self._downloads_page_lbl.configure(text=f"Página {cur} de {max_page + 1}  ({total} resultado(s))")
+        self._downloads_prev_btn.configure(state="normal" if self._downloads_page > 0 else "disabled")
+        self._downloads_next_btn.configure(state="normal" if self._downloads_page < max_page else "disabled")
+
+    def _downloads_prev_page(self):
+        if self._downloads_page > 0:
+            self._downloads_page -= 1
+            self._downloads_rebuild_page()
+
+    def _downloads_next_page(self):
+        total = len(self._downloads_results)
+        pp = self._downloads_per_page
+        max_page = (total - 1) // pp if total > 0 else 0
+        if self._downloads_page < max_page:
+            self._downloads_page += 1
+            self._downloads_rebuild_page()
+
+    def _downloads_do_download(self, result_number: int):
+        self._downloads_status_lbl.configure(
+            text=f"Enviando descarga #{result_number} a aMule...", text_color=PENDING_COLOR)
+        threading.Thread(target=self._downloads_do_download_worker,
+                         args=(result_number,), daemon=True).start()
+
+    def _downloads_do_download_worker(self, result_number: int):
+        if not self._downloads_session or not self._downloads_session.is_alive():
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text="Error: sesión aMule cerrada", text_color=ERROR_COLOR))
+            return
+        ok, raw = self._downloads_amule.download_in_session(self._downloads_session, result_number)
+        def _update():
+            if ok:
+                self._downloads_status_lbl.configure(
+                    text=f"Descarga #{result_number} enviada a aMule (revísalo en la cola de aMule)",
+                    text_color=SUCCESS_COLOR)
+            else:
+                debug = f" (raw: {raw[:200]})" if raw else ""
+                self._downloads_status_lbl.configure(
+                    text=f"Error al iniciar descarga #{result_number}.{debug}",
+                    text_color=ERROR_COLOR)
+        self.after(0, _update)
+
     def _toggle_missing_ep_expand(self, tmdb_id):
         if tmdb_id in self._missing_ep_expanded:
             self._missing_ep_expanded.discard(tmdb_id)
@@ -8592,15 +9495,28 @@ class App(_AppBase):
             if widgets["detail_fr"] is None:
                 widgets["detail_fr"] = self._build_missing_ep_detail_frame(widgets["row_fr"], widgets["r"])
             widgets["detail_fr"].pack(fill="x", padx=(36, 12), pady=(0, 8))
+            # Al desplegar (con la flecha ">"/"v" o con el nombre, ver
+            # _on_missing_ep_name_click) también se selecciona la serie y
+            # se carga su ficha en el panel lateral -- antes solo pasaba
+            # pulsando el nombre; pulsar la flecha desplegaba sin
+            # seleccionar nada, dejando el panel con la ficha de otra
+            # serie (o vacío).
+            self._show_missing_ep_poster(widgets["r"])
         elif widgets["detail_fr"] is not None:
             widgets["detail_fr"].pack_forget()
 
     def _on_missing_ep_name_click(self, tmdb_id, r: dict):
-        """Pulsar el nombre de una serie despliega sus episodios (igual que
-        antes) Y además carga su ficha de TMDB en el panel lateral, igual
-        que el buscador de Archivos."""
+        """Pulsar el nombre de una serie despliega/colapsa sus episodios --
+        _toggle_missing_ep_expand ya selecciona y carga la ficha al
+        desplegar (ver arriba); si en cambio esta pulsación COLAPSA una
+        fila ya abierta, _toggle... no llama a _show_missing_ep_poster
+        (no hace falta al colapsar), así que se llama aquí para que
+        pulsar el nombre de una fila ya abierta también la traiga al
+        panel lateral, igual que siempre."""
+        was_expanded = tmdb_id in self._missing_ep_expanded
         self._toggle_missing_ep_expand(tmdb_id)
-        self._show_missing_ep_poster(r)
+        if was_expanded:
+            self._show_missing_ep_poster(r)
 
     def _show_missing_ep_poster(self, r: dict):
         self._missing_ep_current_row = r
@@ -8718,20 +9634,6 @@ class App(_AppBase):
         corrompía la conexión y hacía fallar la búsqueda en TODAS las
         series, no solo en la que se estaba mirando."""
         import types
-        if not use_cache_only:
-            # _find_category_with_existing_folder solo lista una raíz si
-            # NO está ya en self._ftp_dir_cache -- si quedó una entrada
-            # vacía de antes (p.ej. un corte de red al listar, visto ya
-            # una vez con el cruce del FTP del escaneo), "ya está en
-            # caché" y nunca se vuelve a intentar, aunque use_cache_only
-            # diga que sí se puede conectar de verdad. Se limpian aquí las
-            # raíces vacías para forzar un listado fresco de verdad.
-            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get("tv", [])
-            for cat in cats:
-                root = cat.get("root", "")
-                if root and not self._ftp_dir_cache.get(root):
-                    self._ftp_dir_cache.pop(root, None)
-
         # SimpleNamespace, no MediaInfo -- _find_category_with_existing_folder
         # solo necesita title/media_type y, si se conoce, folder_name (ver
         # get_jellyfin_series::folder_name, el nombre REAL de carpeta que ya
@@ -8741,12 +9643,9 @@ class App(_AppBase):
         # parecido de nombres, el mismo fallo que "Acusado" (Jellyfin, en
         # español) vs carpeta real "Accused" ya tuvo en el botón de borrar.
         info = types.SimpleNamespace(title=r["name"], media_type="tv", folder_name=r.get("folder_name"))
-        category, folder_name = self._find_category_with_existing_folder(
+        return self._existing_ftp_path_for_info(
             ftp_conn or self.ftp, info, use_cache_only=use_cache_only,
             known_year=self._missing_ep_known_year(r))
-        if not category or not folder_name:
-            return ""
-        return f"{category.get('root', '').rstrip('/')}/{folder_name}"
 
     def _update_missing_ep_path_label(self, r: dict, token):
         """Muestra directamente la ruta de la serie en el FTP, sin pulsar
@@ -10601,6 +11500,9 @@ class App(_AppBase):
         else:
             self._rename_remote_switch.deselect()
 
+        for key, entry in self._amule_entries.items():
+            _set_entry(entry, self.config_data.get(key, ""))
+
         saved = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []})
         self._categories = {mt: [dict(c) for c in saved.get(mt, [])] for mt in self._CATEGORY_TYPES}
         for mt in self._CATEGORY_TYPES:
@@ -11139,7 +12041,23 @@ class App(_AppBase):
         # (mismo arreglo que Episodios, ver [[project_pagination_user_object_limit]]).
         self._file_list_frame._parent_canvas.yview_moveto(0)
 
-        cw = self._col_widths
+        # Leído en vivo de self._file_table (no de self._col_widths) para
+        # name/det/nn/dest/stat/bar/spd/size: self._col_widths es un mirror
+        # que solo se resincroniza tras el antirrebote de 150ms de
+        # _on_table_resize (ver _apply_col_widths_debounced) -- _refresh_table
+        # puede llamarse DENTRO de ese hueco (progreso de subida, archivo
+        # añadido/quitado durante un redimensionado de ventana en curso), y
+        # entonces pintaba las filas con el ancho VIEJO mientras la cabecera
+        # ya mostraba el nuevo (bug real: nombres largos truncados con
+        # muchos más caracteres de los que cabían de verdad en su columna,
+        # invadiendo visualmente "Detectado"/"Nuevo nombre"). self._file_table
+        # .col_width() siempre refleja el valor YA aplicado a la cabecera
+        # (set_width() lo actualiza de forma síncrona, sin esperar al
+        # antirrebote), así que leerlo aquí en vez del mirror cierra la
+        # ventana de desincronización de raíz.
+        cw = {**self._col_widths, **{k: self._file_table.col_width(k) for k in
+              ("name", "det", "nn", "dest", "stat", "bar", "spd", "size")}}
+        hidden = self._file_table.hidden_columns()
         for i, entry in enumerate(page_files):
             rf = ctk.CTkFrame(
                 self._file_list_frame,
@@ -11160,102 +12078,175 @@ class App(_AppBase):
             _BF = self._font_btn
 
             # ── Todo pack desde la IZQUIERDA en orden visual; nn expande para llenar el hueco ──
-            name_lbl = ctk.CTkLabel(rf, text=_fit_text(entry.name, cw["name"], self._font_name), anchor="w",
-                                     font=self._font_name, width=cw["name"])
-            name_lbl.pack(side="left", padx=0, pady=2)
+            # Cada columna va dentro de su propia CELDA (TableView.cell):
+            # un contenedor de ancho fijo que RECORTA lo que no cabe, así
+            # que ninguna etiqueta puede ensanchar su columna y empujar a
+            # las siguientes por mucho que su texto crezca (ver el docstring
+            # de cell()). _fit_text se sigue usando, pero solo para que el
+            # corte quede con "…" -- ya no es lo que sostiene la alineación,
+            # así que no necesita márgenes mágicos (-12/-16/-24) distintos
+            # en cada sitio, que es justo lo que descuadraba unas filas sí y
+            # otras no según quién las hubiera repintado la última.
+            # Las columnas ocultas (menú contextual de la cabecera, ver
+            # TableView._show_column_menu) no se construyen ni se empaquetan;
+            # las entradas del dict de la fila quedan a None y los que
+            # consumen (_apply_col_widths/_update_row) las saltan.
+            cells = []
+            name_lbl = None
+            if "name" not in hidden:
+                c = self._file_table.cell(rf, "name", pady=2); cells.append(c)
+                name_lbl = ctk.CTkLabel(c, text=_fit_text(entry.name, cw["name"], self._font_name),
+                                         anchor="w", font=self._font_name)
+                name_lbl.pack(fill="both", expand=True)
 
             # Detectado: doble clic para corregir a mano título/temporada/
             # episodio -- ver _edit_detected. Útil cuando detect_episode()
             # no acierta con un nombre de archivo raro, sin tener que
             # esperar a un arreglo de regex para poder subir ESE archivo ya.
-            det_lbl = ctk.CTkLabel(rf, text=_fit_text(det_text, cw["det"], self._font_det), anchor="w",
-                                    font=self._font_det, text_color=PENDING_COLOR,
-                                    width=cw["det"], cursor="hand2")
-            det_lbl.pack(side="left", padx=(4, 0), pady=2)   # mirror sash name|det
-            det_lbl.bind("<Double-Button-1>", lambda ev, e=entry: self._edit_detected(e))
+            det_lbl = None
+            if "det" not in hidden:
+                c = self._file_table.cell(rf, "det", pady=2); cells.append(c)
+                det_lbl = ctk.CTkLabel(c, text=_fit_text(det_text, cw["det"], self._font_det), anchor="w",
+                                         font=self._font_det, text_color=PENDING_COLOR, cursor="hand2")
+                det_lbl.pack(fill="both", expand=True)
+                det_lbl.bind("<Double-Button-1>", lambda ev, e=entry: self._edit_detected(e))
 
-            nn_lbl = ctk.CTkLabel(rf, text=_fit_text(entry.new_name, cw["nn"], self._font_nn), anchor="w",
-                                   font=self._font_nn,
-                                   text_color=ACCENT if entry.new_name else PENDING_COLOR)
-            nn_lbl.pack(side="left", padx=(4, 0), pady=2, fill="x", expand=True)  # mirror sash det|nn
+            nn_lbl = None
+            if "nn" not in hidden:
+                c = self._file_table.cell(rf, "nn", pady=2); cells.append(c)
+                nn_lbl = ctk.CTkLabel(c, text=_fit_text(entry.new_name, cw["nn"], self._font_nn), anchor="w",
+                                       font=self._font_nn,
+                                       text_color=ACCENT if entry.new_name else PENDING_COLOR)
+                nn_lbl.pack(fill="both", expand=True)
 
             # Destino: doble clic para fijarlo a mano (ver _edit_remote_dir)
             # -- en naranja/acento si el usuario ya lo fijó, para
             # distinguirlo del calculado automáticamente por categoría.
-            dest_lbl = ctk.CTkLabel(
-                rf, text=_fit_text(self._preview_remote_path(entry), cw["dest"], self._font_det),
-                anchor="w", font=self._font_det, width=cw["dest"], cursor="hand2",
-                text_color=ACCENT if entry.remote_dir_override else PENDING_COLOR)
-            dest_lbl.pack(side="left", padx=(4, 0), pady=2)   # mirror sash nn|dest
-            dest_lbl.bind("<Double-Button-1>", lambda ev, e=entry: self._edit_remote_dir(e))
+            dest_lbl = None
+            if "dest" not in hidden:
+                c = self._file_table.cell(rf, "dest", pady=2); cells.append(c)
+                dest_lbl = ctk.CTkLabel(
+                    c, text=_fit_text(self._preview_remote_path(entry), cw["dest"], self._font_det),
+                    anchor="w", font=self._font_det, cursor="hand2",
+                    text_color=ACCENT if entry.remote_dir_override else PENDING_COLOR)
+                dest_lbl.pack(fill="both", expand=True)
+                dest_lbl.bind("<Double-Button-1>", lambda ev, e=entry: self._edit_remote_dir(e))
 
-            st_lbl = ctk.CTkLabel(rf, text=_status_label(entry.status), width=cw["stat"],
-                                   anchor="w", font=self._font_small,
-                                   text_color=sc.get(entry.status, PENDING_COLOR))
-            st_lbl.pack(side="left", padx=(4, 0), pady=2)    # mirror sash nn|stat
+            st_lbl = None
+            if "stat" not in hidden:
+                c = self._file_table.cell(rf, "stat", pady=2); cells.append(c)
+                st_lbl = ctk.CTkLabel(c, text=_status_label(entry.status),
+                                       anchor="w", font=self._font_small,
+                                       text_color=sc.get(entry.status, PENDING_COLOR))
+                st_lbl.pack(fill="both", expand=True)
 
-            ftp_bar = ctk.CTkProgressBar(rf, height=8, width=cw["bar"], corner_radius=0)
-            ftp_bar.set(entry.ftp_progress)
-            ftp_bar.pack(side="left", padx=(4, 0), pady=2)   # mirror sash stat|bar
+            ftp_bar = None
+            if "bar" not in hidden:
+                c = self._file_table.cell(rf, "bar", pady=2); cells.append(c)
+                # fill="x" (no "both") + expand: la barra conserva su alto de
+                # 8px y queda centrada en la celda, en vez de estirarse a lo
+                # alto de toda la fila.
+                ftp_bar = ctk.CTkProgressBar(c, height=8, corner_radius=0)
+                ftp_bar.set(entry.ftp_progress)
+                ftp_bar.pack(fill="x", expand=True)
 
-            spd_text = _fmt_speed(entry.ftp_speed) if entry.ftp_speed > 0 else ""
-            ftp_speed = ctk.CTkLabel(rf, text=spd_text, width=cw["spd"],
-                                      font=self._font_small, text_color=PENDING_COLOR)
-            ftp_speed.pack(side="left", padx=(4, 0), pady=2) # mirror sash bar|spd
+            ftp_speed = None
+            if "spd" not in hidden:
+                c = self._file_table.cell(rf, "spd", pady=2); cells.append(c)
+                spd_text = _fmt_speed(entry.ftp_speed) if entry.ftp_speed > 0 else ""
+                ftp_speed = ctk.CTkLabel(c, text=spd_text,
+                                          font=self._font_small, text_color=PENDING_COLOR)
+                ftp_speed.pack(fill="both", expand=True)
 
-            size_lbl = ctk.CTkLabel(rf, text=self._file_size_text(entry), width=cw["size"],
-                                     anchor="w", font=self._font_small, text_color=PENDING_COLOR)
-            size_lbl.pack(side="left", padx=(4, 0), pady=2)  # mirror sash spd|size
+            size_lbl = None
+            if "size" not in hidden:
+                c = self._file_table.cell(rf, "size", pady=2); cells.append(c)
+                size_lbl = ctk.CTkLabel(c, text=self._file_size_text(entry),
+                                         anchor="w", font=self._font_small, text_color=PENDING_COLOR)
+                size_lbl.pack(fill="both", expand=True)
 
+            # "Abrir en Jellyfin/Plex" (ver _open_entry_in_media_server) --
+            # a diferencia de Episodios que faltan/Liberar espacio (que ya
+            # traen su server_id de un escaneo previo), un archivo no viene
+            # de un escaneo a Jellyfin/Plex: hace falta buscarlo por
+            # tmdb_id EN EL MOMENTO DEL CLIC, así que solo tiene sentido
+            # una vez subido de verdad (mismo gate que el candado de
+            # reservar) y con una ficha de TMDB real (no libros/cómics,
+            # que no existen en Jellyfin/Plex). El logo mostrado es el del
+            # servidor PREFERIDO (Jellyfin > Plex, ver
+            # core/server_config.py), no necesariamente el que de verdad
+            # tiene el ítem -- eso solo se sabe al buscar.
+            logo_clickable = bool(
+                entry.media_info and entry.media_info.media_type in ("tv", "movie")
+                and entry.media_info.tmdb_id and entry.status == "subido")
+            show_media_logo = bool(self.config_data.get("jellyfin_enabled") or self.config_data.get("plex_enabled"))
+            logo_img = self._jellyfin_logo_img if self.config_data.get("jellyfin_enabled") else self._plex_logo_img
+            c = self._file_table.cell(rf, "logo", pady=2); cells.append(c)
+            logo_lbl = ctk.CTkLabel(c, image=logo_img if show_media_logo else self._blank_logo_img, text="",
+                                     cursor="hand2" if logo_clickable else "")
+            logo_lbl.pack(fill="both", expand=True)
+            if logo_clickable:
+                logo_lbl.bind("<Button-1>", lambda ev, e=entry: self._open_entry_in_media_server(e))
+
+            c = self._file_table.cell(rf, "fav", pady=2); cells.append(c)
             fav_btn = ctk.CTkButton(
-                rf, text=self._fav_symbol(entry), width=cw["btn"], height=26,
+                c, text=self._fav_symbol(entry), width=cw["btn"], height=26,
                 font=_BF, fg_color="transparent", border_width=0,
                 text_color=ACCENT if self._entry_is_favorite(entry) else PENDING_COLOR,
                 hover_color=("gray85", "#2b2b2b"),
                 state="normal" if entry.media_info else "disabled",
                 command=lambda e=entry: self._toggle_entry_favorite(e))
-            fav_btn.pack(side="left", padx=(4, 0), pady=2)
+            fav_btn.pack(fill="both", expand=True)
 
             # Reservar (ver core/reservations.py) solo tiene sentido una vez
             # el archivo está de verdad en el servidor -- antes de subir no
             # hay nada que proteger todavía, así que se deshabilita hasta
             # que entry.status == "subido" (igual que favorito, deshabilitado
             # sin media_info).
+            c = self._file_table.cell(rf, "lock", pady=2); cells.append(c)
             lock_btn = ctk.CTkButton(
-                rf, text=self._lock_symbol(entry), width=cw["btn"], height=26,
+                c, text=self._lock_symbol(entry), width=cw["btn"], height=26,
                 font=_BF, fg_color="transparent", border_width=0,
                 text_color=ACCENT if self._entry_is_reserved(entry) else PENDING_COLOR,
                 hover_color=("gray85", "#2b2b2b"),
                 state="normal" if (entry.media_info and entry.status == "subido") else "disabled",
                 command=lambda e=entry: self._toggle_entry_reservation(e))
-            lock_btn.pack(side="left", padx=(4, 0), pady=2)
+            lock_btn.pack(fill="both", expand=True)
 
-            ftp_up = ctk.CTkButton(rf, text="▲", width=cw["btn"], height=26,
+            # Los tres botones de acción comparten una única celda ("btns",
+            # ancha 28*3+6) -- dentro de ella siguen empaquetándose en
+            # horizontal, pero ya no pueden salirse de la fila.
+            btns_cell = self._file_table.cell(rf, "btns", pady=2); cells.append(btns_cell)
+            ftp_up = ctk.CTkButton(btns_cell, text="▲", width=cw["btn"], height=26,
                                     font=_BF, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                     command=lambda e=entry: self._upload_one(e))
-            ftp_up.pack(side="left", padx=(4, 0), pady=2)    # mirror sash size|btns
+            ftp_up.pack(side="left")
 
-            play_btn = ctk.CTkButton(rf, text="▶", width=cw["btn"], height=26,
+            play_btn = ctk.CTkButton(btns_cell, text="▶", width=cw["btn"], height=26,
                                       font=_BF, fg_color="transparent", border_width=1,
                                       command=lambda e=entry: self._play_file(e))
-            play_btn.pack(side="left", padx=(2, 0), pady=2)
+            play_btn.pack(side="left", padx=(2, 0))
 
-            del_btn = ctk.CTkButton(rf, text="✕", width=cw["btn"], height=26,
+            del_btn = ctk.CTkButton(btns_cell, text="✕", width=cw["btn"], height=26,
                                      font=_BF, fg_color="transparent", border_width=1,
                                      border_color=ERROR_COLOR, text_color=ERROR_COLOR,
                                      hover_color=("gray85", "#3d1010"),
                                      command=lambda e=entry: self._remove_entry(e))
-            del_btn.pack(side="left", padx=(2, 2), pady=2)
+            del_btn.pack(side="left", padx=(2, 0))
 
-            for w in (rf, name_lbl, det_lbl, nn_lbl, dest_lbl, st_lbl):
-                w.bind("<Button-1>", lambda ev, e=entry: self._on_row_click(ev, e))
-                w.bind("<Button-3>", lambda ev, e=entry: self._show_row_menu(ev, e))
+            # Las CELDAS también responden al clic, no solo las etiquetas de
+            # dentro: con el recorte, una etiqueta corta deja hueco vacío en
+            # su celda, y pulsar ahí debe seleccionar la fila igualmente.
+            for w in [rf, name_lbl, det_lbl, nn_lbl, dest_lbl, st_lbl] + cells:
+                if w is not None:
+                    w.bind("<Button-1>", lambda ev, e=entry: self._on_row_click(ev, e))
+                    w.bind("<Button-3>", lambda ev, e=entry: self._show_row_menu(ev, e))
 
             self._file_rows.append({
                 "frame": rf, "name": name_lbl, "detected": det_lbl,
                 "new_name": nn_lbl, "dest": dest_lbl, "status": st_lbl,
                 "ftp_bar": ftp_bar, "ftp_speed": ftp_speed, "size": size_lbl,
-                "ftp_up": ftp_up, "play_btn": play_btn, "fav": fav_btn, "lock": lock_btn,
+                "ftp_up": ftp_up, "play_btn": play_btn, "fav": fav_btn, "lock": lock_btn, "logo": logo_lbl,
                 "entry": entry,
                 "_raw_name": entry.name,
                 "_raw_det":  det_text,
@@ -11290,15 +12281,29 @@ class App(_AppBase):
               "auto": ACCENT, "omitido": WARNING_COLOR}
         for row in self._file_rows:
             if row["entry"] is entry:
-                row["new_name"].configure(
-                    text=_fit_text(entry.new_name, self._col_widths["nn"], self._font_nn),
-                    text_color=ACCENT if entry.new_name else PENDING_COLOR)
-                row["dest"].configure(
-                    text=_fit_text(self._preview_remote_path(entry), self._col_widths["dest"], self._font_det),
-                    text_color=ACCENT if entry.remote_dir_override else PENDING_COLOR)
-                row["status"].configure(text=_status_label(entry.status),
-                                         text_color=sc.get(entry.status, PENDING_COLOR))
-                row["size"].configure(text=self._file_size_text(entry))
+                # col_width() en vivo, no self._col_widths -- mismo motivo
+                # que en _refresh_table (el mirror puede estar desfasado
+                # hasta 150ms tras un redimensionado, ver el comentario ahí).
+                # Solo texto/color -- NUNCA width: el ancho es de la celda
+                # que envuelve a la etiqueta (TableView.cell). Poner aquí
+                # width= sobre "Nuevo nombre" (la columna expand, cuyo ancho
+                # es "lo que sobre", no un valor propio) es exactamente lo
+                # que hacía que una fila ya subida quedara más ancha que sus
+                # vecinas y empujara los botones fuera de la vista.
+                if row["new_name"] is not None:
+                    row["new_name"].configure(
+                        text=_fit_text(entry.new_name, self._file_table.col_width("nn"), self._font_nn),
+                        text_color=ACCENT if entry.new_name else PENDING_COLOR)
+                if row["dest"] is not None:
+                    row["dest"].configure(
+                        text=_fit_text(self._preview_remote_path(entry), self._file_table.col_width("dest"),
+                                        self._font_det),
+                        text_color=ACCENT if entry.remote_dir_override else PENDING_COLOR)
+                if row["status"] is not None:
+                    row["status"].configure(text=_status_label(entry.status),
+                                             text_color=sc.get(entry.status, PENDING_COLOR))
+                if row["size"] is not None:
+                    row["size"].configure(text=self._file_size_text(entry))
                 row["fav"].configure(
                     text=self._fav_symbol(entry),
                     text_color=ACCENT if self._entry_is_favorite(entry) else PENDING_COLOR,
@@ -11307,6 +12312,13 @@ class App(_AppBase):
                     text=self._lock_symbol(entry),
                     text_color=ACCENT if self._entry_is_reserved(entry) else PENDING_COLOR,
                     state="normal" if (entry.media_info and entry.status == "subido") else "disabled")
+                logo_clickable = bool(
+                    entry.media_info and entry.media_info.media_type in ("tv", "movie")
+                    and entry.media_info.tmdb_id and entry.status == "subido")
+                row["logo"].configure(cursor="hand2" if logo_clickable else "")
+                row["logo"].unbind("<Button-1>")
+                if logo_clickable:
+                    row["logo"].bind("<Button-1>", lambda ev, e=entry: self._open_entry_in_media_server(e))
                 break
         self._update_status_bar()
 
@@ -11474,6 +12486,8 @@ class App(_AppBase):
     def _update_assign_button_label(self):
         n = len(self._current_selection())
         self._assign_btn.configure(text=f"Asignar a la selección ({n})" if n > 1 else "Asignar")
+        self._assign_and_upload_btn.configure(
+            text=f"Asignar y subir ({n})" if n > 1 else "Asignar y subir")
         self._update_select_all_button_label()
 
     def _update_select_all_button_label(self):
@@ -12084,13 +13098,19 @@ class App(_AppBase):
         self._detail_confidence.configure(text="")
         self._set_textbox_text(self._detail_error, "")
         self._apply_overview_and_poster(info)
+        self._refresh_detail_ftp_extras(info)
 
-    def _assign_selected_result(self):
+    def _assign_selected_result(self, also_upload: bool = False):
         """Aplica a la entrada seleccionada (o a toda la selección múltiple,
         ver _current_selection/_toggle_multi_select/_select_range) el
         resultado actualmente elegido en el desplegable — el paso explícito
         que faltaba entre "buscar" y "aceptar", para no asignar
-        automáticamente el primero que aparece."""
+        automáticamente el primero que aparece.
+
+        also_upload=True (botón "Asignar y subir") además encola la
+        subida justo después de asignar -- mismo _upload_one de siempre
+        (encola si ya hay una subida en marcha, si no la empieza), para no
+        tener que pulsar "Asignar" y luego ir a subir el archivo aparte."""
         entry = self._selected_entry
         if not entry:
             return
@@ -12123,7 +13143,7 @@ class App(_AppBase):
             # con una tanda grande.
             self._set_status(f"Asignando a {len(targets)} archivo(s)...", WARNING_COLOR)
             threading.Thread(target=self._assign_to_selection_worker,
-                              args=(result, targets), daemon=True).start()
+                              args=(result, targets, also_upload), daemon=True).start()
             return
 
         det  = entry.detected
@@ -12141,16 +13161,26 @@ class App(_AppBase):
         self._update_row(entry)
         self._update_detail(entry)
         self._set_status(f"Asignado: {info.title}", SUCCESS_COLOR)
+        if also_upload:
+            self._upload_one(entry)
 
-    def _assign_to_selection_worker(self, result, targets):
+    def _assign_to_selection_worker(self, result, targets, also_upload: bool = False):
         """Aplica *result* a cada archivo de *targets* (varios marcados con
         Ctrl/Shift+clic) -- cada uno conserva su propio episodio/número de
         capítulo ya detectado de su nombre (entry.detected), solo se
         comparte la serie/título/portada. Omite (sin aplicar a la fuerza)
         los archivos cuyo tipo no coincide con el del resultado elegido
-        (p.ej. un vídeo mezclado por error en una selección de cómics)."""
+        (p.ej. un vídeo mezclado por error en una selección de cómics).
+
+        also_upload=True encola (_upload_one) cada archivo que sí se
+        asignó -- en orden, desde el hilo principal (ver _finish más
+        abajo): _upload_one ya sabe si debe empezar la subida al momento
+        o encolarla si otra ya está en marcha, así que llamarlo varias
+        veces seguidas para varios archivos ya reparte correctamente entre
+        "empieza este" y "el resto a la cola", sin lógica nueva."""
         kind = self._results_kind
         ok, skipped = 0, 0
+        ok_entries = []
         for entry in targets:
             matches = (
                 (kind in ("comic", "mangadex", "anilist", "kitsu") and entry.is_comic) or
@@ -12167,6 +13197,7 @@ class App(_AppBase):
             entry.error_msg  = ""
             self._mark_auto_processed(entry.path, "identificado_manual", entry.new_name)
             ok += 1
+            ok_entries.append(entry)
             self.after(0, lambda e=entry: self._update_row(e))
 
         def _finish(ok=ok, skipped=skipped):
@@ -12176,6 +13207,9 @@ class App(_AppBase):
             self._set_status(msg, SUCCESS_COLOR if ok else WARNING_COLOR)
             if self._selected_entry in targets:
                 self._update_detail(self._selected_entry)
+            if also_upload:
+                for e in ok_entries:
+                    self._upload_one(e)
         self.after(0, _finish)
 
     # -------------------------------------------------------- Detail panel
@@ -12321,6 +13355,7 @@ class App(_AppBase):
             self._set_overview_text("")
             self._poster_token = None
             self._set_poster("Sin carátula")
+            self._clear_detail_ftp_extras()
             return
         self._set_textbox_text(self._detail_title, info.title)
         if info.season and info.episode:
@@ -12345,6 +13380,7 @@ class App(_AppBase):
         else:
             self._detail_confidence.configure(text="")
         self._apply_overview_and_poster(info)
+        self._refresh_detail_ftp_extras(info)
 
     def _load_poster(self, url, token):
         try:
@@ -12366,6 +13402,207 @@ class App(_AppBase):
                     self._set_poster("Sin carátula")
             self.after(0, _apply_error)
 
+    # ------------------------------------- Panel de detalle: árbol FTP + enlaces
+
+    def _refresh_detail_ftp_extras(self, info):
+        """Refresca la ruta FTP/árbol y los botones de plantilla del panel
+        de detalle para *info* -- llamado tanto desde _preview_result
+        (resultado aún sin asignar) como desde _update_detail (fila ya
+        asignada), justo después de _apply_overview_and_poster."""
+        self._detail_ftp_tree_expanded = False
+        self._detail_ftp_tree_ruta = None
+        self._detail_ftp_tree_loaded_for = None
+        self._detail_ftp_tree_box.pack_forget()
+        token = object()
+        self._detail_ftp_token = token
+        self._update_detail_ftp_path_label(info, token)
+        self._render_detail_links(info)
+
+    def _clear_detail_ftp_extras(self):
+        """Oculta/limpia la ruta FTP/árbol y los botones de plantilla --
+        usado cuando no hay ningún info que mostrar (_update_detail sin
+        entry.media_info, o _clear_detail sin ninguna fila seleccionada)."""
+        self._detail_ftp_token = None
+        self._detail_ftp_tree_expanded = False
+        self._detail_ftp_tree_ruta = None
+        self._detail_ftp_tree_loaded_for = None
+        self._detail_ftp_tree_box.pack_forget()
+        self._detail_ftp_path_lbl.configure(text="")
+        for w in self._detail_links_frame.winfo_children():
+            w.destroy()
+
+    def _update_detail_ftp_path_label(self, info, token):
+        """Muestra la ruta ya existente en el FTP para *info*, sin pulsar
+        ningún botón -- mismo patrón que _update_missing_ep_path_label:
+        instantáneo si ya está en caché, si no conecta de verdad en un
+        hilo aparte (con su PROPIA conexión FTP, nunca self.ftp -- no es
+        seguro entre hilos y self.ftp lo usan a la vez otras partes de la
+        app)."""
+        ruta = self._existing_ftp_path_for_info(self.ftp, info, use_cache_only=True,
+                                                 known_year=info.year or None)
+        if ruta:
+            self._set_detail_ftp_tree_ruta(ruta)
+            return
+
+        self._detail_ftp_tree_ruta = None
+        self._detail_ftp_path_lbl.configure(text="📁 Buscando la carpeta en el FTP...", text_color=PENDING_COLOR)
+
+        def worker():
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            try:
+                own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                found_ruta = self._existing_ftp_path_for_info(
+                    own_ftp, info, use_cache_only=False, known_year=info.year or None)
+            except Exception:
+                found_ruta = ""
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._apply_detail_ftp_path_label(token, found_ruta))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_detail_ftp_path_label(self, token, ruta: str):
+        if self._detail_ftp_token is not token:
+            return   # el usuario ya cambió de archivo mientras se buscaba -- no pisar su etiqueta
+        if ruta:
+            self._set_detail_ftp_tree_ruta(ruta)
+        else:
+            self._detail_ftp_tree_ruta = None
+            self._detail_ftp_path_lbl.configure(text="📁 No se encontró la carpeta en el FTP",
+                                                text_color=WARNING_COLOR)
+
+    def _set_detail_ftp_tree_ruta(self, ruta: str):
+        self._detail_ftp_tree_ruta = ruta
+        arrow = "v" if self._detail_ftp_tree_expanded else ">"
+        self._detail_ftp_path_lbl.configure(text=f"{arrow} 📁 {ruta}", text_color=PENDING_COLOR)
+
+    def _toggle_detail_ftp_tree(self):
+        """Despliega/colapsa el árbol de archivos de la carpeta ya
+        encontrada en el FTP -- mismo patrón que
+        _toggle_missing_ep_ftp_tree. Sin ruta conocida todavía no hay nada
+        que desplegar."""
+        ruta = self._detail_ftp_tree_ruta
+        if not ruta:
+            return
+        self._detail_ftp_tree_expanded = not self._detail_ftp_tree_expanded
+        arrow = "v" if self._detail_ftp_tree_expanded else ">"
+        self._detail_ftp_path_lbl.configure(text=f"{arrow} 📁 {ruta}")
+
+        if not self._detail_ftp_tree_expanded:
+            self._detail_ftp_tree_box.pack_forget()
+            return
+
+        self._detail_ftp_tree_box.pack(pady=(0, 4), fill="x", before=self._detail_links_frame)
+        if self._detail_ftp_tree_loaded_for == ruta:
+            return   # ya en caché -- no hace falta volver a listar
+
+        self._set_textbox_text(self._detail_ftp_tree_box, "Listando el árbol de archivos...")
+        token = self._detail_ftp_token
+
+        def worker():
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            try:
+                own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                tree = own_ftp.get_folder_tree(ruta)
+            except Exception:
+                tree = None
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._apply_detail_ftp_tree(token, ruta, tree))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_detail_ftp_tree(self, token, ruta: str, tree):
+        if self._detail_ftp_token is not token:
+            return   # el usuario ya cambió de archivo mientras se listaba
+        if ruta != self._detail_ftp_tree_ruta or not self._detail_ftp_tree_expanded:
+            return   # colapsó el árbol (o cambió de ruta) antes de que terminara de listar
+        if tree is None:
+            self._set_textbox_text(self._detail_ftp_tree_box, "No se pudo listar la carpeta en el FTP.")
+            return
+        from core.ftp_client import format_ftp_tree
+        text = format_ftp_tree(ruta, tree)
+        self._set_textbox_text(self._detail_ftp_tree_box, text or "Carpeta vacía.")
+        self._detail_ftp_tree_loaded_for = ruta
+
+    def _render_detail_links(self, info):
+        """Botones de los enlaces personalizables (Ajustes > Plantillas)
+        -- un archivo de Archivos es siempre un único episodio/película/
+        emisión. Las películas usan su propio nivel ("custom_links_movie",
+        plantilla "/movie/{tmdb_id}", sin {temporada}/{episodio}) -- el
+        resto (tv/libro/cómic) usa el mismo nivel que los botones POR
+        EPISODIO de Episodios que faltan (ver
+        _render_missing_ep_show_links)."""
+        for w in self._detail_links_frame.winfo_children():
+            w.destroy()
+        config_key = "custom_links_movie" if info.media_type == "movie" else "custom_links_episode"
+        links = self.config_data.get(config_key, [])
+        if not links:
+            return
+        variables = {
+            "serie": info.title, "tmdb_id": info.tmdb_id, "temporada": info.season,
+            "episodio": info.episode, "titulo": info.episode_title,
+            "nombre_archivo": self._selected_entry.name if self._selected_entry else "",
+        }
+        for link in links:
+            template = link.get("url_template", "")
+            if not template:
+                continue
+            ctk.CTkButton(
+                self._detail_links_frame, text=link.get("name", "Enlace"),
+                fg_color="transparent", border_width=1,
+                command=lambda t=template, v=variables, bg=link.get("background", False):
+                self._resolve_detail_ruta_and_open(t, v, info, bg)
+            ).pack(fill="x", pady=2)
+
+    def _resolve_detail_ruta_and_open(self, template: str, base_variables: dict, info,
+                                      background: bool = False):
+        """Igual que _resolve_missing_ep_ruta_and_open, pero resolviendo la
+        ruta con _existing_ftp_path_for_info (info real, no un dict de
+        Episodios que faltan)."""
+        if "{ruta}" not in template:
+            self._open_custom_link(template, base_variables, background)
+            return
+
+        ruta = self._existing_ftp_path_for_info(self.ftp, info, use_cache_only=True,
+                                                 known_year=info.year or None)
+        if ruta:
+            self._open_custom_link(template, dict(base_variables, ruta=ruta), background)
+            return
+
+        self._set_status("Buscando la carpeta en el FTP...", PENDING_COLOR)
+
+        def worker():
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            try:
+                own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                found_ruta = self._existing_ftp_path_for_info(
+                    own_ftp, info, use_cache_only=False, known_year=info.year or None)
+            except Exception:
+                found_ruta = ""
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._open_custom_link(
+                template, dict(base_variables, ruta=found_ruta) if found_ruta else base_variables,
+                background))
+        threading.Thread(target=worker, daemon=True).start()
+
     def _clear_detail(self):
         if self._selected_entry is not None:
             for row in self._file_rows:
@@ -12386,6 +13623,7 @@ class App(_AppBase):
         self._set_textbox_text(self._detail_error, "")
         self._set_overview_text("")
         self._set_poster("—")
+        self._clear_detail_ftp_extras()
         self._update_status_bar()
         self._update_assign_button_label()
 
@@ -12598,6 +13836,43 @@ class App(_AppBase):
             is_series = bool(season or episode)
             return (0 if is_series else 1, season, episode, e.name.lower())
         self.files.sort(key=_sort_key)
+        self._refresh_table()
+
+    @staticmethod
+    def _next_sort_state(current_key, current_asc: bool, clicked_key: str):
+        """Mismo comportamiento que Excel/Explorer al pulsar una cabecera
+        ordenable: la columna ya activa alterna de dirección; una columna
+        distinta empieza en ascendente. Compartido por las 3 tablas
+        ordenables (Archivos/Episodios que faltan/Liberar espacio)."""
+        if clicked_key == current_key:
+            return clicked_key, not current_asc
+        return clicked_key, True
+
+    def _on_files_header_click(self, key: str):
+        self._files_sort_key, self._files_sort_asc = self._next_sort_state(
+            self._files_sort_key, self._files_sort_asc, key)
+        self._file_table.set_sort_indicator(self._files_sort_key, self._files_sort_asc)
+
+        def _sort_key(e):
+            if key == "name":
+                return Path(e.path).name.lower()
+            if key == "det":
+                return (e.detected or {}).get("title", "").lower()
+            if key == "nn":
+                return (e.new_name or "").lower()
+            if key == "dest":
+                return self._preview_remote_path(e).lower()
+            if key == "stat":
+                return e.status
+            if key == "size":
+                if e._last_known_size_bytes is None:
+                    try:
+                        e._last_known_size_bytes = Path(e.path).stat().st_size
+                    except OSError:
+                        e._last_known_size_bytes = 0
+                return e._last_known_size_bytes
+            return ""
+        self.files.sort(key=_sort_key, reverse=not self._files_sort_asc)
         self._refresh_table()
 
     def _rename_selected(self):
@@ -12926,6 +14201,12 @@ class App(_AppBase):
                 for w in self._custom_links_widgets["episode"]
                 if w["name"].get().strip() or w["url"].get().strip()
             ],
+            "custom_links_movie": [
+                {"name": w["name"].get().strip(), "url_template": w["url"].get().strip(),
+                 "background": w["background"].get()}
+                for w in self._custom_links_widgets["movie"]
+                if w["name"].get().strip() or w["url"].get().strip()
+            ],
 
             "reservation_quota_gb": quota_gb,
 
@@ -12933,6 +14214,11 @@ class App(_AppBase):
                 mt: [self._category_to_plain_dict(c) for c in self._categories[mt]]
                 for mt in self._CATEGORY_TYPES
             },
+
+            "amule_host":     self._amule_entries["amule_host"].get().strip(),
+            "amule_port":     int(self._amule_entries["amule_port"].get() or 4712),
+            "amule_password": self._amule_entries["amule_password"].get(),
+            "amulecmd_path":  self._amule_entries["amulecmd_path"].get().strip() or "amulecmd",
         }
 
     def _settings_dirty(self) -> bool:
@@ -13698,6 +14984,19 @@ class App(_AppBase):
         self._history_show_all_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(header, text="Ver todo el servidor", variable=self._history_show_all_var,
                       command=self._on_history_show_all_toggled).pack(side="left", padx=(0, 12), pady=8)
+
+        # Buscador -- filtra self._history_all por archivo/destino/cliente
+        # antes de paginar (ver _apply_history_search). Mismo patrón que el
+        # buscador de Episodios que faltan (_on_missing_ep_search_key):
+        # <KeyRelease> + antirrebote, no un StringVar.trace_add en cada
+        # pulsación -- _apply_history_search reconstruye la página entera de
+        # la tabla, y repetirlo tecla a tecla se nota con un historial largo.
+        self._history_search_entry = ctk.CTkEntry(
+            header, placeholder_text="Buscar archivo, destino, cliente...", width=240)
+        self._history_search_entry.pack(side="left", padx=(0, 12), pady=8)
+        self._history_search_entry.bind("<KeyRelease>", self._on_history_search_key)
+        self._history_search_debounce_id = None   # ver _on_history_search_key
+
         ctk.CTkButton(header, text="🗑 Limpiar historial", width=150,
                       fg_color="transparent", border_width=1,
                       border_color=ERROR_COLOR, text_color=ERROR_COLOR,
@@ -13742,6 +15041,7 @@ class App(_AppBase):
         self._history_rows = []
         self._history_empty_msg = None   # label "sin subidas...", ver _refresh_history_view
         self._history_all = []   # historial completo (más reciente primero), ver _refresh_history_view
+        self._history_filtered = []   # self._history_all tras el buscador -- ver _apply_history_search
         self._history_page = 0
         self._history_dirty = True   # ver _refresh_history_view: solo se relee/redibuja si hubo cambios reales
 
@@ -13809,8 +15109,7 @@ class App(_AppBase):
                 history = self._load_history()
                 self._history_all = list(reversed(history))   # más reciente primero
                 self._history_title_lbl.configure(text=f"Historial de subidas  ({len(history)} registros)")
-            self._history_page = 0
-            self._history_render_page()
+            self._apply_history_search()
             self._history_dirty = False
         finally:
             _log.info("Vista: _refresh_history_view %6.0f ms%s", (_time.perf_counter() - _t0) * 1000,
@@ -13820,8 +15119,53 @@ class App(_AppBase):
         self._history_dirty = True
         self._refresh_history_view()
 
+    @staticmethod
+    def _history_entry_matches(entry: dict, query: str) -> bool:
+        """True si *entry* (un registro crudo de self._history_all, antes
+        de formatear para pintarlo) contiene *query* (ya en minúsculas) en
+        alguno de los campos que el usuario reconocería al buscar: archivo/
+        nombre, destino remoto/motivo de borrado, y quién lo hizo. No busca
+        en fecha/tamaño/estado -- no son lo que alguien escribiría para
+        encontrar un registro concreto."""
+        kind = entry.get("kind", "subida")
+        if kind == "borrado":
+            haystack = (entry.get("name", ""), entry.get("reason", ""), entry.get("person", ""))
+        else:
+            haystack = (entry.get("filename", ""), entry.get("remote", ""), entry.get("person", ""))
+        return any(query in (field or "").lower() for field in haystack)
+
+    def _apply_history_search(self):
+        """Recalcula self._history_filtered a partir de self._history_all y
+        el texto del buscador -- se llama tras recargar el historial
+        (_refresh_history_view) y, con antirrebote, en cada pulsación en el
+        buscador (ver _on_history_search_key). Vuelve siempre a la página 1:
+        el conjunto filtrado puede ser mucho más corto que antes."""
+        query = self._history_search_entry.get().strip().lower()
+        if query:
+            self._history_filtered = [e for e in self._history_all if self._history_entry_matches(e, query)]
+        else:
+            self._history_filtered = self._history_all
+        self._history_page = 0
+        self._history_render_page()
+
+    _HISTORY_SEARCH_DEBOUNCE_MS = 200   # ver _on_history_search_key
+
+    def _on_history_search_key(self, event):
+        """<KeyRelease> del buscador de Historial -- con antirrebote, mismo
+        patrón que _on_missing_ep_search_key (Episodios que faltan):
+        _apply_history_search reconstruye la página entera de la tabla,
+        caro para repetirlo en cada pulsación mientras se sigue escribiendo."""
+        if self._history_search_debounce_id is not None:
+            self.after_cancel(self._history_search_debounce_id)
+        self._history_search_debounce_id = self.after(
+            self._HISTORY_SEARCH_DEBOUNCE_MS, self._apply_history_search_debounced)
+
+    def _apply_history_search_debounced(self):
+        self._history_search_debounce_id = None
+        self._apply_history_search()
+
     def _history_change_page(self, delta: int):
-        n_pages = max(1, -(-len(self._history_all) // self._history_table.page_size))
+        n_pages = max(1, -(-len(self._history_filtered) // self._history_table.page_size))
         new_page = max(0, min(n_pages - 1, self._history_page + delta))
         if new_page == self._history_page:
             return
@@ -13835,7 +15179,7 @@ class App(_AppBase):
         _history_change_page), así que un cambio de tamaño de página por
         redimensionado necesita reclamparlo aquí antes de redibujar, o el
         usuario podría quedar "aparcado" en una página que ya no existe."""
-        n_pages = max(1, -(-len(self._history_all) // new_size))
+        n_pages = max(1, -(-len(self._history_filtered) // new_size))
         self._history_page = max(0, min(n_pages - 1, self._history_page))
         self._history_render_page()
 
@@ -13848,7 +15192,8 @@ class App(_AppBase):
 
     def _history_render_page_impl(self):
         """Dibuja solo la página actual (self._history_page) de
-        self._history_all -- ver TableView.page_size. Separado de
+        self._history_filtered (self._history_all tras el buscador, ver
+        _apply_history_search) -- ver TableView.page_size. Separado de
         _refresh_history_view para que cambiar de página no implique
         releer el historial de disco."""
         import datetime
@@ -13857,11 +15202,11 @@ class App(_AppBase):
         self._history_rows = []
         self._history_empty_msg = None
 
-        total = len(self._history_all)
+        total = len(self._history_filtered)
         page_size = self._history_table.page_size
         n_pages = max(1, -(-total // page_size))
         start = self._history_page * page_size
-        page_items = self._history_all[start:start + page_size]
+        page_items = self._history_filtered[start:start + page_size]
 
         self._history_page_lbl.configure(
             text=f"Página {self._history_page + 1} de {n_pages}" if total else "")
@@ -13874,8 +15219,10 @@ class App(_AppBase):
         self._history_table.scroll_to_top()
 
         if not page_items:
+            empty_text = ("Ningún registro coincide con la búsqueda." if self._history_search_entry.get().strip()
+                          else "Sin subidas registradas todavía.")
             self._history_empty_msg = ctk.CTkLabel(
-                self._history_table.body, text="Sin subidas registradas todavía.", text_color=PENDING_COLOR)
+                self._history_table.body, text=empty_text, text_color=PENDING_COLOR)
             self._history_empty_msg.pack(pady=30)
             return
 
@@ -13928,12 +15275,14 @@ class App(_AppBase):
             row_fr = ctk.CTkFrame(self._history_table.body)
             row_fr.pack(fill="x", pady=1, padx=2)
             row_labels = {"_raw": raw}
-            for idx, key in enumerate(self._history_col_order):
-                lbl = ctk.CTkLabel(row_fr, text=_fit_text(raw[key], cw[key], font), width=cw[key],
+            for key in self._history_col_order:
+                # Celda con recorte (ver TableView.cell) -- rutas de destino
+                # largas ya no pueden ensanchar su columna ni empujar al
+                # botón "Reintentar" fuera de la vista.
+                c = self._history_table.cell(row_fr, key, pady=2)
+                lbl = ctk.CTkLabel(c, text=_fit_text(raw[key], cw[key], font),
                                    anchor="w", font=font, **extra_by_col.get(key, {}))
-                # padx=(4, 0) espeja el separador de 4px de la cabecera en
-                # todas menos la primera columna, igual que en Archivos.
-                lbl.pack(side="left", padx=(4, 0) if idx > 0 else (0, 0), pady=2)
+                lbl.pack(fill="both", expand=True)
                 row_labels[key] = lbl
 
             # Solo tiene sentido reintentar subidas que fallaron -- y solo
@@ -13942,12 +15291,14 @@ class App(_AppBase):
             # en vez de deshabilitarlo aquí en silencio, ver
             # _retry_history_upload). Un borrado no tiene "reintentar" en
             # este mismo sentido -- deshabilitado siempre para esas filas.
+            c = self._history_table.cell(
+                row_fr, "accion", pady=2, padx=(self._history_table.col_padx("accion")[0], 4))
             retry_btn = ctk.CTkButton(
-                row_fr, text="🔄 Reintentar", width=self._history_table.col_width("accion"),
+                c, text="🔄 Reintentar",
                 fg_color="transparent", border_width=1,
                 state="normal" if (st == "error" and not is_deletion) else "disabled",
                 command=lambda e=entry: self._retry_history_upload(e))
-            retry_btn.pack(side="left", padx=(4, 4), pady=2)
+            retry_btn.pack(fill="both", expand=True)
             row_labels["accion"] = retry_btn
 
             self._history_rows.append(row_labels)
@@ -14265,12 +15616,20 @@ class App(_AppBase):
         # columna "candidata" solo etiqueta ese bloque, no una línea.
         self._cleanup_table = TableView(results_wrap, columns=[
             ColumnSpec("icon", "", width=28),
-            ColumnSpec("candidata", "Candidata", expand=True),
-            ColumnSpec("tendencia", "Tendencia", width=70),
+            ColumnSpec("candidata", "Candidata", expand=True, sortable=True),
+            ColumnSpec("tendencia", "Tendencia", width=70, sortable=True),
+            ColumnSpec("logo", "", width=24),
             ColumnSpec("fav", "", width=32),
             ColumnSpec("reserve", "", width=32),
             ColumnSpec("del", "", width=110),
         ])
+        # Fila más alta que el resto: la celda "candidata" lleva dos líneas
+        # (nombre + tamaño/motivo), ver _build_cleanup_result_row.
+        self._cleanup_table.row_height = 38
+        self._cleanup_table.on_header_click = self._on_cleanup_header_click
+        self._cleanup_sort_key = "candidata"   # arranca igual que el comportamiento previo (alfabético)
+        self._cleanup_sort_asc = True
+        self._cleanup_table.set_sort_indicator(self._cleanup_sort_key, self._cleanup_sort_asc)
         self._cleanup_table.grid(row=0, column=0, sticky="nsew")
         self._cleanup_table.enable_dynamic_page_size(lambda _size: self._render_cleanup_page())
 
@@ -14323,6 +15682,8 @@ class App(_AppBase):
         self._cleanup_poster_token = None
         self._cleanup_current_poster = None
         self._cleanup_selected_item = None   # candidata pulsada, ver _show_cleanup_poster
+        self._cleanup_ftp_tree_expanded = False
+        self._cleanup_ftp_tree_loaded_for = None   # ruta (o "loose:<ruta>") ya lista, ver _toggle_cleanup_ftp_tree
         self._cleanup_row_widgets = []   # [(item, row_frame), ...] -- para resaltar la fila seleccionada
         self._cleanup_page = 0
         # Compartidas entre todas las filas -- mismo motivo que en
@@ -14468,7 +15829,9 @@ class App(_AppBase):
             stats = get_jellyfin_usage_stats(
                 self.config_data.get("jellyfin_host", ""), self.config_data.get("jellyfin_api_key", ""),
                 username=self.config_data.get("jellyfin_username", "")) or {}
-            for entry in stats.values():
+            for key, entry in stats.items():
+                entry["source"] = "jellyfin"
+                entry["server_id"] = key
                 _merge_usage(entry["name"], entry.get("media_type"), entry)
             _log.info("Liberar espacio: Jellyfin -> %d elemento(s) en %.1fs",
                       len(stats), _time.monotonic() - t_jf)
@@ -14478,7 +15841,9 @@ class App(_AppBase):
             t_px = _time.monotonic()
             stats = get_plex_usage_stats(
                 self.config_data.get("plex_host", ""), self.config_data.get("plex_token", "")) or {}
-            for entry in stats.values():
+            for key, entry in stats.items():
+                entry["source"] = "plex"
+                entry["server_id"] = key
                 _merge_usage(entry["name"], entry.get("media_type"), entry)
             _log.info("Liberar espacio: Plex -> %d elemento(s) en %.1fs",
                       len(stats), _time.monotonic() - t_px)
@@ -14612,6 +15977,8 @@ class App(_AppBase):
                     play_count=(usage or {}).get("play_count", 0) or 0,
                     last_played_ts=parse_media_date((usage or {}).get("last_played")),
                     date_added_ts=parse_media_date((usage or {}).get("date_added")),
+                    source=(usage or {}).get("source", ""),
+                    server_id=(usage or {}).get("server_id", ""),
                 ))
             for j, (media_type, cat, root, base_name, group) in enumerate(loose_groups_list):
                 if progress_cb:
@@ -14637,6 +16004,8 @@ class App(_AppBase):
                     last_played_ts=parse_media_date((usage or {}).get("last_played")),
                     date_added_ts=parse_media_date((usage or {}).get("date_added")),
                     loose_file_paths=[f"{root}/{fn}" for fn in group["file_names"]],
+                    source=(usage or {}).get("source", ""),
+                    server_id=(usage or {}).get("server_id", ""),
                 ))
             self._cleanup_last_ftp_size_count = ftp_size_count
             _log.info(
@@ -14671,6 +16040,25 @@ class App(_AppBase):
             self._cleanup_not_rewatched_row.pack(anchor="w", pady=(0, 12))
         elif choice == "Pocas reproducciones":
             self._cleanup_max_playcount_row.pack(anchor="w", pady=(0, 12))
+
+    @staticmethod
+    def _cleanup_sort_key_fn(key: str):
+        """Función de clave de orden para self._cleanup_filtered_items
+        según la columna elegida (ver _on_cleanup_header_click) --
+        "tendencia" reutiliza la misma función que ya pinta la celda
+        (core.trending.trending_score), para que el orden coincida
+        siempre con lo que se ve."""
+        if key == "tendencia":
+            return lambda it: trending_score(it.play_count, it.last_played_ts, _time.time())
+        return lambda it: it.name.lower()
+
+    def _on_cleanup_header_click(self, key: str):
+        self._cleanup_sort_key, self._cleanup_sort_asc = self._next_sort_state(
+            self._cleanup_sort_key, self._cleanup_sort_asc, key)
+        self._cleanup_table.set_sort_indicator(self._cleanup_sort_key, self._cleanup_sort_asc)
+        self._cleanup_filtered_items.sort(key=self._cleanup_sort_key_fn(self._cleanup_sort_key),
+                                          reverse=not self._cleanup_sort_asc)
+        self._render_cleanup_page()
 
     def _apply_cleanup_filters(self):
         """Vuelve a filtrar la lista YA analizada (self._cleanup_raw_items)
@@ -14746,10 +16134,13 @@ class App(_AppBase):
                 it for it in self._cleanup_filtered_items
                 if not self._is_reserved(it.media_type, it.tmdb_id)]
         self._update_cleanup_quota_label()
-        # Alfabético, no el orden en que las devolvió el escaneo del
-        # servidor (que no sigue ningún criterio reconocible para quien
-        # mira la lista).
-        self._cleanup_filtered_items.sort(key=lambda it: it.name.lower())
+        # Por la columna activa (alfabético por defecto, no el orden en
+        # que las devolvió el escaneo del servidor, que no sigue ningún
+        # criterio reconocible para quien mira la lista) -- ver
+        # _on_cleanup_header_click, mismo criterio de orden configurable
+        # que Archivos/Episodios que faltan.
+        self._cleanup_filtered_items.sort(key=self._cleanup_sort_key_fn(self._cleanup_sort_key),
+                                          reverse=not self._cleanup_sort_asc)
 
         # Con "Solo duplicados" activo, cada fila necesita saber en qué
         # OTRAS rutas existe el mismo contenido (mismo tmdb_id Y mismo
@@ -14898,11 +16289,16 @@ class App(_AppBase):
         row.pack(fill="x", pady=3, padx=2)
         self._cleanup_row_widgets.append((item, row))
 
-        icon = "📺" if item.media_type == "tv" else "🎬"
-        ctk.CTkLabel(row, text=icon, width=cw("icon")).pack(side="left", padx=(8, 4), pady=8)
+        # Celdas con recorte (ver TableView.cell). Esta tabla tiene la fila
+        # más alta de todas (la celda "candidata" lleva dos líneas: nombre
+        # arriba y tamaño/motivo debajo), de ahí su row_height propio.
+        _cell = lambda key, pady=6, **kw: self._cleanup_table.cell(row, key, pady=pady, **kw)
 
-        info_fr = ctk.CTkFrame(row, fg_color="transparent")
-        info_fr.pack(side="left", fill="x", expand=True, pady=6)
+        icon = "📺" if item.media_type == "tv" else "🎬"
+        c = _cell("icon", padx=(8, 4))
+        ctk.CTkLabel(c, text=icon).pack(fill="both", expand=True)
+
+        info_fr = _cell("candidata")
         name_lbl = ctk.CTkLabel(info_fr, text=item.name, font=self._cleanup_name_font,
                                 anchor="w", cursor="hand2")
         name_lbl.pack(fill="x")
@@ -14915,11 +16311,24 @@ class App(_AppBase):
         reason_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
 
         score = trending_score(item.play_count, item.last_played_ts, _time.time())
-        trending_lbl = ctk.CTkLabel(row, text=format_trending_score(score), width=cw("tendencia"),
+        c = _cell("tendencia", padx=(4, 4))
+        trending_lbl = ctk.CTkLabel(c, text=format_trending_score(score),
                      font=self._cleanup_reason_font, text_color=PENDING_COLOR)
-        trending_lbl.pack(side="left", padx=(4, 4), pady=6)
+        trending_lbl.pack(fill="both", expand=True)
         attach_tooltip(trending_lbl, lambda it=item: explain_trending_score(
             it.play_count, it.last_played_ts, _time.time()))
+
+        # Logo de Jellyfin/Plex -- abre el ítem en la web de ese servidor
+        # (ver _open_in_media_server). Solo si el escaneo lo emparejó con
+        # alguno de los dos (item.source vacío si no se encontró en
+        # ninguno): oculto en vez de deshabilitado, para no ocupar hueco
+        # con un icono sin sentido en la mayoría de candidatas normales.
+        c = _cell("logo", padx=(0, 4))
+        if item.source:
+            source_img = self._plex_logo_img if item.source == "plex" else self._jellyfin_logo_img
+            logo_lbl = ctk.CTkLabel(c, image=source_img, text="", cursor="hand2")
+            logo_lbl.pack(fill="both", expand=True)
+            logo_lbl.bind("<Button-1>", lambda ev, it=item: self._open_in_media_server(it.source, it.server_id))
 
         is_fav = self._is_favorite(item.media_type, item.tmdb_id)
         is_res = self._is_reserved(item.media_type, item.tmdb_id)
@@ -14928,33 +16337,36 @@ class App(_AppBase):
         # instante (ver _apply_cleanup_filters): un favorito nunca se
         # muestra como candidata a borrar por defecto -- salvo que el
         # filtro "Mostrar favoritos" esté activo, ver más abajo.
-        ctk.CTkButton(row, text="★" if is_fav else "☆", width=cw("fav"), fg_color="transparent", border_width=0,
+        c = _cell("fav", padx=(0, 4))
+        ctk.CTkButton(c, text="★" if is_fav else "☆", fg_color="transparent", border_width=0,
                       text_color=ACCENT if is_fav else PENDING_COLOR, hover_color=("gray85", "#2b2b2b"),
                       command=lambda it=item: self._toggle_cleanup_item_favorite(it)).pack(
-            side="left", padx=(0, 4), pady=6)
+            fill="both", expand=True)
 
         # Igual que favoritos pero con cuota configurable por usuario (ver
         # core/reservations.py) -- "🔒" reservado (por cualquiera, no solo
         # el usuario actual), "🔓" libre.
-        ctk.CTkButton(row, text="🔒" if is_res else "🔓", width=cw("reserve"), fg_color="transparent",
+        c = _cell("reserve", padx=(0, 4))
+        ctk.CTkButton(c, text="🔒" if is_res else "🔓", fg_color="transparent",
                       border_width=0, text_color=ACCENT if is_res else PENDING_COLOR,
                       hover_color=("gray85", "#2b2b2b"),
                       command=lambda it=item: self._toggle_cleanup_item_reservation(it)).pack(
-            side="left", padx=(0, 4), pady=6)
+            fill="both", expand=True)
 
         # Protegido (favorito o reservado) nunca se borra desde aquí, ni
         # aunque el filtro correspondiente lo esté mostrando -- deshabilitar
         # en vez de ocultar, para que quede claro POR QUÉ no se puede.
         is_protected = is_fav or is_res
+        c = _cell("del", padx=(8, 8))
         del_btn = ctk.CTkButton(
-            row, text="🗑 Eliminar" if not is_protected else "🔒 Protegida",
-            width=cw("del"), fg_color="transparent", border_width=1,
+            c, text="🗑 Eliminar" if not is_protected else "🔒 Protegida",
+            fg_color="transparent", border_width=1,
             border_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
             text_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
             hover_color=("gray85", "#3d1010") if not is_protected else ("gray90", "gray20"),
             state="disabled" if is_protected else "normal",
             command=lambda it=item: self._confirm_and_delete_cleanup_item(it))
-        del_btn.pack(side="left", padx=8, pady=6)
+        del_btn.pack(fill="both", expand=True)
 
     def _build_cleanup_side_panel(self, parent):
         """Ficha de TMDB de la candidata pulsada -- póster + sinopsis,
@@ -14988,8 +16400,23 @@ class App(_AppBase):
 
         self._cleanup_detail_path_lbl = ctk.CTkLabel(
             scroll, text="", font=ctk.CTkFont(size=11), text_color=PENDING_COLOR,
-            wraplength=200, justify="left", anchor="w")
+            wraplength=200, justify="left", anchor="w", cursor="hand2")
         self._cleanup_detail_path_lbl.pack(pady=(0, 4), fill="x")
+        # Ruta ya conocida (esta candidata ya está subida de verdad, a
+        # diferencia de Archivos) -- clic despliega/colapsa el árbol de
+        # archivos de esa carpeta, ver _toggle_cleanup_ftp_tree.
+        self._cleanup_detail_path_lbl.bind("<Button-1>", lambda ev: self._toggle_cleanup_ftp_tree())
+
+        self._cleanup_ftp_tree_box = ctk.CTkTextbox(
+            scroll, width=200, height=180, wrap="word", font=ctk.CTkFont(size=10))
+        self._cleanup_ftp_tree_box.configure(state="disabled")
+        # sin pack -- solo se empaqueta al desplegar
+
+        # Enlaces personalizables (Ajustes > Plantillas, nivel serie) -- una
+        # candidata de Liberar espacio es siempre una serie/película entera
+        # ya subida, no un episodio suelto.
+        self._cleanup_links_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        self._cleanup_links_frame.pack(pady=(0, 4), fill="x")
         return panel
 
     def _show_cleanup_poster(self, item):
@@ -15001,7 +16428,13 @@ class App(_AppBase):
             row.configure(fg_color=SELECTED_ROW_COLOR if it is item else ("gray95", "gray17"))
         self._update_status_bar()
         self._set_textbox_text(self._cleanup_detail_title, item.name)
-        self._cleanup_detail_path_lbl.configure(text=f"📁 {item.ftp_path}")
+        # La selección cambió -- colapsar el árbol de la candidata anterior
+        # (si estaba desplegado) antes de fijar la ruta nueva.
+        self._cleanup_ftp_tree_expanded = False
+        self._cleanup_ftp_tree_loaded_for = None
+        self._cleanup_ftp_tree_box.pack_forget()
+        self._cleanup_detail_path_lbl.configure(text=f"> 📁 {item.ftp_path}")
+        self._render_cleanup_show_links(item)
         token = object()
         self._cleanup_poster_token = token
 
@@ -15049,6 +16482,109 @@ class App(_AppBase):
             self.after(0, _apply)
         except Exception:
             pass
+
+    def _toggle_cleanup_ftp_tree(self):
+        """Despliega/colapsa el árbol de archivos de la carpeta de la
+        candidata seleccionada -- a diferencia de Archivos/Episodios que
+        faltan, aquí la ruta ya se conoce sin buscar nada (item.ftp_path es
+        de una candidata YA subida al servidor), así que no hace falta
+        ninguna resolución con caché/conexión aparte, solo listar."""
+        item = self._cleanup_selected_item
+        if item is None:
+            return
+        self._cleanup_ftp_tree_expanded = not self._cleanup_ftp_tree_expanded
+        arrow = "v" if self._cleanup_ftp_tree_expanded else ">"
+        self._cleanup_detail_path_lbl.configure(text=f"{arrow} 📁 {item.ftp_path}")
+
+        if not self._cleanup_ftp_tree_expanded:
+            self._cleanup_ftp_tree_box.pack_forget()
+            return
+
+        self._cleanup_ftp_tree_box.pack(pady=(0, 4), fill="x", before=self._cleanup_links_frame)
+        cache_key = f"loose:{item.ftp_path}" if item.loose_file_paths else item.ftp_path
+        if self._cleanup_ftp_tree_loaded_for == cache_key:
+            return   # ya en caché -- no hace falta volver a listar
+
+        if item.loose_file_paths:
+            # Archivos sueltos directamente en la raíz de la categoría, sin
+            # carpeta propia (ver core/cleanup_candidates.py::
+            # group_loose_files_by_name) -- item.ftp_path es una ruta
+            # SINTÉTICA ("root/nombre_base") que no existe de verdad como
+            # carpeta en el FTP; listarla daría "carpeta vacía" en vez de
+            # avisar de que no es una carpeta real. Se construye el texto
+            # directamente a partir de los nombres ya conocidos, sin tocar
+            # el FTP para nada.
+            import os
+            lines = [f"📄 {os.path.basename(p)}" for p in item.loose_file_paths]
+            self._set_textbox_text(self._cleanup_ftp_tree_box, "\n".join(lines) or "Carpeta vacía.")
+            self._cleanup_ftp_tree_loaded_for = cache_key
+            return
+
+        self._set_textbox_text(self._cleanup_ftp_tree_box, "Listando el árbol de archivos...")
+        token = self._cleanup_poster_token
+
+        def worker():
+            from core.ftp_client import FTPClient
+            own_ftp = FTPClient()
+            try:
+                own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                tree = own_ftp.get_folder_tree(item.ftp_path)
+            except Exception:
+                tree = None
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._apply_cleanup_ftp_tree(token, item, tree))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_cleanup_ftp_tree(self, token, item, tree):
+        if self._cleanup_poster_token is not token:
+            return   # el usuario ya pulsó otra candidata mientras se listaba
+        if item is not self._cleanup_selected_item or not self._cleanup_ftp_tree_expanded:
+            return   # colapsó el árbol (o cambió de candidata) antes de que terminara de listar
+        if tree is None:
+            self._set_textbox_text(self._cleanup_ftp_tree_box, "No se pudo listar la carpeta en el FTP.")
+            return
+        from core.ftp_client import format_ftp_tree
+        text = format_ftp_tree(item.ftp_path, tree)
+        self._set_textbox_text(self._cleanup_ftp_tree_box, text or "Carpeta vacía.")
+        self._cleanup_ftp_tree_loaded_for = item.ftp_path
+
+    def _render_cleanup_show_links(self, item):
+        """Botones de los enlaces personalizables (Ajustes > Plantillas)
+        -- una candidata de Liberar espacio es siempre una serie/película
+        entera. Las películas usan su propio nivel ("custom_links_movie");
+        las series usan el nivel serie, igual que el panel lateral de
+        Episodios que faltan (ver _render_missing_ep_show_links)."""
+        for w in self._cleanup_links_frame.winfo_children():
+            w.destroy()
+        config_key = "custom_links_movie" if item.media_type == "movie" else "custom_links_show"
+        links = self.config_data.get(config_key, [])
+        if not links:
+            return
+        variables = {"serie": item.name, "tmdb_id": item.tmdb_id}
+        for link in links:
+            template = link.get("url_template", "")
+            if not template:
+                continue
+            ctk.CTkButton(
+                self._cleanup_links_frame, text=link.get("name", "Enlace"),
+                fg_color="transparent", border_width=1,
+                command=lambda t=template, v=variables, bg=link.get("background", False):
+                self._resolve_cleanup_ruta_and_open(t, v, item, bg)
+            ).pack(fill="x", pady=2)
+
+    def _resolve_cleanup_ruta_and_open(self, template: str, base_variables: dict, item,
+                                       background: bool = False):
+        """Mucho más simple que en Archivos/Episodios que faltan: item.ftp_path
+        ya se conoce sin buscar nada (la candidata ya está subida), así que
+        no hace falta ninguna resolución con caché/conexión aparte."""
+        variables = dict(base_variables, ruta=item.ftp_path) if "{ruta}" in template else base_variables
+        self._open_custom_link(template, variables, background)
 
     def _toggle_cleanup_item_favorite(self, item):
         # _apply_cleanup_filters() ya llama a _render_cleanup_results() al
@@ -15364,30 +16900,37 @@ class App(_AppBase):
         row = ctk.CTkFrame(self._protected_table.body, fg_color=("gray95", "gray17"))
         row.pack(fill="x", pady=3, padx=2)
 
+        # Celdas con recorte, igual que el resto de tablas (ver TableView.cell).
+        _cell = lambda key, pady=8, **kw: self._protected_table.cell(row, key, pady=pady, **kw)
+
         icon = "📺" if entry.get("media_type") == "tv" else "🎬"
-        ctk.CTkLabel(row, text=icon, width=cw("icon")).pack(side="left", padx=(8, 4), pady=8)
+        c = _cell("icon", padx=(8, 4))
+        ctk.CTkLabel(c, text=icon).pack(fill="both", expand=True)
 
-        ctk.CTkLabel(row, text=entry.get("name", ""), font=self._protected_name_font,
-                     anchor="w").pack(side="left", fill="x", expand=True, padx=(4, 4), pady=8)
+        c = _cell("name", padx=(4, 4))
+        ctk.CTkLabel(c, text=entry.get("name", ""), font=self._protected_name_font,
+                     anchor="w").pack(fill="both", expand=True)
 
-        ctk.CTkLabel(row, text=_fmt_size(entry.get("size_bytes", 0)), width=cw("size"),
-                     text_color=PENDING_COLOR).pack(side="left", padx=(0, 4), pady=8)
+        c = _cell("size", padx=(0, 4))
+        ctk.CTkLabel(c, text=_fmt_size(entry.get("size_bytes", 0)),
+                     text_color=PENDING_COLOR).pack(fill="both", expand=True)
 
         owner = entry.get("reserved_by", "")
-        ctk.CTkLabel(row, text=owner, width=cw("owner"),
-                     text_color=ACCENT if owner == user else PENDING_COLOR).pack(
-            side="left", padx=(0, 4), pady=8)
+        c = _cell("owner", padx=(0, 4))
+        ctk.CTkLabel(c, text=owner,
+                     text_color=ACCENT if owner == user else PENDING_COLOR).pack(fill="both", expand=True)
 
         # Solo el dueño puede liberarla de verdad -- _toggle_reservation ya
         # lo comprueba y avisa, pero deshabilitar el botón aquí (en vez de
         # dejar que el aviso aparezca cada vez) es más claro en la vista
         # "Ver todo el servidor", donde la mayoría de filas serán ajenas.
         is_mine = owner == user
-        ctk.CTkButton(row, text="🔓 Liberar" if is_mine else "🔒 De otra persona",
-                      width=cw("release"), fg_color="transparent", border_width=1,
+        c = _cell("release", padx=(8, 8), pady=6)
+        ctk.CTkButton(c, text="🔓 Liberar" if is_mine else "🔒 De otra persona",
+                      fg_color="transparent", border_width=1,
                       state="normal" if is_mine else "disabled",
                       command=lambda k=key, e=entry: self._release_protected_row(k, e)).pack(
-            side="left", padx=8, pady=6)
+            fill="both", expand=True)
 
     def _release_protected_row(self, key: str, entry: dict):
         # Reutiliza _toggle_reservation tal cual: la fila solo existe

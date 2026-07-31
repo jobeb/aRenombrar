@@ -1,4 +1,12 @@
-from core.server_config import SHARED_CONFIG_KEYS, extract_shared_config, filter_shared_config
+import core.appdirs as appdirs_module
+from core.server_config import (
+    SHARED_CONFIG_KEYS, extract_shared_config, filter_shared_config,
+    load_last_synced_snapshot, save_last_synced_snapshot, diff_local_changes,
+)
+
+
+def _isolated_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(appdirs_module, "app_data_dir", lambda: tmp_path)
 
 
 def test_extract_shared_config_only_includes_shared_keys():
@@ -41,6 +49,8 @@ def test_shared_config_keys_excludes_ftp_connection_and_personal_state():
                     "ftp_parallel", "ftp_speed_limit", "ftp_retries",
                     "app_user_name", "shared_data_ftp_path",
                     "appearance", "color_theme", "last_dir", "table_col_widths",
+                    "table_hidden_columns",
+                    "amule_search_type",
                     "skipped_update_version", "watch_folder", "poll_interval",
                     "auto_action", "manual_action", "auto_extract_archives", "min_confidence",
                     "desktop_notifications", "start_with_windows", "rename_local"}
@@ -86,3 +96,39 @@ def test_shared_config_keys_pins_the_exact_set():
         "custom_links_show", "custom_links_season", "custom_links_episode",
         "reservation_quota_gb",
     }
+
+
+def test_load_last_synced_snapshot_returns_empty_dict_when_never_saved(tmp_path, monkeypatch):
+    _isolated_data_dir(tmp_path, monkeypatch)
+    assert load_last_synced_snapshot() == {}
+
+
+def test_save_and_load_last_synced_snapshot_roundtrip(tmp_path, monkeypatch):
+    _isolated_data_dir(tmp_path, monkeypatch)
+    data = {"custom_links_show": "http://example.com/{title}", "reservation_quota_gb": 50}
+    save_last_synced_snapshot(data)
+    assert load_last_synced_snapshot() == data
+
+
+def test_load_last_synced_snapshot_returns_empty_dict_on_corrupt_file(tmp_path, monkeypatch):
+    _isolated_data_dir(tmp_path, monkeypatch)
+    (tmp_path / "server_config_last_synced.json").write_text("no es json valido", encoding="utf-8")
+    assert load_last_synced_snapshot() == {}
+
+
+def test_diff_local_changes_detects_only_keys_that_moved_since_last_synced():
+    last_synced = {"custom_links_show": "old-url", "reservation_quota_gb": 50}
+    current = {"custom_links_show": "new-url-editada-en-local", "reservation_quota_gb": 50}
+    assert diff_local_changes(current.get, last_synced) == {"custom_links_show"}
+
+
+def test_diff_local_changes_empty_when_last_synced_is_empty_and_current_matches_none():
+    """Bug real que motivó este mecanismo: un enlace personalizable nuevo,
+    guardado en local pero nunca publicado, desaparecía al reiniciar la app
+    porque el sync silencioso de arranque pisaba TODA la config de servidor
+    sin distinguir ediciones locales sin publicar de lo que otra persona sí
+    publicó. diff_local_changes es lo que permite a
+    gui/app.py::_apply_synced_server_config proteger justo esas claves."""
+    last_synced = {}
+    current = {key: f"valor-local-{key}" for key in SHARED_CONFIG_KEYS}
+    assert diff_local_changes(current.get, last_synced) == set(SHARED_CONFIG_KEYS)

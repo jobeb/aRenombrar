@@ -202,6 +202,25 @@ def test_merge_usage_entries_fills_missing_tmdb_id_and_size_from_either_source()
     assert merged["size_bytes"] == 12345
 
 
+def test_merge_usage_entries_prefers_first_source_for_source_and_server_id():
+    """El llamador (gui/app.py::_scan_cleanup_candidates) procesa Jellyfin
+    antes que Plex -- por eso "a" gana aquí, respetando la preferencia
+    "Jellyfin primero" ya establecida para abrir en el servidor de medios."""
+    jellyfin = {"name": "X", "source": "jellyfin", "server_id": "jf-123"}
+    plex = {"name": "X", "source": "plex", "server_id": "plex-456"}
+    merged = merge_usage_entries(jellyfin, plex)
+    assert merged["source"] == "jellyfin"
+    assert merged["server_id"] == "jf-123"
+
+
+def test_merge_usage_entries_falls_back_to_second_source_when_first_has_none():
+    only_plex = {"name": "X"}
+    plex = {"name": "X", "source": "plex", "server_id": "plex-456"}
+    merged = merge_usage_entries(only_plex, plex)
+    assert merged["source"] == "plex"
+    assert merged["server_id"] == "plex-456"
+
+
 # ── Busqueda por nombre ─────────────────────────────────────────────────────
 
 def test_name_query_filters_by_substring_case_insensitive():

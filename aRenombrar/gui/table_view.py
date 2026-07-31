@@ -32,12 +32,16 @@ class ColumnSpec:
     expand: esta columna ocupa el espacio sobrante (fill="x",
         expand=True) -- como máximo UNA columna de la tabla debería
         marcarse así.
+    sortable: la cabecera responde a clic (ver TableView.on_header_click)
+        para ordenar la tabla por esta columna -- el propio TableView no
+        sabe ordenar nada (no conoce el modelo de las filas), solo avisa;
+        quien construye la tabla decide la clave de orden real.
     """
 
-    __slots__ = ("key", "header", "width", "min_width", "resizable", "expand", "anchor")
+    __slots__ = ("key", "header", "width", "min_width", "resizable", "expand", "anchor", "sortable", "hideable")
 
     def __init__(self, key, header="", width=80, min_width=40,
-                 resizable=False, expand=False, anchor="w"):
+                 resizable=False, expand=False, anchor="w", sortable=False, hideable=True):
         self.key = key
         self.header = header
         self.width = width
@@ -45,6 +49,8 @@ class ColumnSpec:
         self.resizable = resizable
         self.expand = expand
         self.anchor = anchor
+        self.sortable = sortable
+        self.hideable = hideable
 
 
 class TableView(ctk.CTkFrame):
@@ -78,7 +84,8 @@ class TableView(ctk.CTkFrame):
     DEFAULT_PAGE_ROWS = 25   # valor de arranque, antes de medir ninguna fila real
     _RESIZE_DEBOUNCE_MS = 150   # mismo valor que _DETAIL_RESIZE_DEBOUNCE_MS en gui/app.py
 
-    def __init__(self, master, columns, scrollable: bool = True, **kwargs):
+    def __init__(self, master, columns, scrollable: bool = True, header_right_pad: int = 0,
+                 on_visibility_changed=None, **kwargs):
         """scrollable=False: self.body es un CTkFrame normal (crece con
         cada fila añadida, sin barra de scroll propia) en vez de un
         CTkScrollableFrame -- para listas pequeñas/ya acotadas (p.ej. ya
@@ -86,7 +93,34 @@ class TableView(ctk.CTkFrame):
         contiene, no tener una segunda barra de scroll anidada e inútil
         (ver "Sincronizar visionado"). Por defecto True: mismo
         comportamiento de siempre, el que necesitan Archivos/Episodios/
-        Liberar espacio/Historial con listas sin acotar."""
+        Liberar espacio/Historial con listas sin acotar.
+
+        header_right_pad: hueco extra (px) reservado a la derecha de la
+        cabecera -- 0 por defecto, no cambia nada. Cada fila vive dentro
+        de self.body (CTkScrollableFrame, que reserva su propia barra de
+        scroll + borde interno en el lado derecho, la tenga visible ahora
+        mismo o no), mientras que self.header_frame es un CTkFrame normal
+        sin ese hueco -- así que la columna expand=True de la cabecera
+        puede acabar creciendo más que la misma columna en cada fila,
+        desplazando hacia la derecha, en la cabecera, las columnas de
+        ancho fijo que van DESPUÉS del expand. El hueco real que hace
+        falta compensar NO es un valor fijo universal -- depende de
+        cuántas columnas/qué anidación tenga cada tabla en concreto (visto
+        de verdad: Episodios que faltan necesitaba ~30px, Archivos ~16px)
+        -- por eso esto es opt-in por tabla (medido a mano contra esa
+        tabla, ver dónde se pasa en gui/app.py), no un valor aplicado
+
+        OJO -- esto es un efecto DISTINTO e independiente de col_padx()
+        (el hueco que cada columna resizable=True deja tras de sí en la
+        CABECERA, ver _init_widths): header_right_pad compensa la
+        diferencia de ancho real entre header_frame y body/su scrollbar;
+        col_padx() compensa los separadores arrastrables. Los dos se
+        miden por separado -- no asumas que ajustar uno arregla el otro
+        (confusión real de esta sesión: al medir header_right_pad antes
+        de que existiera col_padx(), el valor encontrado absorbía sin
+        querer parte del déficit de sashes, así que tocó re-medirlo tras
+        añadir col_padx()).
+        solo por defecto a las cuatro."""
         # border_width en el propio TableView (aunque fg_color siga
         # "transparent"): sin esto, el "contenedor" de la tabla no tiene
         # ningún límite visible propio -- depende por completo de que el
@@ -105,16 +139,38 @@ class TableView(ctk.CTkFrame):
 
         self.columns = columns
         self.scrollable = scrollable
+        self._header_right_pad = header_right_pad
+        # Debe quedar fijado ANTES de _build_header() (llamado más abajo) --
+        # el menú contextual de ocultar columnas solo se enlaza si este
+        # callback está puesto, así que pasarlo por constructor es lo único
+        # que garantiza que las etiquetas de la cabecera ya nacen con el
+        # clic derecho. Si se pusiera después (p.ej. como atributo desde
+        # quien construye la tabla), la primera _build_header() no añadiría
+        # el binding, y como set_hidden() solo reconstruye la cabecera si
+        # el conjunto oculto CAMBIA (no ocurre en el primer arranque sin
+        # columnas ocultas guardadas), el menú no aparecería nunca.
+        self.on_visibility_changed = on_visibility_changed
         self._widths = {}
+        self._desired = {}   # ancho pedido/elegido, antes de encogerlo para que quepa -- ver fit_to_width
+        self._padx = {}   # padx que debe usar CADA FILA para esta columna -- ver _init_widths/col_padx
         self._header_min = {}   # ancho mínimo para que quepa el texto de cabecera -- ver _init_widths
+        self._hidden = set()   # claves de columnas ocultas -- ver set_hidden/visible_columns
         self._sash_state = None
         self._header_labels = {}
+        # Celdas de fila ya construidas, por columna ({key: [frame, ...]}) --
+        # ver cell()/_apply_cell_widths: al arrastrar un separador hay que
+        # reajustar el ancho de las celdas YA pintadas, no solo el de la
+        # cabecera, o cabecera y filas dejan de coincidir hasta el siguiente
+        # redibujado completo. Se lleva aquí (y no en cada pestaña) para que
+        # ninguna tabla tenga que reimplementarlo.
+        self._cells = {}
         self._bold_font = ctk.CTkFont(weight="bold")
 
         self.page_size = self.DEFAULT_PAGE_ROWS
         self._row_stride_px = None   # alto medio medido por fila, ver note_rows_rendered
         self._resize_after_id = None
         self.on_page_size_changed = None   # callback opcional, ver enable_dynamic_page_size
+        self.on_header_click = None   # callback opcional: ordenar por columna, ver set_sort_indicator
 
         # fg_color explícito: sin esto la cabecera usa el gris por defecto
         # de CTkFrame (gray17 en modo oscuro), que es EXACTAMENTE el mismo
@@ -179,14 +235,177 @@ class TableView(ctk.CTkFrame):
                 # La cabecera nunca se sale de su columna: si el texto no
                 # cabe en el ancho pedido, la columna crece para acomodarlo
                 # (esto es justo lo que fallaba antes -- el CTkLabel de la
-                # cabecera crecía él solo y desalineaba lo de después).
-                needed = self._bold_font.measure(col.header) + self._HEADER_TEXT_PADDING
+                # cabecera crecía él solo y desalineaba todo lo de después).
+                # Si es ordenable, se mide con la flecha de orden puesta
+                # (" ^", ver set_sort_indicator) aunque no se esté mostrando
+                # ahora mismo -- si no, la columna se queda justa y el texto
+                # se sale en cuanto el usuario la pulsa para ordenar.
+                text_to_measure = f"{col.header} ^" if col.sortable else col.header
+                needed = self._bold_font.measure(text_to_measure) + self._HEADER_TEXT_PADDING
                 self._header_min[col.key] = needed
                 width = max(width, needed)
             self._widths[col.key] = width
+            # Ancho DESEADO (el que pidió quien construyó la tabla, o el que
+            # el usuario dejó al arrastrar) frente al ancho EFECTIVO
+            # (self._widths, que puede ser menor si ahora mismo no cabe) --
+            # ver fit_to_width. Separarlos es lo que permite que encoger la
+            # ventana estreche columnas sin perder el ancho elegido: al
+            # volver a ensanchar, se recuperan solas.
+            self._desired[col.key] = width
+        self._recompute_padx()
+
+    def _recompute_padx(self):
+        """padx que debe usar la CELDA de cada fila para esta columna --
+        ver col_padx. Debe reproducir EXACTAMENTE lo que _build_header
+        dibuja de verdad: la primera columna VISIBLE no lleva margen
+        izquierdo; las demás llevan 4px, +4px más si la columna ANTERIOR
+        VISIBLE es resizable=True (porque _build_header le dibuja un
+        separador arrastrable de 4px detrás, ver el bucle de más abajo) --
+        un separador que solo existe en la cabecera, nunca en las filas.
+        Las columnas ocultas no cuentan ni como primera ni como vecina:
+        si se oculta "Nombre original", "Detectado" pasa a ser la primera
+        columna visible y debe quedar sin margen izquierdo. Antes cada
+        tabla copiaba esta cuenta a mano fila por fila ("mirror sash X|Y"
+        en gui/app.py) y se desalineaba en cuanto cambiaba una columna sin
+        que quien tocara ESA columna se acordara de las demás (bug real,
+        repetido dos veces: primero con Estreno/Episodios que faltan,
+        luego con Peso en Archivos al añadir el logo de Jellyfin/Plex)."""
+        visible = [c for c in self.columns if c.key not in self._hidden]
+        self._padx = {}
+        for i, col in enumerate(visible):
+            if i == 0:
+                self._padx[col.key] = (0, 0)
+            else:
+                prev_resizable = visible[i - 1].resizable
+                self._padx[col.key] = (8, 0) if prev_resizable else (4, 0)
 
     def col_width(self, key: str) -> int:
         return self._widths[key]
+
+    # Alto por defecto de una celda construida con cell() -- ver ahí por qué
+    # hace falta un alto EXPLÍCITO. Cada tabla ajusta el suyo (table.row_height
+    # = N) justo después de construirla, según lo alto que sea su fila real.
+    row_height = 26
+
+    def cell(self, parent, key: str, height=None, pady=0, padx=None):
+        """Contenedor de UNA celda de fila, con el ancho de su columna y
+        recorte real -- devuelve un CTkFrame ya empaquetado dentro de
+        *parent*; el llamador mete dentro su etiqueta/botón con
+        pack(fill="both", expand=True).
+
+        Esto es lo que hace que una columna NO PUEDA desbordar, y sustituye
+        a la estrategia anterior de "medir el texto y recortarlo antes de
+        pintarlo" (_fit_text en gui/app.py). En Tk, `width` en una etiqueta
+        es un MÍNIMO, no un máximo: si el texto no cabe, el widget crece y
+        empuja a todas las columnas siguientes -- medido de verdad, una
+        CTkLabel(width=200) con un nombre de release largo ocupaba 616px y
+        movía la columna de al lado de x=200 a x=616. Por eso la alineación
+        dependía de que CADA sitio que escribe en una celda midiera bien y
+        usara el MISMO presupuesto de píxeles, y no lo hacían (en Archivos
+        había tres presupuestos distintos entre _refresh_table/_update_row/
+        _apply_col_widths, así que la misma celda acababa con un ancho u
+        otro según quién la hubiera tocado la última: unas filas cuadraban
+        y otras se salían por la derecha, escondiendo los botones del final).
+
+        Con pack_propagate(False) el contenedor NUNCA crece para acomodar a
+        su contenido: lo que no cabe se recorta, mida quien mida. _fit_text
+        se sigue usando, pero solo para que el corte quede bonito ("…") --
+        si se equivoca, ya no descuadra nada.
+
+        OJO -- pack_propagate(False) fija el alto además del ancho, así que
+        la celda necesita un `height` correcto o recortará en vertical: por
+        defecto self.row_height (ajústalo por tabla), o pásalo aquí para
+        una celda concreta más alta (p.ej. el bloque de dos líneas de
+        "Liberar espacio").
+
+        La columna expand=True no lleva ancho propio (es "lo que sobre"),
+        así que su celda se empaqueta con fill/expand -- pero con la misma
+        propagación desactivada, para que su contenido tampoco pueda
+        estirarla más allá del hueco real disponible."""
+        col = next(c for c in self.columns if c.key == key)
+        frame = ctk.CTkFrame(
+            parent, fg_color="transparent",
+            width=1 if col.expand else self._widths[key],
+            height=height if height is not None else self.row_height)
+        frame.pack_propagate(False)
+        pack_kwargs = {"side": "left",
+                       "padx": self.col_padx(key) if padx is None else padx,
+                       "pady": pady}
+        if col.expand:
+            pack_kwargs.update(fill="both", expand=True)
+        frame.pack(**pack_kwargs)
+        self._cells.setdefault(key, []).append(frame)
+        return frame
+
+    def _apply_cell_widths(self, keys=None):
+        """Reajusta el ancho de las celdas YA construidas (ver cell()) --
+        llamado al cambiar el ancho de una columna, para que las filas ya
+        pintadas sigan cuadrando con la cabecera sin tener que redibujar la
+        tabla entera. De paso descarta las celdas de filas ya destruidas
+        (las pestañas destruyen sus filas de formas distintas, no todas vía
+        clear_rows)."""
+        for key in (keys if keys is not None else list(self._cells)):
+            frames = self._cells.get(key)
+            if not frames:
+                continue
+            alive = []
+            for frame in frames:
+                if not frame.winfo_exists():
+                    continue
+                alive.append(frame)
+                col = next(c for c in self.columns if c.key == key)
+                if not col.expand:
+                    frame.configure(width=self._widths[key])
+            self._cells[key] = alive
+
+    def col_padx(self, key: str) -> tuple:
+        """padx que debe usar el widget de una FILA para esta columna --
+        única fuente de verdad compartida con la cabecera (ver _init_widths).
+        Úsalo en vez de escribir `padx=(4, 0)`/`(8, 0)` a mano en cada
+        `.pack()` de una fila: así, si la lista de columnas cambia (se
+        añade una, se marca resizable=True, se oculta una...), las filas
+        ya construidas con esto se mantienen alineadas sin tocar nada
+        más."""
+        return self._padx[key]
+
+    def visible_columns(self) -> list:
+        """Columnas NO ocultas, en orden -- quien construye filas debe
+        iterar por esto (o consultar is_hidden) y saltarse las ocultas."""
+        return [c for c in self.columns if c.key not in self._hidden]
+
+    def is_hidden(self, key: str) -> bool:
+        return key in self._hidden
+
+    def hidden_columns(self) -> set:
+        return set(self._hidden)
+
+    def set_hidden(self, hidden_keys, notify: bool = True):
+        """Oculta/muestra columnas de golpe (persistencia: quien use esto
+        debe guardar hidden_columns() y volver a pasárselo al construir la
+        tabla). Nunca permite ocultar la ÚLTIMA columna visible -- una
+        tabla sin ninguna columna no tiene cabecera ni filas que pintar.
+        Reconstruye la cabecera y recalcula col_padx para que cabecera y
+        filas sigan alineadas entre las columnas que quedan. notify=False
+        se usa al restaurar desde disco en la construcción, para no
+        disparar el callback antes de que el resto de la tabla exista."""
+        new_hidden = set(hidden_keys)
+        if not [c for c in self.columns if c.key not in new_hidden]:
+            return
+        if new_hidden != self._hidden:
+            self._hidden = new_hidden
+            self._recompute_padx()
+            self._build_header()
+            if notify and self.on_visibility_changed:
+                self.on_visibility_changed()
+
+    def _toggle_column_visible(self, key: str):
+        """Muestra u oculta una columna (usado por el menú contextual de
+        la cabecera). El caso "ocultar la última visible" lo bloquea
+        set_hidden."""
+        if key in self._hidden:
+            self.set_hidden(self._hidden - {key})
+        else:
+            self.set_hidden(self._hidden | {key})
 
     def set_width(self, key: str, width: int, refresh: bool = True):
         """Cambia el ancho base de una columna (p.ej. al redimensionar la
@@ -195,31 +414,122 @@ class TableView(ctk.CTkFrame):
         columna más estrecha de lo que necesita su propio texto de
         cabecera (ver _min_width_for)."""
         self._widths[key] = max(width, self._min_width_for(key))
+        self._desired[key] = self._widths[key]
+        self._apply_cell_widths(keys=[key])
         if refresh:
             self.refresh_header(keys=[key])
+
+    def fit_to_width(self, avail_width: int, min_expand: int = 60):
+        """Hace que la suma de las columnas QUEPA de verdad en *avail_width*
+        -- llámalo cuando cambie el ancho disponible de la tabla (ver
+        _on_table_resize en Archivos).
+
+        El recorte de cell() impide que una celda empuje a las siguientes,
+        pero NO cubre el otro caso que también deja los botones del final
+        fuera de la vista: que la SUMA de todos los anchos supere el ancho
+        real de la tabla (p.ej. tras ensanchar varias columnas a mano y
+        luego encoger la ventana, o ensanchar el panel lateral). Tk no
+        encoge por su cuenta un widget con ancho fijo -- simplemente lo
+        dibuja fuera del contenedor, donde queda recortado e invisible.
+
+        Aquí las columnas arrastrables se encogen proporcionalmente hasta
+        que todo cabe, nunca por debajo de su mínimo real (_min_width_for,
+        que ya respeta el texto de su cabecera). Se encoge el ancho
+        EFECTIVO, no el DESEADO (ver _desired): al volver a haber sitio,
+        cada columna recupera sola el ancho que el usuario había elegido,
+        así que esto nunca le "roba" un ajuste hecho a mano.
+
+        min_expand: hueco que se le reserva a la columna expand=True (si la
+        hay) antes de repartir el resto. Devuelve la lista de columnas cuyo
+        ancho efectivo ha cambiado."""
+        visible = self.visible_columns()
+        if not visible or avail_width <= 1:
+            return []
+
+        # + header_right_pad: hueco que SOLO existe en la cabecera (ver
+        # __init__) -- si no se descuenta aquí, las columnas pueden crecer
+        # hasta llenar el ancho de las filas y dejar la cabecera desbordada.
+        padx_total = sum(sum(self.col_padx(c.key)) for c in visible) + self._header_right_pad
+        expand_col = next((c for c in visible if c.expand), None)
+        shrinkable = [c for c in visible if c.resizable and not c.expand]
+        frozen = sum(self._widths[c.key] for c in visible
+                     if not c.expand and c not in shrinkable)
+        budget = avail_width - padx_total - frozen - (min_expand if expand_col else 0)
+        desired_total = sum(self._desired.get(c.key, self._widths[c.key]) for c in shrinkable)
+
+        changed = []
+        for col in shrinkable:
+            desired = self._desired.get(col.key, self._widths[col.key])
+            if desired_total <= budget or desired_total <= 0:
+                new_w = desired                      # cabe tal cual: recuperar el ancho elegido
+            else:
+                new_w = max(self._min_width_for(col.key),
+                            int(desired * max(0.0, budget) / desired_total))
+            if new_w != self._widths[col.key]:
+                self._widths[col.key] = new_w
+                changed.append(col.key)
+
+        # La columna expand no tiene ancho propio (es "lo que sobra"), pero
+        # su valor en _widths sí se consulta para recortar texto (_fit_text),
+        # así que se deja al día con el hueco real que le queda.
+        if expand_col is not None:
+            used = sum(self._widths[c.key] for c in visible if not c.expand)
+            self._widths[expand_col.key] = max(0, avail_width - padx_total - used)
+
+        if changed:
+            self._apply_cell_widths(keys=changed)
+            self.refresh_header(keys=changed)
+        return changed
 
     # ------------------------------------------------------------ cabecera --
 
     def _next_resizable_pair(self, key: str):
-        keys = [c.key for c in self.columns]
+        keys = [c.key for c in self.visible_columns()]
         i = keys.index(key)
         return keys[i + 1] if i + 1 < len(keys) else None
+
+    def _show_column_menu(self, event):
+        """Menú contextual (clic derecho en la cabecera) para ocultar/
+        mostrar columnas -- las columnas hideable=False no aparecen. El
+        estado se persiste fuera (ver on_visibility_changed)."""
+        menu = tk.Menu(self, tearoff=0)
+        for col in self.columns:
+            if not col.hideable:
+                continue
+            menu.add_checkbutton(
+                label=col.header or col.key,
+                variable=tk.BooleanVar(self, value=col.key not in self._hidden),
+                onvalue=True, offvalue=False,
+                command=lambda k=col.key: self._toggle_column_visible(k))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _build_header(self):
         for w in self.header_frame.winfo_children():
             w.destroy()
         self._header_labels = {}
 
-        for i, col in enumerate(self.columns):
+        for i, col in enumerate(self.visible_columns()):
             lbl = ctk.CTkLabel(
                 self.header_frame, text=col.header, font=self._bold_font, anchor=col.anchor,
-                width=0 if col.expand else self._widths[col.key])
+                width=0 if col.expand else self._widths[col.key],
+                cursor="hand2" if col.sortable else "")
             padx = (self._PADX_BETWEEN, 0) if i > 0 else (0, 0)
             if col.expand:
                 lbl.pack(side="left", padx=padx, pady=4, fill="x", expand=True)
             else:
                 lbl.pack(side="left", padx=padx, pady=4)
             self._header_labels[col.key] = lbl
+            if col.sortable:
+                lbl.bind("<Button-1>", lambda e, k=col.key: self.on_header_click(k) if self.on_header_click else None)
+            # Menú contextual solo si quien construyó la tabla lo ha
+            # activado (ver on_visibility_changed) -- las otras tablas
+            # (Episodios/Historial/etc.) no saben saltarse columnas
+            # ocultas en sus filas, así que no deben poder ocultarlas.
+            if col.hideable and self.on_visibility_changed is not None:
+                lbl.bind("<Button-3>", lambda e: self._show_column_menu(e))
 
             if col.resizable:
                 right_key = self._next_resizable_pair(col.key)
@@ -230,6 +540,13 @@ class TableView(ctk.CTkFrame):
                     sash.bind("<ButtonPress-1>", lambda e, l=col.key, r=right_key: self._sash_press(e, l, r))
                     sash.bind("<B1-Motion>", self._sash_motion)
                     sash.bind("<ButtonRelease-1>", self._sash_release)
+
+        if self._header_right_pad:
+            # Ver header_right_pad en __init__ -- 0 por defecto, no toca
+            # nada; solo se reserva este hueco en las tablas que lo pidan
+            # explícitamente.
+            ctk.CTkFrame(self.header_frame, width=self._header_right_pad, height=1,
+                         fg_color="transparent").pack(side="right")
 
     def refresh_header(self, keys=None):
         """Actualiza el ancho de las etiquetas ya construidas -- NUNCA
@@ -245,7 +562,7 @@ class TableView(ctk.CTkFrame):
         que cambian en un arrastre de separador) -- reconfigurar TODAS
         las etiquetas en cada píxel de arrastre, aunque no cambien de
         ancho, generaba más trabajo de redibujado del necesario."""
-        for col in self.columns:
+        for col in self.visible_columns():
             if col.expand or (keys is not None and col.key not in keys):
                 continue
             lbl = self._header_labels.get(col.key)
@@ -254,6 +571,25 @@ class TableView(ctk.CTkFrame):
 
     def header_label(self, key: str):
         return self._header_labels.get(key)
+
+    def set_sort_indicator(self, key: "str | None", ascending: bool):
+        """Marca *key* como la columna de orden activa -- su cabecera
+        pasa a "{header} ^" (ascendente) o "{header} v" (descendente).
+        ASCII, no ▲/▼: esos caracteres Unicode dejan un recuadro visible
+        en el sistema del usuario (mismo motivo que el toggle de
+        expandir/colapsar de Episodios que faltan). Cualquier OTRA
+        columna sortable que tuviera flecha vuelve a su texto plano --
+        solo una columna muestra indicador a la vez. Solo toca texto,
+        nunca ancho -- refresh_header() no lo pisa (esa solo toca
+        width=)."""
+        arrow = "^" if ascending else "v"
+        for col in self.visible_columns():
+            if not col.sortable:
+                continue
+            lbl = self._header_labels.get(col.key)
+            if lbl is None:
+                continue
+            lbl.configure(text=f"{col.header} {arrow}" if col.key == key else col.header)
 
     # --------------------------------------------------- arrastre de sash --
 
@@ -271,6 +607,11 @@ class TableView(ctk.CTkFrame):
         new_r = max(self._min_width_for(self._sash_state["right"]), self._sash_state["right_w"] - delta)
         self._widths[self._sash_state["left"]] = new_l
         self._widths[self._sash_state["right"]] = new_r
+        # Arrastrar = el usuario ELIGE ese ancho -- se guarda también como
+        # deseado, para que fit_to_width lo respete/recupere (ver _desired).
+        self._desired[self._sash_state["left"]] = new_l
+        self._desired[self._sash_state["right"]] = new_r
+        self._apply_cell_widths(keys=[self._sash_state["left"], self._sash_state["right"]])
         self.refresh_header(keys=[self._sash_state["left"], self._sash_state["right"]])
         if self.on_column_resize:
             self.on_column_resize()
@@ -298,6 +639,7 @@ class TableView(ctk.CTkFrame):
         delante."""
         for w in self.body.winfo_children():
             w.destroy()
+        self._cells = {}   # las celdas de esas filas ya no existen -- ver cell()/_apply_cell_widths
 
     def scroll_to_top(self):
         """No-op si scrollable=False -- self.body es un CTkFrame normal,
