@@ -24,8 +24,20 @@ def normalize_series_name(name: str) -> str:
 _MIN_SUBSTRING_BOOST_LEN = 4
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
+# Contenido de cualquier grupo entre paréntesis/corchetes/llaves.
+_BRACKET_RE = re.compile(r"[(\[{]([^)\]}]*)[)\]}]")
 
-def series_similarity(a: str, b: str, strict: bool = False) -> float:
+
+def _plain_words(text: str) -> list:
+    """Palabras en minúscula, SIN quitar el artículo inicial -- a
+    diferencia de normalize_series_name(), que sí lo quita y por eso no
+    sirve para comparar el contenido de un paréntesis palabra a palabra
+    ("(The Simpsons)" perdería el "the" y dejaría de casar)."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).split()
+
+
+def series_similarity(a: str, b: str, strict: bool = False,
+                      allow_annotation: bool = False) -> float:
     """0..1 — cuánto se parecen dos nombres de serie una vez normalizados.
 
     Años distintos = nunca la misma obra, SIEMPRE (independientemente de
@@ -53,7 +65,24 @@ def series_similarity(a: str, b: str, strict: bool = False) -> float:
     una palabra de más SÍ importa) solo se admite si comparten el mismo
     año, o si lo que sobra en el nombre largo son dígitos/espacios, no
     letras -- así "Animal" y "Animal Crackers" ya no se consideran el
-    mismo título solo porque uno empiece igual que el otro."""
+    mismo título solo porque uno empiece igual que el otro.
+
+    *allow_annotation* (solo tiene efecto con strict=True) relaja ese modo
+    lo justo para admitir el patrón "título (título original)":
+    "Desencanto (Disenchantment)", "Los Simpson (The Simpsons)". Es el
+    modo que necesita la ELECCIÓN DE CARPETA DE DESTINO (ver
+    core/ftp_categories.py::find_existing_category_folder), donde el modo
+    laxo es peligroso -- "Star Wars", que es lo que queda de "Star Wars
+    Xxx, A Porn Parody 2011" tras limpiar el nombre, puntuaba 0.90 contra
+    la carpeta "Star Wars Las aventuras de los jóvenes Jedi" y el archivo
+    acababa en la categoría infantil (caso real: porno subido a
+    /datos2/seriespeques/) -- pero el modo estricto a secas se pasa de
+    frenada y rompe la reutilización legítima de carpetas.
+
+    El modo laxo se queda como estaba a propósito: lo usa la detección de
+    duplicados, donde un falso positivo solo evita una subida repetida y
+    el patrón "nombre corto vs nombre de release largo" es justo lo que
+    hay que reconocer."""
     na, nb = normalize_series_name(a), normalize_series_name(b)
     if not na or not nb:
         return 0.0
@@ -68,21 +97,58 @@ def series_similarity(a: str, b: str, strict: bool = False) -> float:
     ratio = difflib.SequenceMatcher(None, na, nb).ratio()
     shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
     if len(shorter) >= _MIN_SUBSTRING_BOOST_LEN and longer.startswith(shorter):
+        remainder = longer.replace(shorter, "", 1)
         if not strict:
             ratio = max(ratio, 0.90)
-        else:
-            remainder = longer.replace(shorter, "", 1)
-            if same_year or not any(c.isalpha() for c in remainder):
-                ratio = max(ratio, 0.90)
+        elif same_year or not any(c.isalpha() for c in remainder):
+            ratio = max(ratio, 0.90)
+        elif allow_annotation and _is_annotation_remainder(a, b, remainder):
+            ratio = max(ratio, 0.90)
     return ratio
 
 
-def best_match(desired: str, candidates, min_ratio: float = 0.55):
+def _is_annotation_remainder(a: str, b: str, normalized_remainder: str) -> bool:
+    """True si lo que le sobra al nombre largo respecto al corto es una
+    anotación y no texto libre que continúa el título.
+
+    Cuenta como anotación:
+      - solo dígitos/espacios (un año suelto: "Ranma" vs "Ranma 1989")
+      - texto que en el nombre ORIGINAL va entre paréntesis o corchetes
+        ("Desencanto" vs "Desencanto (Disenchantment)")
+
+    Hay que mirar los nombres originales porque normalize_series_name()
+    borra la puntuación, y sin paréntesis no hay forma de distinguir
+    "Desencanto (Disenchantment)" de "Star Wars Las aventuras...".
+    """
+    if not any(c.isalpha() for c in normalized_remainder):
+        return True
+
+    original_long = a if len(a) >= len(b) else b
+
+    # Se comparan CONJUNTOS DE PALABRAS, no posiciones dentro del texto:
+    # normalize_series_name() quita el artículo inicial, así que contar
+    # caracteres sobre el original se desalinea en cuanto hay uno ("Los
+    # Simpson" -> "simpson" deja el índice a mitad de palabra).
+    bracketed = " ".join(_BRACKET_RE.findall(original_long))
+    if not bracketed:
+        return False
+
+    bracket_words = set(_plain_words(bracketed))
+    remainder_words = set(normalized_remainder.split())
+    return bool(remainder_words) and remainder_words <= bracket_words
+
+
+def best_match(desired: str, candidates, min_ratio: float = 0.55,
+               strict: bool = False, allow_annotation: bool = False):
     """Devuelve (mejor_candidato, ratio) entre *candidates*, o (None, 0.0)
-    si ninguno alcanza min_ratio."""
+    si ninguno alcanza min_ratio.
+
+    *strict* y *allow_annotation* se pasan tal cual a series_similarity --
+    ver allí. La combinación strict=True + allow_annotation=True es la que
+    necesita la elección de carpeta de destino."""
     best_name, best_ratio = None, 0.0
     for c in candidates:
-        r = series_similarity(desired, c)
+        r = series_similarity(desired, c, strict=strict, allow_annotation=allow_annotation)
         if r > best_ratio:
             best_name, best_ratio = c, r
     if best_ratio >= min_ratio:

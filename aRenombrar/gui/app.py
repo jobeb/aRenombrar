@@ -8,6 +8,7 @@ Progreso FTP integrado como columnas en la lista de archivos.
 import difflib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -45,9 +46,24 @@ from core.kitsu_client import KitsuClient
 from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
-from core.amule_client import AmuleClient, AmuleSearchResult
+from core.amule_client import AmuleSearchResult
+from core.ec_client import EcClient, EcConnectionError, EcAuthError
 from core.auto_watcher import AutoWatcher
-from core.series_match import best_match, match_names_exclusively
+from core.series_match import best_match, match_names_exclusively, series_similarity
+from core.download_quality import best_result
+
+# Parecido mínimo para dar dos carpetas del FTP por la MISMA serie al
+# comprobar qué episodios ya están en el servidor (ver _match_ftp_present).
+# Más bajo que el 0.90 de _find_category_with_existing_folder a propósito,
+# porque el riesgo no es el mismo: aquí un falso positivo solo hace que un
+# hueco no se reporte (se cree que ya tienes un episodio), nunca mueve ni
+# sube ningún archivo a la carpeta equivocada. Medido contra los dos casos
+# reales que motivaron cada lado del ajuste: "Prodigiosa: Las aventuras de
+# Ladybug" vs "Miraculous las aventuras de Ladybug" (la MISMA serie en dos
+# carpetas) da 0.80 y debe unirse; "Arcadia" vs "Los 3 de Adabo: Cuentos de
+# Arcadia" (series DISTINTAS que llegaron a fusionarse) da 0.56 y debe
+# seguir separado.
+_FTP_PRESENT_MIN_RATIO = 0.75
 from core.ftp_categories import choose_category, new_category_id
 from core.upload_slots import UploadSlotManager
 from gui.table_view import TableView, ColumnSpec
@@ -66,9 +82,30 @@ ERROR_COLOR   = "#e74c3c"
 WARNING_COLOR = "#f39c12"
 SUCCESS_COLOR = "#2ecc71"
 PENDING_COLOR = "#95a5a6"
+
+# Botones de icono en las filas de episodios que faltan / temporada -- cada
+# tipo de acción lleva su propio color (ambos temas) para distinguirse sin
+# texto. ver _build_missing_ep_season_episode_rows.
+ICON_COPY  = ("#4A6FC4", "#2B4A8A")   # copiar al portapapeles
+ICON_AMULE = ("#9B59B6", "#6e3aa1")   # búsqueda en aMule (abre Descargas)
+ICON_IGNORE= ("#C0392B", "#8E2A1F")   # ignorar/ocultar
+ICON_RESTORE=("#2ECC71", "#1d7a45")    # restaurar (des-ignorar)
+ICON_LINKS = ("#7F8C8D", "#5f6b6d")   # enlaces personalizados
+# Colores del botón "Descargar" automático de una fila de episodio: en
+# reposo lleva el color de marca, y cambia a OK (verde)/error (rojo)/en
+# curso (ámbar) según avanza el ciclo buscar🏏mejor candidato▶descargar.
+ICON_DL_IDLE   = ("#2980B9", "#155a8a")   # botón de descarga en reposo
+ICON_DL_BUSY   = ("#E67E22", "#b85c12")   # búsqueda + descarga en segundo plano
+ICON_DL_OK     = ("#27AE60", "#147a3d")   # descarga lanzada a aMule con éxito
+ICON_DL_FAIL   = ("#C0392B", "#8a1f16")   # no se encontró/como lanzado
+# Botón "⚡" de autocompletado por serie (pestaña Episodios que faltan): se
+# pinta del color de marca cuando el autocompletado está ACTIVO para la serie.
+ICON_AUTO_ON   = ("#2980B9", "#155a8a")
 CONTAINER_GAP = 8   # separación estándar entre contenedores principales de la UI
 QUEUED_COLOR  = "#3498db"
 SELECTED_ROW_COLOR = ("#c8e6d0", "#204a34")   # (modo claro, modo oscuro) — fila seleccionada
+# Fila del "mejor candidato" de la tabla Descargar (ver _downloads_rebuild_page).
+DOWNLOAD_BEST_ROW_COLOR = ("#d2efc9", "#1e3a2c")
 STATUS_LABELS = {"en_cola": "En cola",
                   "esperando_confirmacion": "Espera"}   # textos de estado que no quedan bien con .capitalize()
 
@@ -1040,8 +1077,25 @@ class App(_AppBase):
         # solo con --minimized: el botón "⚡ Auto" debe recordar su estado
         # tanto si la app se abre a mano como por el autoarranque.
         self.after(400, self._restore_auto_watcher_state)
+        self.after(600, self._start_missing_ep_auto_worker)
         if "--minimized" in sys.argv:
             self.after(200, self._minimize_to_tray)
+
+        # Los callbacks de Tk (binds, after...) que lancen una excepción se
+        # pierden por stderr por defecto y no aparecen en app.log -- con lo
+        # que un fallo de repintado (p.ej. un error al construir una fila de
+        # "Episodios que faltan") dejaba medio-renderizada la tabla sin dejar
+        # ningún rastro. Este hook vuelca la traza a _log para poder
+        # diagnosticarlo.
+        try:
+            self.report_callback_exception = self._report_callback_exception
+        except Exception:
+            pass
+
+    def _report_callback_exception(self, exc, val, tb):
+        import traceback
+        _log.error("Excepción en callback de Tk:\n%s",
+                   "".join(traceback.format_exception(exc, val, tb)))
 
     def _apply_icon(self, window):
         """Aplica el icono de la app a *window* (ventana principal o cualquier
@@ -2124,8 +2178,9 @@ class App(_AppBase):
         self._file_rows = []
         self._files_page = 0
         self._table_resize_debounce_id = None   # ver _on_table_resize
-        self._files_sort_key = None   # ver _on_files_header_click -- sin ordenar hasta que se pulse una cabecera
-        self._files_sort_asc = True
+        self._files_sort_key, self._files_sort_asc = self._saved_table_sort(
+            "archivos", None, True)   # ver _on_files_header_click -- sin ordenar hasta que se pulse una cabecera
+        self._files_table_sort_applied = False   # orden guardado aún no aplicado a self.files (ver _apply_persisted_sort)
         self._apply_col_widths()   # sincroniza self._col_widths con los anchos guardados (sw0), si había
 
         # Paginado (ver TableView.page_size, calculado dinámicamente según
@@ -2206,6 +2261,24 @@ class App(_AppBase):
         all_saved = dict(self.config_data.get("table_hidden_columns", {}))
         all_saved[table_id] = sorted(hidden)
         self.config_data.set("table_hidden_columns", all_saved)
+        self.config_data.save()
+
+    def _saved_table_sort(self, table_id: str, default_key=None, default_asc=True):
+        """Orden de columna guardado para una tabla (ver _save_table_sort) --
+        (clave, ascendente) o el par por defecto si la tabla nunca se
+        ordenó / no hay nada guardado (primer arranque o reset de config)."""
+        saved = self.config_data.get("table_sort", {}).get(table_id)
+        if isinstance(saved, dict) and "key" in saved:
+            return saved.get("key"), bool(saved.get("asc", default_asc))
+        return default_key, default_asc
+
+    def _save_table_sort(self, table_id: str, key, asc: bool):
+        """Callback de los handlers de clic en cabecera: guarda el orden
+        elegido en disco al instante (no espera a "Guardar configuración"),
+        para que el orden de columnas elegido persista entre sesiones."""
+        all_saved = dict(self.config_data.get("table_sort", {}))
+        all_saved[table_id] = {"key": key, "asc": bool(asc)}
+        self.config_data.set("table_sort", all_saved)
         self.config_data.save()
 
     def _compute_cw(self, avail_w=None, dest_w=140, name_w=None, det_w=None,
@@ -5322,13 +5395,35 @@ class App(_AppBase):
 
         parallel   = max(1, min(5, int(self.config_data.get("ftp_parallel", 1))))
 
+        # Subidas transfiriendo AHORA MISMO (no las conexiones configuradas)
+        # -- ver get_speed_kbs. Lo incrementa/decrementa cada worker al coger
+        # y soltar su conexión (ver process()).
+        _active_uploads = [0]
+        _active_lock = threading.Lock()
+
         # Callable — lee config_data en cada chunk para cambio instantáneo
         # Config almacena MB/s; devolvemos KB/s (ftp_client lo multiplica × 1024 → bytes/s)
         def get_speed_kbs():
+            """Límite POR CONEXIÓN: el límite global repartido entre las
+            subidas que están transfiriendo de verdad en este momento.
+
+            Antes se dividía entre `parallel` (las conexiones CONFIGURADAS),
+            así que subir un único archivo con 5 conexiones configuradas y
+            un límite de 20 MB/s daba 20/5 = 4 MB/s reales -- se
+            desperdiciaban las otras cuatro quintas partes del límite
+            porque las otras conexiones no estaban subiendo nada. Al
+            repartir entre las ACTIVAS, un archivo solo puede usar el
+            límite entero, y en cuanto arrancan más subidas cada una baja
+            su parte sola (esto se reevalúa en cada bloque, ver el callback
+            de FTPClient.upload_file, así que se ajusta en caliente sin
+            reiniciar la transferencia)."""
             try:
                 mbs = float(self.config_data.get("ftp_speed_limit", 0) or 0)
-                per = mbs / parallel if mbs > 0 else 0.0
-                return int(per * 1024)  # MB/s → KB/s
+                if mbs <= 0:
+                    return 0
+                with _active_lock:
+                    n = max(1, _active_uploads[0])
+                return int((mbs / n) * 1024)  # MB/s → KB/s
             except Exception:
                 return 0
 
@@ -5407,6 +5502,8 @@ class App(_AppBase):
             slot = _next_slot()
             slot_of[id(entry)] = slot
             ftp_conn = conn_q.get()
+            with _active_lock:
+                _active_uploads[0] += 1   # ver get_speed_kbs: reparte el límite entre las ACTIVAS
             try:
                 for attempt in range(max_retries + 1):
                     if self._upload_cancel.is_set():
@@ -5434,6 +5531,8 @@ class App(_AppBase):
                             self._ftp_row_set(e, f"Reintento {a}/{m}…", e.ftp_progress, 0))
                         _time.sleep(wait)
             finally:
+                with _active_lock:
+                    _active_uploads[0] -= 1
                 conn_q.put(ftp_conn)
 
         from concurrent.futures import wait as _fut_wait, FIRST_COMPLETED as _FIRST
@@ -5832,7 +5931,6 @@ class App(_AppBase):
             row=1, column=0, columnspan=2, pady=(0, 10))
         self._amule_entries = {}
         for i, (label, key, secret) in enumerate([
-            ("amulecmd (ruta):", "amulecmd_path", False),
             ("Host:",            "amule_host",    False),
             ("Puerto:",          "amule_port",    False),
             ("Contraseña:",      "amule_password", True),
@@ -7561,12 +7659,13 @@ class App(_AppBase):
                        sortable=True),
             ColumnSpec("trending", "Tendencia", width=70, sortable=True),
             ColumnSpec("ignore", "", width=90),
+            ColumnSpec("auto", "", width=36),
             ColumnSpec("rescan", "", width=36),
             ColumnSpec("delete", "", width=36),
         ], header_right_pad=30)   # ver TableView.__init__ -- medido a mano contra esta tabla en concreto
         self._missing_ep_table.on_header_click = self._on_missing_ep_header_click
-        self._missing_ep_sort_key = "name"   # arranca igual que el comportamiento previo (alfabético)
-        self._missing_ep_sort_asc = True
+        self._missing_ep_sort_key, self._missing_ep_sort_asc = self._saved_table_sort(
+            "episodios", "name", True)   # arranca igual que el comportamiento previo (alfabético)
         self._missing_ep_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
         self._missing_ep_table.set_sort_indicator(self._missing_ep_sort_key, self._missing_ep_sort_asc)
         self._missing_ep_table.on_column_resize = self._on_missing_ep_column_resize
@@ -7617,6 +7716,9 @@ class App(_AppBase):
         self._missing_ep_cancel_event = None
         self._missing_ep_scanning = False
         self._missing_ep_row_widgets = {}
+        self._missing_ep_auto_widgets = {}   # tmdb_id -> botón "⚡" de autocompletado (ver _build_missing_ep_row)
+        self._missing_ep_auto_worker = None
+        self._missing_ep_auto_busy = set()   # tmdb_ids en proceso (anti-duplicado, ver _auto_complete_series_single)
         self._missing_ep_page = 0
         self._missing_ep_selected_tmdb_id = None   # serie pulsada, ver _show_missing_ep_poster
         self._missing_ep_expanded = set()   # tmdb_ids con la fila desplegada
@@ -8364,6 +8466,7 @@ class App(_AppBase):
         self._missing_ep_sort_key, self._missing_ep_sort_asc = self._next_sort_state(
             self._missing_ep_sort_key, self._missing_ep_sort_asc, key)
         self._missing_ep_table.set_sort_indicator(self._missing_ep_sort_key, self._missing_ep_sort_asc)
+        self._save_table_sort("episodios", self._missing_ep_sort_key, self._missing_ep_sort_asc)
         self._render_missing_episodes_table(reset_page=False)
 
     def _missing_ep_render_page(self, scroll_top: bool = True):
@@ -8452,7 +8555,11 @@ class App(_AppBase):
             if token != self._missing_ep_render_token:
                 return   # una llamada más reciente ya se está pintando
             for r in page_rows[start:start + _BATCH]:
-                self._build_missing_ep_row(r)
+                try:
+                    self._build_missing_ep_row(r)
+                except Exception:
+                    _log.exception("Episodios que faltan: no se pudo construir "
+                                   "la fila de '%s' (tmdb_id=%s)", r.get("name"), r.get("tmdb_id"))
             if start + _BATCH < len(page_rows):
                 self.after(1, lambda: _render_batch(start + _BATCH))
             else:
@@ -8720,11 +8827,33 @@ class App(_AppBase):
         attach_tooltip(trending_lbl, lambda row=r: explain_trending_score(
             row.get("play_count", 0), row.get("last_played_ts"), _time.time()))
 
-        btn_text = "Restaurar" if r.get("ignored") else "Ignorar"
+        is_ignored = r.get("ignored")
         c = _cell("ignore")
-        ctk.CTkButton(c, text=btn_text, fg_color="transparent", border_width=1,
-                      command=lambda tid=tmdb_id, ig=not r.get("ignored"):
-                      self._toggle_missing_ep_ignore(tid, ig)).pack(fill="both", expand=True)
+        ignore_series_btn = ctk.CTkButton(c, text="🚫" if not is_ignored else "↺",
+                      fg_color=ICON_IGNORE if not is_ignored else ICON_RESTORE,
+                      command=lambda tid=tmdb_id, ig=not is_ignored:
+                      self._toggle_missing_ep_ignore(tid, ig))
+        attach_tooltip(ignore_series_btn, lambda:
+                       "Ignorar toda la serie (no contará como faltante)" if not is_ignored
+                       else "Restaurar serie (volver a contarla como faltante)")
+        ignore_series_btn.pack(fill="both", expand=True)
+
+        auto_active = self._is_missing_ep_auto_enabled(tmdb_id)
+        c = _cell("auto")
+        auto_btn = ctk.CTkButton(
+            c, text="⚡", height=24,
+            fg_color=ICON_AUTO_ON if auto_active else "transparent",
+            border_width=1,
+            command=lambda tid=tmdb_id: self._toggle_missing_ep_auto_complete(tid))
+        attach_tooltip(auto_btn, lambda tid=tmdb_id: (
+            "Autocompletar ACTIVO: la app busca y descarga sola los capítulos que "
+            "faltan de esta serie, también los nuevos que vayan saliendo. Pulsa para "
+            "desactivar." if self._is_missing_ep_auto_enabled(tid)
+            else "Activar autocompletado: busca y descarga los capítulos que faltan de "
+                 "esta serie de forma autónoma y persistente (los nuevos que salgan "
+                 "también los añade)."))
+        auto_btn.pack(fill="both", expand=True)
+        self._missing_ep_auto_widgets[tmdb_id] = auto_btn
 
         c = _cell("rescan")
         rescan_btn = ctk.CTkButton(c, text="🔄", height=24,
@@ -8948,28 +9077,37 @@ class App(_AppBase):
             toggle_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, s=season:
                             self._toggle_missing_ep_season_expand(tid, s))
             season_ignored = season in (r.get("ignored_seasons") or set())
-            ctk.CTkButton(
-                header_fr, text="Restaurar" if season_ignored else "Ignorar",
-                width=110, height=22, fg_color="transparent", border_width=1,
+            season_ign_btn = ctk.CTkButton(
+                header_fr, text="🚫" if not season_ignored else "↺",
+                width=28, height=22,
+                fg_color=ICON_IGNORE if not season_ignored else ICON_RESTORE,
                 command=lambda tid=tmdb_id, s=season, ig=not season_ignored:
-                self._toggle_missing_ep_season_ignore(tid, s, ig)).pack(side="left", padx=(6, 0))
+                self._toggle_missing_ep_season_ignore(tid, s, ig))
+            attach_tooltip(season_ign_btn, lambda:
+                           "Ignorar toda la temporada (no contará como faltante)" if not season_ignored
+                           else "Restaurar temporada (volver a contarla como faltante)")
+            season_ign_btn.pack(side="left", padx=(6, 0))
             season_search_query = f"{r['name']} {season}x"
-            ctk.CTkButton(header_fr, text="🔍 aMule", width=70, height=22,
-                          fg_color="transparent", border_width=1,
+            season_amule_btn = ctk.CTkButton(header_fr, text="🔍", width=28, height=22,
+                          fg_color=ICON_AMULE, hover_color="#693a99",
                           command=lambda sq=season_search_query, sn=r['name']:
-                          self._search_missing_ep_on_amule(sq, sn)).pack(
-                side="left", padx=(4, 0))
+                          self._search_missing_ep_on_amule(sq, sn))
+            attach_tooltip(season_amule_btn, lambda: "Buscar esta temporada en aMule (abre la pestaña Descargas)")
+            season_amule_btn.pack(side="left", padx=(4, 0))
             season_vars = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season}
             for link in season_links:
                 template = link.get("url_template", "")
                 if not template:
                     continue
                 short_label = (link.get("name", "").split() or ["🔗"])[-1]
-                ctk.CTkButton(header_fr, text=short_label, width=70, height=22,
-                              fg_color="transparent", border_width=1,
+                link_name = link.get("name", short_label)
+                season_link_btn = ctk.CTkButton(header_fr, text=short_label[:1], width=28, height=22,
+                              fg_color=ICON_LINKS, hover_color="#6a7779",
                               command=lambda t=template, v=season_vars, bg=link.get("background", False):
                               self._resolve_missing_ep_ruta_and_open(t, v, r, bg)
-                              ).pack(side="left", padx=(6, 0))
+                              )
+                attach_tooltip(season_link_btn, lambda n=link_name: f"Enlace personalizado: {n}")
+                season_link_btn.pack(side="left", padx=(6, 0))
             next_row += 1
 
             episodes_fr = ctk.CTkFrame(detail_fr, fg_color="transparent")
@@ -9020,23 +9158,61 @@ class App(_AppBase):
                          text_color=PENDING_COLOR, anchor="w", width=80).grid(
                 row=ep_row, column=1, sticky="w", padx=(8, 0), pady=1)
             btn_col = 2
-            ctk.CTkButton(episodes_fr, text="📋", width=28, height=22, fg_color="transparent",
-                          border_width=1, command=lambda n=name: self._copy_to_clipboard(n)).grid(
-                row=ep_row, column=btn_col, padx=(6, 0), pady=1)
+            # Botones de icono con color (ver constantes ICON_*): mismo
+            # tamaño (28px) para todos y solo icono, sin texto -- cada
+            # acción se reconoce por su color.
+            copy_btn = ctk.CTkButton(episodes_fr, text="📋", width=28, height=22,
+                          fg_color=ICON_COPY, hover_color="#35508F",
+                          command=lambda n=name: self._copy_to_clipboard(n))
+            attach_tooltip(copy_btn, lambda: "Copiar nombre del episodio al portapapeles")
+            copy_btn.grid(row=ep_row, column=btn_col, padx=(6, 0), pady=1)
+            btn_col += 1
+            # Auto-descarga: busca en aMule, elige el mejor candidato
+            # (core/download_quality.best_result) y lo lanza en segundo
+            # plano sin abrir la pestaña Descargas. El botón cambia de color
+            # según avanza el ciclo (reposo→ocupado→ok/error), ver
+            # _auto_download_episode_on_amule.
+            # Búsqueda de aMule SIN el título del episodio: incluir el título
+            # (con sus subtítulos, barras, etc.) recorta muchísimo los
+            # resultados -- "Star Wars: ... 1x09 La princesa y los jedi /
+            # Kai tiene un mal día" devuelve 0 resultados mientras que
+            # "Star Wars: ... 1x09" devuelve varios. best_result igualmente
+            # exige temporada×episodio (ver core/download_quality.py), así
+            # que el título sobra para acertar el capítulo.
+            ep_amule_query = f"{r['name']} {season}x{ep:02d}"
+            dl_btn = ctk.CTkButton(episodes_fr, text="⬇", width=28, height=22,
+                                   fg_color=ICON_DL_IDLE, hover_color=ICON_DL_BUSY)
+            dl_btn.configure(command=lambda sq=ep_amule_query, b=dl_btn:
+                             self._auto_download_episode_on_amule(sq, b))
+            attach_tooltip(dl_btn, lambda: (
+                "Buscar en aMule y descargar automáticamente el mejor candidato "
+                "para este episodio (en segundo plano, sin abrir la pestaña Descargas).\n"
+                "Color: azul=reposo, ámbar=en curso, verde=lanzado, rojo=sin candidato/error"))
+            dl_btn.grid(row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             btn_col += 1
             ep_ignored = ep in (r.get("ignored_episodes") or {}).get(season, set())
-            ctk.CTkButton(
-                episodes_fr, text="Restaurar" if ep_ignored else "Ignorar", width=70, height=22,
-                fg_color="transparent", border_width=1,
+            ignore_btn = ctk.CTkButton(
+                episodes_fr, text="🚫" if not ep_ignored else "↺", width=28, height=22,
+                fg_color=ICON_IGNORE if not ep_ignored else ICON_RESTORE,
                 command=lambda tid=tmdb_id, s=season, e=ep, ig=not ep_ignored:
-                self._toggle_missing_ep_episode_ignore(tid, s, e, ig)).grid(
-                row=ep_row, column=btn_col, padx=(4, 0), pady=1)
+                self._toggle_missing_ep_episode_ignore(tid, s, e, ig))
+            attach_tooltip(ignore_btn, lambda:
+                           "Ignorar este episodio (no contará como faltante)" if not ep_ignored
+                           else "Restaurar episodio (volver a contarlo como faltante)")
+            ignore_btn.grid(row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             btn_col += 1
-            ctk.CTkButton(episodes_fr, text="🔍 aMule", width=70, height=22,
-                          fg_color="transparent", border_width=1,
-                          command=lambda n=name, sn=r["name"]:
-                          self._search_missing_ep_on_amule(n, sn)).grid(
-                row=ep_row, column=btn_col, padx=(4, 0), pady=1)
+            # La búsqueda de aMule va SIN el título del episodio (mismo
+            # criterio que el botón ⬇ y el autocompletado, ver arriba): los
+            # títulos reales con subtítulos/barras recortan los resultados y
+            # los rellenos de TMDB tipo "Episodio 1" solo ensucian, así que
+            # se busca "The Ark 3x01" a secas -- best_result ya exige
+            # temporada×episodio.
+            amule_btn = ctk.CTkButton(episodes_fr, text="🔍", width=28, height=22,
+                          fg_color=ICON_AMULE, hover_color="#693a99",
+                          command=lambda sq=ep_amule_query, sn=r["name"]:
+                          self._search_missing_ep_on_amule(sq, sn))
+            attach_tooltip(amule_btn, lambda: "Buscar este episodio en aMule (abre la pestaña Descargas)")
+            amule_btn.grid(row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             variables = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season,
                         "episodio": ep, "titulo": title, "nombre_archivo": name}
             for link in episode_links:
@@ -9045,11 +9221,13 @@ class App(_AppBase):
                     continue
                 btn_col += 1
                 short_label = (link.get("name", "").split() or ["🔗"])[-1]
-                ctk.CTkButton(episodes_fr, text=short_label, width=70, height=22,
-                              fg_color="transparent", border_width=1,
+                link_name = link.get("name", short_label)
+                link_btn = ctk.CTkButton(episodes_fr, text=short_label[:1], width=28, height=22,
+                              fg_color=ICON_LINKS, hover_color="#6a7779",
                               command=lambda t=template, v=variables, bg=link.get("background", False):
-                              self._resolve_missing_ep_ruta_and_open(t, v, r, bg)).grid(
-                    row=ep_row, column=btn_col, padx=(4, 0), pady=1)
+                              self._resolve_missing_ep_ruta_and_open(t, v, r, bg))
+                attach_tooltip(link_btn, lambda n=link_name: f"Enlace personalizado: {n}")
+                link_btn.grid(row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             ep_row += 1
 
     def _toggle_missing_ep_season_expand(self, tmdb_id, season):
@@ -9080,19 +9258,16 @@ class App(_AppBase):
         self._set_status(f"Copiado: {text}", SUCCESS_COLOR)
 
     def _search_missing_ep_on_amule(self, filename: str, series_name: str):
-        amule = AmuleClient(
+        ec = EcClient(
             host=self.config_data.get("amule_host", "localhost"),
             port=self.config_data.get("amule_port", 4712),
             password=self.config_data.get("amule_password", ""),
-            amulecmd_path=self.config_data.get("amulecmd_path", "amulecmd"),
+            timeout=10.0,
         )
-        if not amule.is_available:
-            messagebox.showwarning("aMule no disponible",
-                "No se encontró 'amulecmd' en el sistema.\n\n"
-                "Instálalo con: sudo apt install amule-utils  (Linux/macOS)\n"
-                "o asegúrate de que esté en el PATH.", parent=self)
-            return
-        ok, msg = amule.test_connection()
+        try:
+            ok, msg = ec.test_connection()
+        except Exception:
+            ok, msg = False, "no se pudo contactar con aMule"
         if not ok:
             messagebox.showerror("Error de conexión",
                 f"No se pudo conectar con aMule:\n{msg}\n\n"
@@ -9107,7 +9282,315 @@ class App(_AppBase):
         self._downloads_search_var.set(filename)
         self._downloads_do_search()
 
-    # ---- Métodos de la pestaña Descargas ----
+    def _auto_download_episode_on_amule(self, query: str, button):
+        """Botón "⬇" de una fila de episodio: busca en aMule, elige el mejor
+        candidato (core/download_quality.best_result, el mismo criterio que
+        se usa para destacar la fila recomendada de la pestaña Descargas) y
+        lanza la descarga en segundo plano, SIN abrir la pestaña Descargas
+        ni mostrar resultados. El único feedback es el color del propio
+        botón: en reposo azul (ICON_DL_IDLE), ámbar mientras busca/descarga,
+        verde si la descarga se lanzó o rojo si no hubo candidato útil."""
+        def _worker():
+            ec = None
+            try:
+                self.after(0, lambda: button.configure(fg_color=ICON_DL_BUSY, state="disabled"))
+                ec = EcClient(
+                    host=self.config_data.get("amule_host", "localhost"),
+                    port=self.config_data.get("amule_port", 4712),
+                    password=self.config_data.get("amule_password", ""),
+                    timeout=10.0,
+                )
+                try:
+                    ec.connect()
+                except (EcConnectionError, EcAuthError, OSError):
+                    self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
+                    return
+                st = self.config_data.get("amule_search_type", "Kad")
+                best = None
+                # Se lee en vivo: aMule va llenando la lista; sondeo modesto
+                # (2s) y se termina en cuanto el mejor alcanza el umbral y no
+                # mejora en el siguiente sondeo, para que el botón vuelva a
+                # su color rápido (límite 30s por seguridad).
+                last = None
+                for results in ec.iter_search(
+                        query, search_type=st, poll_interval=2.0, max_duration=20.0):
+                    candidate = best_result(results, query) if results else None
+                    if candidate is not None:
+                        best = candidate
+                        if last is not None and best is last:
+                            break
+                        last = best
+                if best is None:
+                    self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
+                    return
+                ok, _ = ec.download(best)
+                self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_OK if ok else ICON_DL_FAIL))
+            except Exception:
+                self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
+            finally:
+                if ec is not None:
+                    try:
+                        ec.close()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _dl_btn_reset(self, button, color):
+        button.configure(fg_color=color, state="normal")
+
+    # ---- Autocompletado por serie (pestaña "Episodios que faltan") ----
+    #
+    # El botón "⚡" de cada fila activa que esa serie se complete sola: la
+    # app busca en aMule (mejor candidato, core/download_quality.best_result)
+    # y descarga los capítulos que le faltan, de forma persistente, para que
+    # los capítulos nuevos que vayan saliendo también se añadan solos.
+    #
+    # Es personal de CADA instalación: la lista de series activadas y el
+    # estado "ya revisado" por episodio viven en config.json (config keys
+    # missing_ep_auto_complete / missing_ep_auto_checked), NO viajan por FTP.
+    #
+    # Antes de descargar WESTHOUSE/FTP, por serie se comprueba primero que
+    # el capítulo no esté ya en el servidor (upload_history) ni en su carpeta
+    # real del FTP -- porque la lista de "faltantes" se genera contra el
+    # servidor de medios (Plex/Jellyfin), que puede estar desactualizado y
+    # no reflejar un capítulo que ya se subió. Ver _auto_check_episode_exists.
+
+    # Segundos entre pasadas del worker de autocompletado (30 min) y el
+    # retardo inicial tras arrancar la app.
+    _AUTO_COMPLETE_INTERVAL = 30 * 60
+    _AUTO_COMPLETE_STARTUP_DELAY = 45
+
+    def _auto_complete_series(self) -> set:
+        """Sets de tmdb_id (str) con el autocompletado activo."""
+        return set(self.config_data.get("missing_ep_auto_complete") or [])
+
+    def _is_missing_ep_auto_enabled(self, tmdb_id: int) -> bool:
+        return str(tmdb_id) in self._auto_complete_series()
+
+    def _auto_checked_map(self) -> dict:
+        """{tmdb_id_str: {season: [ep, ...]}} de episodios ya probados."""
+        return dict(self.config_data.get("missing_ep_auto_checked") or {})
+
+    def _set_auto_checked_episode(self, tmdb_id: int, season: int, episode: int):
+        checked = self._auto_checked_map()
+        entry = checked.setdefault(str(tmdb_id), {})
+        entry.setdefault(str(season), [])
+        if episode not in entry[str(season)]:
+            entry[str(season)].append(episode)
+            self.config_data.set("missing_ep_auto_checked", checked)
+
+    def _toggle_missing_ep_auto_complete(self, tmdb_id: int):
+        """Interruptor del botón "⚡" de una fila: activa/desactiva el
+        autocompletado de esa serie y persiste (config personal)."""
+        key = str(tmdb_id)
+        series = self._auto_complete_series()
+        if key in series:
+            series.discard(key)
+            new_state = False
+        else:
+            series.add(key)
+            new_state = True
+        self.config_data.set("missing_ep_auto_complete", sorted(series))
+        self.config_data.save()
+        self._refresh_missing_ep_auto_button(tmdb_id, new_state)
+        name = ""
+        row = self._missing_ep_results and next(
+            (r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
+        if row:
+            name = row.get("name", "")
+            
+        self._set_status(
+            f"Autocompletado {'activado' if new_state else 'desactivado'} para "
+            f"{name or 'la serie'}",
+            SUCCESS_COLOR if new_state else PENDING_COLOR)
+        if new_state:
+            threading.Thread(target=self._auto_complete_pass, daemon=True).start()
+
+    def _refresh_missing_ep_auto_button(self, tmdb_id: int, active: bool):
+        btn = self._missing_ep_auto_widgets.get(tmdb_id)
+        if btn is not None:
+            btn.configure(fg_color=ICON_AUTO_ON if active else "transparent")
+
+    def _start_missing_ep_auto_worker(self):
+        """Hilo daemon que recorre las series con autocompletado: arranca al
+        abrir la app (tras un pequeño retardo) y luego cada 30 min, buscando
+        y descargando capítulos nuevos que hayan salido."""
+        def _loop():
+            _time.sleep(self._AUTO_COMPLETE_STARTUP_DELAY)
+            while True:
+                try:
+                    self._auto_complete_pass()
+                except Exception:
+                    _log.exception("Autocompletado: fallo en la pasada programada")
+                _time.sleep(self._AUTO_COMPLETE_INTERVAL)
+        if self._missing_ep_auto_worker is None or not self._missing_ep_auto_worker.is_alive():
+            self._missing_ep_auto_worker = threading.Thread(target=_loop, daemon=True)
+            self._missing_ep_auto_worker.start()
+
+    def _auto_complete_pass(self):
+        """Una pasada de autocompletado: para cada serie activa, revisa los
+        capítulos que faltan la mar casilla y descarga los nuevos."""
+        series = sorted(self._auto_complete_series(), key=int)
+        if not series:
+            return
+        _log.info("Autocompletado: pasada sobre %d serie(s)", len(series))
+        for tmdb_id_str in series:
+            try:
+                self._auto_complete_series_single(int(tmdb_id_str))
+            except Exception:
+                _log.exception("Autocompletado: fallo en serie %s", tmdb_id_str)
+
+    def _auto_complete_series_single(self, tmdb_id: int):
+        """Descarga los capítulos pendientes de UNA serie con autocompletado.
+        Primero obtiene la lista fresca de faltantes (rescan de esa serie
+        sola, que ya cruza contra el FTP y quita lo que ya está en el
+        servidor), después, para cada capítulo que falte y no esté ya
+        probado ni ya en el servidor (upload_history), busca en aMule y lo
+        descarga. Ver _AUTO_* y el comentario del bloque de arriba."""
+        # Guardia anti-duplicados: tanto el hilo programado (cada 30 min)
+        # como el arranque inmediato al pulsar el botón "⚡" pueden llamar a
+        # esto a la vez para la misma serie; si ya se está procesando, esta
+        # llamada se descarta (la otra pasada ya revisará este capítulo).
+        busy = getattr(self, "_missing_ep_auto_busy", None)
+        if busy is None:
+            busy = self._missing_ep_auto_busy = set()
+        if tmdb_id in busy:
+            return
+        busy.add(tmdb_id)
+        try:
+            self._auto_complete_series_single_impl(tmdb_id)
+        finally:
+            busy.discard(tmdb_id)
+
+    def _auto_complete_series_single_impl(self, tmdb_id: int):
+        # Fila actual si ya está cachada; sin ella no se puede reescanear
+        # esa serie sola (se necesita source/server_id).
+        row = next((r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
+        if row is None:
+            from core.missing_episodes_cache import load_cache
+            cached = dict(load_cache()).get(str(tmdb_id))
+            if not cached:
+                _log.info("Autocompletado: serie %s sin fila ni caché, se omite", tmdb_id)
+                return
+            row = {
+                "tmdb_id": tmdb_id,
+                "name": cached.get("name", ""),
+                "source": cached.get("source"),
+                "server_id": cached.get("server_id"),
+                "folder_name": cached.get("folder_name"),
+                "ignored": cached.get("ignored", False),
+                "ignored_seasons": set(cached.get("ignored_seasons") or []),
+                "ignored_episodes": {s: set(eps) for s, eps in (cached.get("ignored_episodes") or {}).items()},
+                "episode_titles": {},
+                "play_count": cached.get("play_count", 0),
+                "last_played_ts": cached.get("last_played_ts"),
+                "ai_verdict": cached.get("ai_verdict"),
+            }
+        if not row.get("source") or not row.get("server_id"):
+            return   # sin cómo reencender -- se deja para el reescaneo completo
+
+        # Lista fresca de faltantes YA cruzada contra el FTP (los que ya
+        # están en el servidor salen de "missing" -- ver _rescan_single_series_worker).
+        try:
+            fresh_results, _removed = self._rescan_single_series_worker(row)
+        except Exception:
+            _log.exception("Autocompletado: reescaneo de '%s' (tmdb_id=%s) falló", row["name"], tmdb_id)
+            return
+        if not fresh_results:
+            _log.info("Autocompletado: '%s' ya no tiene huecos", row["name"])
+            return
+        fresh = fresh_results[0]
+
+        checked = (self._auto_checked_map().get(str(tmdb_id)) or {})
+        checked_seasons = {int(s): set(eps) for s, eps in checked.items()}
+
+        # Header de capítulos faltantes que de verdad hay que intentar.
+        pending = []
+        for season in sorted(fresh.get("missing", {})):
+            for ep in fresh["missing"][season]:
+                if ep in checked_seasons.get(season, set()):
+                    continue   # ya probado (descargado o sin candidato) en una pasada anterior
+                pending.append((season, ep))
+
+        # Guardia rápida local: que no esté ya en upload_history (aunque el
+        # reescaneo lo hubiera quitado de missing, por si el servidor de
+        # medios va desactualizado con respecto al FTP).
+        history_remote_paths = {h.get("remote", "") for h in self._load_history()
+                                if h.get("status") == "ok"}
+        series_name = fresh.get("name", row["name"])
+        to_download = []
+        for season, episode in pending:
+            if self._auto_episode_in_history(history_remote_paths, series_name, season, episode):
+                self._set_auto_checked_episode(tmdb_id, season, episode)
+                continue
+            to_download.append((season, episode))
+
+        if not to_download:
+            return
+
+        _log.info("Autocompletado: '%s' -> %d capítulo(s) nuevos por descargar",
+                  series_name, len(to_download))
+        for season, episode in to_download:
+            # Igual que el botón manual: se busca SIN el título del episodio
+            # (incluirlo recorta los resultados de aMule -- ver
+            # _build_missing_ep_season_episode_rows). best_result ya exige
+            # temporada×episodio, el título no hace falta.
+            query = f"{series_name} {season}x{episode:02d}"
+            ok, why = self._auto_amule_download_series(query)
+            self._set_auto_checked_episode(tmdb_id, season, episode)
+            if ok:
+                _log.info("Autocompletado: descarga lanzada para '%s'", query)
+            else:
+                _log.info("Autocompletado: '%s' no se pudo descargar (%s)", query, why)
+
+    def _auto_episode_in_history(self, history_remote_paths: set, series_name: str,
+                                 season: int, episode: int) -> bool:
+        """True si *upload_history* ya registra subido este capítulo (serie,
+        temporada × ep) en alguna ruta remota -- advertencia local barata
+        para no lanzar una descarga de algo que ya está en el servidor."""
+        for remote in history_remote_paths:
+            det = detect_episode(remote)
+            if (det.get("season") == season and det.get("episode") == episode):
+                if series_name and series_name.lower() in (remote or "").lower():
+                    return True
+        return False
+
+    def _auto_amule_download_series(self, query: str):
+        """Busca *query* en aMule y descarga el mejor candidato (mismo
+        criterio best_result que el botón manual). Devuelve (ok, motivo). No
+        toca la sesión/pestaña Descargas (crea la suya y la cierra)."""
+        ec = EcClient(
+            host=self.config_data.get("amule_host", "localhost"),
+            port=self.config_data.get("amule_port", 4712),
+            password=self.config_data.get("amule_password", ""),
+            timeout=10.0,
+        )
+        try:
+            try:
+                ec.connect()
+            except (EcConnectionError, EcAuthError, OSError):
+                return False, "aMule no disponible"
+            st = self.config_data.get("amule_search_type", "Kad")
+            best = None
+            last = None
+            for results in ec.iter_search(
+                    query, search_type=st, poll_interval=2.0, max_duration=20.0):
+                candidate = best_result(results, query) if results else None
+                if candidate is not None:
+                    best = candidate
+                    if last is not None and best is last:
+                        break
+                    last = best
+            if best is None:
+                return False, "sin candidato que cumpla el umbral"
+            ok, _raw = ec.download(best)
+            return (True, "") if ok else (False, "aMule rechazó la descarga")
+        finally:
+            try:
+                ec.close()
+            except Exception:
+                pass
 
     def _build_downloads_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -9160,15 +9643,27 @@ class App(_AppBase):
         # clic derecho (on_visibility_changed).
         sw0 = self._saved_col_widths("descargar")   # anchos guardados de una sesión anterior, si hay
         self._downloads_table = TableView(table_fr, columns=[
-            ColumnSpec("name", "Nombre de archivo", width=sw0.get("name", 300), min_width=80,
-                       expand=True, resizable=True, sortable=True),
+            # Nombre de ancho FIJO (antes expand=True): al ser expand, la
+            # columna absorbía TODO el espacio sobrante (~770px en una
+            # ventana de 1200) y los nombres de aMule (300-500px de media)
+            # quedaban perdidos en medio de un hueco enorme -- el usuario
+            # pidió explícitamente un ancho fijo, con los nombres que no
+            # caben truncados con "…" al borde, como el resto de tablas.
+            # Es arrastrable (separador) y el ancho elegido se guarda.
+            ColumnSpec("name", "Nombre de archivo", width=sw0.get("name", 500), min_width=80,
+                       resizable=True, sortable=True),
             ColumnSpec("size", "Tamaño", width=sw0.get("size", 100), min_width=60,
                        resizable=True, sortable=True),
             ColumnSpec("sources", "Fuentes", width=sw0.get("sources", 70), min_width=50,
                        resizable=True, sortable=True),
             ColumnSpec("tipo", "Tipo", width=sw0.get("tipo", 80), min_width=60,
                        resizable=True, sortable=True),
-            ColumnSpec("accion", "", width=98, hideable=False),
+            # accion es expand=True (la única): absorbe el espacio que no
+            # usan las demás columnas, y el botón se empaqueta a la DERECHA
+            # de su celda (ver _downloads_rebuild_page) para quedar pegado
+            # al borde de la tabla, igual que los botones de acción de
+            # Archivos. No es ocultable ni arrastrable (hideable=False).
+            ColumnSpec("accion", "", width=98, expand=True, hideable=False),
         ], header_right_pad=24,   # ver TableView.__init__ -- la barra de scroll del body
         # roba 22px (border_spacing 6 + scrollbar 16) que la cabecera no
         # tiene, +2 por el padx=2 de las filas; medido contra esta tabla en
@@ -9183,8 +9678,18 @@ class App(_AppBase):
         self._downloads_table.set_hidden(self._saved_hidden_columns("descargar"), notify=False)
         self._downloads_table.on_widths_changed = lambda w: self._save_table_col_widths("descargar", w)
         self._downloads_table.on_header_click = self._on_downloads_header_click
-        self._downloads_sort_key = None   # ver _on_downloads_header_click -- sin ordenar hasta pulsar una cabecera
-        self._downloads_sort_asc = True
+        # Al cambiar el ancho del canvas, reajustar las columnas para que la
+        # suma quepa (mismo mecanismo que Archivos, ver _on_table_resize).
+        # Ahora que ninguna columna de datos es expand (name es fijo), si el
+        # usuario ensancha columnas con los separadores, la columna de acción
+        # (expand=True) es la única que absorbe el excedente -- sin este
+        # ajuste, el botón "Descargar" podría quedar fuera de la vista.
+        self._downloads_table_body._parent_canvas.bind(
+            "<Configure>", self._on_downloads_table_resize, add="+")
+        self._downloads_sort_key, self._downloads_sort_asc = self._saved_table_sort(
+            "descargar", None, True)   # ver _on_downloads_header_click -- sin ordenar hasta pulsar la cabecera
+        self._downloads_table.set_sort_indicator(
+            self._downloads_sort_key, self._downloads_sort_asc)
 
         pag = ctk.CTkFrame(parent, fg_color="transparent")
         pag.grid(row=3, column=0, sticky="ew", pady=(6, 0))
@@ -9199,9 +9704,19 @@ class App(_AppBase):
 
         self._downloads_results = []
         self._downloads_page = 0
-        self._downloads_per_page = 25
+        # Como las demás tablas: el número de resultados POR PÁGINA se
+        # ajusta solo al alto real de la tabla (redimensionar la ventana),
+        # en vez de fijarse en un número arbitrario que hacía aparecer la
+        # barra de scroll del CTkScrollableFrame cuando había muchos
+        # resultados. Al cambiar el tamaño, se repinta la página actual.
+        self._downloads_table.enable_dynamic_page_size(lambda _size: self._downloads_rebuild_page())
         self._downloads_session = None
         self._downloads_amule = None
+        # Token de búsqueda en curso: cada búsqueda nueva lo incrementa y
+        # el hilo de la anterior lo compara para pararse solo (ver
+        # _downloads_perform_search) -- sin esto, lanzar una búsqueda
+        # mientras otra sigue sondeando seguía actualizando la lista vieja.
+        self._downloads_search_token = 0
 
     def _downloads_close_session(self):
         if self._downloads_session:
@@ -9216,19 +9731,18 @@ class App(_AppBase):
         if self._downloads_session and self._downloads_session.is_alive():
             return True
         self._downloads_close_session()
-        amule = AmuleClient(
+        ec = EcClient(
             host=self.config_data.get("amule_host", "localhost"),
             port=self.config_data.get("amule_port", 4712),
             password=self.config_data.get("amule_password", ""),
-            amulecmd_path=self.config_data.get("amulecmd_path", "amulecmd"),
+            timeout=10.0,
         )
-        if not amule.is_available:
+        try:
+            ec.connect()
+        except (EcConnectionError, EcAuthError, OSError):
             return False
-        sess = amule.create_session()
-        if sess is None or not sess.is_alive():
-            return False
-        self._downloads_amule = amule
-        self._downloads_session = sess
+        self._downloads_amule = ec
+        self._downloads_session = ec
         return True
 
     def _on_downloads_red_changed(self, value: str):
@@ -9251,10 +9765,13 @@ class App(_AppBase):
             return
         st = self._downloads_search_type_var.get()
         self._on_downloads_red_changed(st)
+        self._downloads_search_token += 1
+        token = self._downloads_search_token
         self._downloads_status_lbl.configure(
-            text=f'Buscando "{query}" en {st}... (espera ~10 segundos)', text_color=PENDING_COLOR)
+            text=f'Buscando "{query}" en {st}... (los resultados se actualizan solos, hasta 1 minuto)',
+            text_color=PENDING_COLOR)
         self._downloads_status_lbl.update()
-        threading.Thread(target=self._downloads_perform_search, args=(query,), daemon=True).start()
+        threading.Thread(target=self._downloads_perform_search, args=(query, token), daemon=True).start()
 
     _downloads_type_map = {
         "Cualquiera": "",
@@ -9278,49 +9795,107 @@ class App(_AppBase):
         "ISO": "Iso",
     }
 
-    def _downloads_perform_search(self, query: str):
+    def _downloads_perform_search(self, query: str, token: int):
         st = self._downloads_search_type_var.get()
         if not self._downloads_ensure_session():
-            self.after(0, lambda: self._downloads_status_lbl.configure(
-                text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
-            self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
-            self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
+            if token == self._downloads_search_token:
+                self.after(0, lambda: self._downloads_status_lbl.configure(
+                    text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
+                self.after(0, self._downloads_enable_search_controls)
             return
         ft_label = self._downloads_file_type_var.get()
         ft = self._downloads_type_map.get(ft_label, "")
         try:
-            results = self._downloads_amule.search_in_session(
-                self._downloads_session, query, search_type=st, wait_seconds=10, file_type=ft)
+            # Sin espera fija: se sondea EC SEARCH_RESULTS cada pocos
+            # segundos y se va mostrando la lista acumulada en vivo (ver
+            # EcClient.iter_search). Si el usuario lanza otra búsqueda,
+            # este hilo se para solo en el siguiente sondeo.
+            for results in self._downloads_amule.iter_search(
+                    query, search_type=st, file_type=ft):
+                if token != self._downloads_search_token:
+                    return
+                self.after(0, lambda r=results: self._downloads_display_results(r, live=True))
         except Exception as e:
-            self.after(0, lambda: self._downloads_status_lbl.configure(
-                text=f"Error: {e}", text_color=ERROR_COLOR))
-            self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
-            self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
-            return
-        self.after(0, lambda: self._downloads_display_results(results))
-        self.after(0, lambda: self._downloads_type_menu.configure(state="normal"))
-        self.after(0, lambda: self._downloads_file_type_menu.configure(state="normal"))
+            if token == self._downloads_search_token:
+                self.after(0, lambda: self._downloads_status_lbl.configure(
+                    text=f"Error: {e}", text_color=ERROR_COLOR))
+        if token == self._downloads_search_token:
+            self.after(0, self._downloads_finish_search)
+
+    def _downloads_enable_search_controls(self):
+        self._downloads_type_menu.configure(state="normal")
+        self._downloads_file_type_menu.configure(state="normal")
+
+    def _downloads_finish_search(self):
+        self._downloads_enable_search_controls()
+        n = len(self._downloads_results)
+        if n:
+            self._downloads_status_lbl.configure(
+                text=f"Búsqueda terminada: {n} resultado(s)", text_color=SUCCESS_COLOR)
+        else:
+            self._downloads_status_lbl.configure(
+                text="Búsqueda terminada sin resultados.", text_color=PENDING_COLOR)
 
     @staticmethod
     def _downloads_truncate(text: str, max_len: int = 100) -> str:
         return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
-    def _downloads_display_results(self, results: list):
-        self._downloads_results = results
-        self._downloads_page = 0
-        # Una búsqueda nueva trae resultados en su orden natural (por
-        # número/antigüedad): se limpia el orden manual elegido antes.
-        self._downloads_sort_key = None
-        self._downloads_sort_asc = True
-        self._downloads_table.set_sort_indicator(None, True)
-        if not results:
-            self._downloads_status_lbl.configure(
-                text="Sin resultados. (intenta cambiar el tipo de búsqueda)", text_color=PENDING_COLOR)
-            self._downloads_rebuild_page()
+    def _downloads_display_results(self, results: list, live: bool = False):
+        """live=True viene de una búsqueda que aún sigue sondeando
+        (iter_search_in_session): se pinta la lista acumulada sin tocar el
+        estado de la búsqueda (el orden manual elegido, la página y el
+        texto "Buscando..." se mantienen; el texto final lo pone
+        _downloads_finish_search). live=False es la llamada clásica de una
+        sola pasada."""
+        # NO machacar una lista poblada con un sondeo vacío a mitad de una
+        # búsqueda: aMule puede devolver momentáneamente "results" sin datos
+        # (el separador de la salida aún no ha salido, o el parse se queda
+        # sin filas) mientras la búsqueda sigue corriendo -- si pudiéramos
+        # sobrescribir, la tabla quedaría en blanco de repente en medio de
+        # una búsqueda con resultados ya mostrados, y no se recuperaría
+        # hasta la siguiente actualización (y a veces ni siquiera al
+        # terminar, porque el último sondeo puede llegar vacío). Se conserva
+        # la última lista con datos.
+        if live and not results and self._downloads_results:
+            _log.info("Descargas: sondeo en vivo sin datos, se conserva la lista de %d resultado(s) mostrada hasta ahora",
+                      len(self._downloads_results))
             return
-        self._downloads_status_lbl.configure(
-            text=f"{len(results)} resultado(s) encontrado(s)", text_color=SUCCESS_COLOR)
+        self._downloads_results = results
+        if not live:
+            self._downloads_page = 0
+            if not results:
+                self._downloads_status_lbl.configure(
+                    text="Sin resultados. (intenta cambiar el tipo de búsqueda)", text_color=PENDING_COLOR)
+            else:
+                self._downloads_status_lbl.configure(
+                    text=f"{len(results)} resultado(s) encontrado(s)", text_color=SUCCESS_COLOR)
+        # Se mantiene y se RE-APLICA el orden elegido (persistido o pulsado):
+        # una búsqueda nueva o un sondeo en vivo trae la lista en el orden
+        # natural de aMule, así que aquí se vuelve a ordenar con la columna
+        # guardada en vez de exigir volver a pulsar la cabecera.
+        self._downloads_apply_sort()
         self._downloads_rebuild_page()
+
+    def _downloads_apply_sort(self):
+        """Reaplica a self._downloads_results el orden de columna elegido
+        (_downloads_sort_key/_downloads_sort_asc), compartido por el clic de
+        cabecera (_on_downloads_header_click), la carga de una búsqueda nueva
+        y las actualizaciones en vivo (_downloads_display_results)."""
+        key = self._downloads_sort_key
+        if not key:
+            return
+        if key == "name":
+            self._downloads_results.sort(key=lambda r: r.name.lower(),
+                                         reverse=not self._downloads_sort_asc)
+        elif key == "size":
+            self._downloads_results.sort(key=lambda r: _parse_size_human(r.size_human),
+                                         reverse=not self._downloads_sort_asc)
+        elif key == "sources":
+            self._downloads_results.sort(key=lambda r: r.sources,
+                                         reverse=not self._downloads_sort_asc)
+        elif key == "tipo":
+            self._downloads_results.sort(key=lambda r: r.complete,
+                                         reverse=not self._downloads_sort_asc)
 
     def _downloads_clear_rows(self):
         for w in list(self._downloads_table_body.winfo_children()):
@@ -9335,7 +9910,7 @@ class App(_AppBase):
             self._downloads_next_btn.configure(state="disabled")
             return
         total = len(results)
-        pp = self._downloads_per_page
+        pp = self._downloads_table.page_size
         max_page = (total - 1) // pp
         page = self._downloads_page
         if page > max_page:
@@ -9344,44 +9919,64 @@ class App(_AppBase):
         start = page * pp
         end = min(start + pp, total)
         hidden = self._downloads_table.hidden_columns()
+        # El mejor candidato de TODA la búsqueda (no solo de esta página):
+        # se pinta así cuando le toca aparecer en esta página. El resto de
+        # filas queda del color normal para que el recomendado salte a la
+        # vista. Ver core/download_quality.py.
+        best_candidate = best_result(results, self._downloads_search_var.get())
+        rows_rendered = 0
         for res in results[start:end]:
-            row_fr = ctk.CTkFrame(self._downloads_table_body, fg_color=("gray95", "gray17"))
+            rows_rendered += 1
+            row_bg = DOWNLOAD_BEST_ROW_COLOR if res is best_candidate else ("gray95", "gray17")
+            row_fr = ctk.CTkFrame(self._downloads_table_body, fg_color=row_bg)
             row_fr.pack(fill="x", pady=2, padx=2)
             # Celdas con recorte (ver TableView.cell): el nombre de un
             # resultado de búsqueda puede ser larguísimo, y antes empujaba
             # a Tamaño/Fuentes/Tipo y dejaba el botón "Descargar" fuera de
             # la vista. El tooltip sigue mostrando el nombre completo.
-            # name es expand=True, así que su ancho no está fijado de
-            # antemano: _fit_text se aplica al ancho REAL de la celda
-            # (event.width) y se re-ajusta al redimensionar la ventana o
-            # arrastrar un separador -- el corte sale con "…" igual que en
-            # Archivos, nunca cortado a lo bruto por el recorte de la celda.
-            # Las columnas ocultas (menú contextual de la cabecera, ver
-            # TableView._show_column_menu) no se construyen ni se empaquetan.
-            def _refit(ev, lbl, raw):
-                if ev.width > 1:
-                    txt = _fit_text(raw, ev.width, self._downloads_font)
-                    if lbl.cget("text") != txt:
-                        lbl.configure(text=txt)
+            # name tiene ancho FIJO (ver _build_downloads_tab), así que
+            # _fit_text se aplica al ancho REAL de la celda (event.width) y
+            # se re-ajusta al redimensionar la ventana o arrastrar un
+            # separador -- el corte sale con "…" al borde de la columna,
+            # igual que en Archivos, nunca cortado a lo bruto por el
+            # recorte de la celda. Las columnas ocultas (menú contextual de
+            # la cabecera, ver TableView._show_column_menu) no se
+            # construyen ni se empaquetan.
+            # Recorte por el ancho REAL de la columna (ver el comentario de
+            # abajo en la celda "name") -- la tabla conoce el ancho, así que
+            # aquí se calcula con ese ancho directamente (col_width), no con
+            # el ancho que el evento <Configure> de la etiqueta reporte en
+            # ese momento (que puede estar desfasado y recortando el texto
+            # más corto de lo que la columna de verdad ofrece).
+            def _refit(raw, lbl, key):
+                available = self._downloads_table.col_width(key)
+                txt = _fit_text(raw, available, self._downloads_font)
+                if lbl.cget("text") != txt:
+                    lbl.configure(text=txt)
 
             if "name" not in hidden:
                 c = self._downloads_table.cell(row_fr, "name", pady=6)
-                lbl = ctk.CTkLabel(c, text=res.name, font=self._downloads_font, anchor="w")
+                # Se recorta desde el ancho de la COLUMNA (no con el de la
+                # etiqueta en el primer <Configure>, que a veces llega más
+                # estrecho y dejaba el nombre cortado sin alcanzar el hueco
+                # real) -- igual que hacen las demás tablas (ver _refresh_table
+                # en Archivos, que usa cw["name"]).
+                lbl = ctk.CTkLabel(c, text=_fit_text(res.name, self._downloads_table.col_width("name"),
+                                                     self._downloads_font),
+                                   font=self._downloads_font, anchor="w")
                 lbl.pack(fill="both", expand=True)
                 attach_tooltip(lbl, lambda n=res.name: n)
-                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=res.name: _refit(ev, lbl, raw))
+                lbl.bind("<Configure>", lambda ev, t=res.name, l=lbl: _refit(t, l, "name"))
 
             if "size" not in hidden:
                 c = self._downloads_table.cell(row_fr, "size", pady=6)
                 lbl = ctk.CTkLabel(c, text=res.size_human, font=self._downloads_font, anchor="w")
                 lbl.pack(fill="both", expand=True)
-                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=res.size_human: _refit(ev, lbl, raw))
 
             if "sources" not in hidden:
                 c = self._downloads_table.cell(row_fr, "sources", pady=6)
                 lbl = ctk.CTkLabel(c, text=str(res.sources), font=self._downloads_font, anchor="w")
                 lbl.pack(fill="both", expand=True)
-                lbl.bind("<Configure>", lambda ev, lbl=lbl, raw=str(res.sources): _refit(ev, lbl, raw))
 
             if "tipo" not in hidden:
                 tipo = "Completo" if res.complete else "Parcial"
@@ -9391,11 +9986,20 @@ class App(_AppBase):
                     fill="both", expand=True)
 
             # accion no es ocultable (ColumnSpec hideable=False) -- el botón
-            # de la última columna siempre está.
+            # de la última columna siempre está. La celda es expand=True (la
+            # única columna expand de esta tabla), así que absorbe el espacio
+            # sobrante y el botón se pega a la DERECHA, junto al borde.
             c = self._downloads_table.cell(row_fr, "accion", pady=6)
             ctk.CTkButton(c, text="Descargar", width=80, height=24,
                          command=lambda n=res.number: self._downloads_do_download(n)).pack(
-                side="left")
+                side="right", padx=(0, 4))
+        # Mide el alto medio por fila (igual que las demás tablas, ver
+        # note_rows_rendered) para que el tamaño de página se ajuste al alto
+        # real -- con el pady=6 de estas celdas el stride es mayor que el
+        # row_height de 24px que da la Tabla, así que sin medirlo el
+        # cálculo de "cuántas filas caben" saldría mal y volvería a salir
+        # scroll.
+        self._downloads_table.note_rows_rendered(rows_rendered)
         self._downloads_update_pagination()
 
     def _on_downloads_header_click(self, key: str):
@@ -9405,21 +10009,25 @@ class App(_AppBase):
         self._downloads_sort_key, self._downloads_sort_asc = self._next_sort_state(
             self._downloads_sort_key, self._downloads_sort_asc, key)
         self._downloads_table.set_sort_indicator(self._downloads_sort_key, self._downloads_sort_asc)
-
-        def _sort_key(res):
-            if key == "name":
-                return res.name.lower()
-            if key == "size":
-                return _parse_size_human(res.size_human)
-            if key == "sources":
-                return res.sources
-            if key == "tipo":
-                return res.complete
-            return 0
-
-        self._downloads_results.sort(key=_sort_key, reverse=not self._downloads_sort_asc)
+        self._save_table_sort("descargar", self._downloads_sort_key, self._downloads_sort_asc)
+        self._downloads_apply_sort()
         self._downloads_page = 0   # el orden nuevo se ve desde el principio
         self._downloads_rebuild_page()
+
+    def _on_downloads_table_resize(self, event):
+        """Reajusta las columnas al cambiar el ancho del canvas (binding al
+        <Configure> del canvas del body, ver _build_downloads_tab). Delega en
+        TableView.fit_to_width, que encoge las columnas arrastrables solo lo
+        necesario para que la suma quepa (sin bajar de su mínimo) y las
+        devuelve a su ancho elegido cuando vuelve a haber sitio -- sin esto,
+        ensanchar columnas con los separadores podía dejar el botón
+        "Descargar" (columna de acción, expand=True) fuera de la vista.
+        min_expand=88 reserva el hueco de la columna de acción (botón de
+        80px + margen) para que fit_to_width lo respete al repartir el
+        ancho cuando no cabe todo -- el 60 por defecto de TableView es
+        para columnas expand de texto, demasiado estrecho para un botón."""
+        if self._downloads_table.fit_to_width(event.width, min_expand=88):
+            self._downloads_rebuild_page()
 
     def _on_downloads_table_visibility_changed(self):
         """Callback de TableView.on_visibility_changed (menú contextual de
@@ -9430,7 +10038,7 @@ class App(_AppBase):
 
     def _downloads_update_pagination(self):
         total = len(self._downloads_results)
-        pp = self._downloads_per_page
+        pp = self._downloads_table.page_size
         if total == 0:
             self._downloads_page_lbl.configure(text="")
             self._downloads_prev_btn.configure(state="disabled")
@@ -9449,7 +10057,7 @@ class App(_AppBase):
 
     def _downloads_next_page(self):
         total = len(self._downloads_results)
-        pp = self._downloads_per_page
+        pp = self._downloads_table.page_size
         max_page = (total - 1) // pp if total > 0 else 0
         if self._downloads_page < max_page:
             self._downloads_page += 1
@@ -9466,7 +10074,13 @@ class App(_AppBase):
             self.after(0, lambda: self._downloads_status_lbl.configure(
                 text="Error: sesión aMule cerrada", text_color=ERROR_COLOR))
             return
-        ok, raw = self._downloads_amule.download_in_session(self._downloads_session, result_number)
+        result = next((r for r in self._downloads_results if r.number == result_number), None)
+        if result is None or not getattr(result, "_ec_hash", None):
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text=f"Error: resultado #{result_number} sin hash MD4 para descargar",
+                text_color=ERROR_COLOR))
+            return
+        ok, raw = self._downloads_amule.download(result)
         def _update():
             if ok:
                 self._downloads_status_lbl.configure(
@@ -11235,30 +11849,54 @@ class App(_AppBase):
         encontrados en esa carpeta, o None si no hay ninguna coincidencia
         de esa confianza."""
         sanitized_desired = _ftp_safe(show_name)
+        matched = {}          # nombre de carpeta -> episodios encontrados en ella
         best_candidate, best_ratio = None, 0.0
+
         for folders in ftp_index.values():
-            if known_folder_name:
-                folders_lower = {f.lower(): f for f in folders}
-                real = folders_lower.get(known_folder_name.lower())
-                if real:
-                    return folders[real]
-            if sanitized_desired in folders:
-                return folders[sanitized_desired]
-            candidate, ratio = best_match(show_name, list(folders.keys()), min_ratio=0.55)
-            if candidate and ratio >= 0.90:
-                return folders[candidate]
-            if candidate and ratio > best_ratio:
-                best_candidate, best_ratio = candidate, ratio
+            year_candidate = None
             if known_year:
                 from core.series_match import best_match_with_year
-                yr_candidate, yr_ratio = best_match_with_year(show_name, list(folders.keys()), known_year)
-                if yr_candidate:
-                    return folders[yr_candidate]
-        if best_candidate:
-            _log.info("Cruce FTP: '%s' -- candidato más parecido '%s' con ratio %.2f "
-                      "(hace falta >= 0.90 para reutilizarlo en silencio)",
-                      show_name, best_candidate, best_ratio)
-        return None
+                year_candidate, _yr_ratio = best_match_with_year(
+                    show_name, list(folders.keys()), known_year)
+
+            for folder_name, episodes in folders.items():
+                if known_folder_name and folder_name.lower() == known_folder_name.lower():
+                    matched[folder_name] = episodes   # el nombre REAL que dio el servidor de medios
+                    continue
+                if folder_name == sanitized_desired:
+                    matched[folder_name] = episodes   # nombre exacto tras sanear
+                    continue
+                if folder_name == year_candidate:
+                    matched[folder_name] = episodes   # desempatado por año (remake vs original)
+                    continue
+                ratio = series_similarity(show_name, folder_name)
+                if ratio >= _FTP_PRESENT_MIN_RATIO:
+                    matched[folder_name] = episodes
+                elif ratio > best_ratio:
+                    best_candidate, best_ratio = folder_name, ratio
+
+        if not matched:
+            if best_candidate:
+                _log.info("Cruce FTP: '%s' -- candidato más parecido '%s' con ratio %.2f "
+                          "(hace falta >= %.2f para darlo por la misma serie)",
+                          show_name, best_candidate, best_ratio, _FTP_PRESENT_MIN_RATIO)
+            return None
+
+        # Unión de TODAS las carpetas que casan, no solo la primera: una
+        # misma serie puede estar repartida en varias carpetas del servidor
+        # (caso real: "Prodigiosa Las aventuras de Ladybug" con solo la T6
+        # y "Miraculous las aventuras de Ladybug" con las T1-T5 -- el
+        # título en castellano y el original, cada uno con su carpeta).
+        # Antes esta función devolvía la PRIMERA que casaba y las demás ni
+        # se miraban, así que los 129 episodios de la otra carpeta salían
+        # como "te faltan" estando ahí al lado.
+        present = set()
+        for episodes in matched.values():
+            present |= episodes
+        if len(matched) > 1:
+            _log.info("Cruce FTP: '%s' -> %d carpeta(s) unidas (%s), %d episodio(s) en total",
+                      show_name, len(matched), ", ".join(sorted(matched)), len(present))
+        return present
 
     def _set_missing_episode_ignored(self, tmdb_id, ignored: bool) -> None:
         """Marca (o desmarca) una serie como ignorada en la caché del
@@ -12397,12 +13035,46 @@ class App(_AppBase):
         self._start_ftp_upload([entry])
 
     def _remove_entry(self, entry):
+        # Quitar una fila a mano es una decisión del usuario ("este archivo
+        # no lo quiero"), así que se le dice al modo automático que lo deje
+        # en paz -- si no, el siguiente escaneo de la carpeta vigilada lo
+        # vuelve a detectar y la fila reaparece sola, y quitarla se vuelve
+        # imposible (visto de verdad con una película que TMDB no tiene:
+        # volvía a la lista cada pocos segundos). Se marca "descartado"
+        # (estado protegido, ver core/auto_watcher.py::_PROTECTED_STATUSES).
+        # No pisa un estado protegido que ya hubiera (p.ej. "subido"): esos
+        # ya hacen que el watcher lo ignore y llevan información que no
+        # conviene perder.
+        self._discard_from_auto_watcher(entry)
         self.files = [e for e in self.files if e is not entry]
         self._multi_selected.discard(entry)
         self._refresh_table()
         if self._selected_entry is entry:
             self._clear_detail()
         self._update_assign_button_label()
+
+    def _discard_from_auto_watcher(self, entry):
+        """Marca *entry* como "descartado" en auto_processed.json para que
+        AutoWatcher no lo vuelva a meter en la lista. Silencioso si el
+        archivo ya tenía un estado protegido."""
+        try:
+            from core.auto_watcher import _processed_db_path, _DB_LOCK, _PROTECTED_STATUSES
+            import json as _json
+            with _DB_LOCK:
+                p = _processed_db_path()
+                db = {}
+                if p.exists():
+                    try:
+                        db = _json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        db = {}
+                if db.get(entry.path, {}).get("status", "") in _PROTECTED_STATUSES:
+                    return
+                db[entry.path] = {"status": "descartado", "new_name": "", "ts": _time.time()}
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            _log.warning("No se pudo marcar como descartado: %s", entry.path, exc_info=True)
 
     def _select_entry(self, entry):
         prev = self._selected_entry
@@ -13842,8 +14514,8 @@ class App(_AppBase):
     def _next_sort_state(current_key, current_asc: bool, clicked_key: str):
         """Mismo comportamiento que Excel/Explorer al pulsar una cabecera
         ordenable: la columna ya activa alterna de dirección; una columna
-        distinta empieza en ascendente. Compartido por las 3 tablas
-        ordenables (Archivos/Episodios que faltan/Liberar espacio)."""
+        distinta empieza en ascendente. Compartido por las 4 tablas
+        ordenables (Archivos/Episodios que faltan/Liberar espacio/Descargar)."""
         if clicked_key == current_key:
             return clicked_key, not current_asc
         return clicked_key, True
@@ -13852,28 +14524,55 @@ class App(_AppBase):
         self._files_sort_key, self._files_sort_asc = self._next_sort_state(
             self._files_sort_key, self._files_sort_asc, key)
         self._file_table.set_sort_indicator(self._files_sort_key, self._files_sort_asc)
+        self._sort_files_by_current_key()
+        self._save_table_sort("archivos", self._files_sort_key, self._files_sort_asc)
+        self._refresh_table()
 
-        def _sort_key(e):
-            if key == "name":
-                return Path(e.path).name.lower()
-            if key == "det":
-                return (e.detected or {}).get("title", "").lower()
-            if key == "nn":
-                return (e.new_name or "").lower()
-            if key == "dest":
-                return self._preview_remote_path(e).lower()
-            if key == "stat":
-                return e.status
-            if key == "size":
+    def _sort_files_by_current_key(self):
+        """Aplica a self.files el orden por la columna elegida
+        (_files_sort_key/_files_sort_asc). Separado del clic de cabecera para
+        poder re-aplicar también el orden guardado de una sesión anterior al
+        cargar la lista (ver _apply_persisted_files_sort)."""
+        key = self._files_sort_key
+        if not key:
+            return
+        if key == "name":
+            self.files.sort(key=lambda e: Path(e.path).name.lower(),
+                            reverse=not self._files_sort_asc)
+        elif key == "det":
+            self.files.sort(key=lambda e: (e.detected or {}).get("title", "").lower(),
+                            reverse=not self._files_sort_asc)
+        elif key == "nn":
+            self.files.sort(key=lambda e: (e.new_name or "").lower(),
+                            reverse=not self._files_sort_asc)
+        elif key == "dest":
+            self.files.sort(key=lambda e: self._preview_remote_path(e).lower(),
+                            reverse=not self._files_sort_asc)
+        elif key == "stat":
+            self.files.sort(key=lambda e: e.status, reverse=not self._files_sort_asc)
+        elif key == "size":
+            def _sz(e):
                 if e._last_known_size_bytes is None:
                     try:
                         e._last_known_size_bytes = Path(e.path).stat().st_size
                     except OSError:
                         e._last_known_size_bytes = 0
                 return e._last_known_size_bytes
-            return ""
-        self.files.sort(key=_sort_key, reverse=not self._files_sort_asc)
-        self._refresh_table()
+            self.files.sort(key=_sz, reverse=not self._files_sort_asc)
+
+    def _apply_persisted_files_sort(self):
+        """Reaplica el orden de columna guardado de una sesión anterior a la
+        lista self.files (que se carga después de arrancar, ver _load_session)
+        -- se hace una sola vez, nada más tener la lista, sin machacar el
+        orden manual elegido luego por el usuario."""
+        if self._files_table_sort_applied or not self.files:
+            self._files_table_sort_applied = True
+            return
+        self._files_table_sort_applied = True
+        if self._files_sort_key:
+            self._sort_files_by_current_key()
+            self._file_table.set_sort_indicator(self._files_sort_key, self._files_sort_asc)
+            self._refresh_table()
 
     def _rename_selected(self):
         entry = self._selected_entry
@@ -14218,7 +14917,6 @@ class App(_AppBase):
             "amule_host":     self._amule_entries["amule_host"].get().strip(),
             "amule_port":     int(self._amule_entries["amule_port"].get() or 4712),
             "amule_password": self._amule_entries["amule_password"].get(),
-            "amulecmd_path":  self._amule_entries["amulecmd_path"].get().strip() or "amulecmd",
         }
 
     def _settings_dirty(self) -> bool:
@@ -15627,8 +16325,8 @@ class App(_AppBase):
         # (nombre + tamaño/motivo), ver _build_cleanup_result_row.
         self._cleanup_table.row_height = 38
         self._cleanup_table.on_header_click = self._on_cleanup_header_click
-        self._cleanup_sort_key = "candidata"   # arranca igual que el comportamiento previo (alfabético)
-        self._cleanup_sort_asc = True
+        self._cleanup_sort_key, self._cleanup_sort_asc = self._saved_table_sort(
+            "limpiar", "candidata", True)   # arranca igual que el comportamiento previo (alfabético)
         self._cleanup_table.set_sort_indicator(self._cleanup_sort_key, self._cleanup_sort_asc)
         self._cleanup_table.grid(row=0, column=0, sticky="nsew")
         self._cleanup_table.enable_dynamic_page_size(lambda _size: self._render_cleanup_page())
@@ -16056,6 +16754,7 @@ class App(_AppBase):
         self._cleanup_sort_key, self._cleanup_sort_asc = self._next_sort_state(
             self._cleanup_sort_key, self._cleanup_sort_asc, key)
         self._cleanup_table.set_sort_indicator(self._cleanup_sort_key, self._cleanup_sort_asc)
+        self._save_table_sort("limpiar", self._cleanup_sort_key, self._cleanup_sort_asc)
         self._cleanup_filtered_items.sort(key=self._cleanup_sort_key_fn(self._cleanup_sort_key),
                                           reverse=not self._cleanup_sort_asc)
         self._render_cleanup_page()
@@ -16958,6 +17657,7 @@ class App(_AppBase):
                 return
             raw = json.loads(p.read_text(encoding="utf-8"))
             self.files = _dedupe_entries([FileEntry.from_dict(d) for d in raw])
+            self._apply_persisted_files_sort()
             self._refresh_table()
         except Exception:
             pass

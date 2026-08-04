@@ -9,6 +9,7 @@ comodín (catch-all).
 import uuid
 from typing import Callable, Optional
 
+from core.adult_content import looks_adult
 from core.ftp_client import _ftp_safe
 from core.series_match import best_match, best_match_with_year
 
@@ -37,7 +38,8 @@ def choose_category(genre_ids, categories: list) -> Optional[dict]:
 def find_existing_category_folder(categories: list, desired_title: str,
                                     known_folder_name: Optional[str],
                                     dir_lookup: Callable[[str], Optional[list]],
-                                    known_year: Optional[str] = None) -> tuple:
+                                    known_year: Optional[str] = None,
+                                    original_name: Optional[str] = None) -> tuple:
     """Busca en *categories* (ya filtradas por tipo de media) si ya existe
     una carpeta con nombre igual o prácticamente idéntico a *desired_title*
     -- para que la organización real del servidor prevalezca sobre la
@@ -74,6 +76,15 @@ def find_existing_category_folder(categories: list, desired_title: str,
     normal se queda justo por debajo de 0.90 al no encontrar ninguna con
     exact/0.90 de parecido directo. Se usa solo como último recurso, tras
     fallar las comprobaciones de arriba (ver best_match_with_year)."""
+    # Defensa en profundidad. El filtro principal está en AutoWatcher, que ni
+    # llega hasta aquí con contenido adulto, pero esta función también la usa
+    # la subida manual. Reutilizar una carpeta YA EXISTENTE es justo el paso
+    # que metió porno en la carpeta infantil, así que si el nombre original
+    # tiene marcas de adulto no se reutiliza ninguna: que se cree su propia
+    # carpeta donde le toque, en vez de colarse en la de otra cosa.
+    if original_name and looks_adult(original_name):
+        return None, None
+
     sanitized_desired = _ftp_safe(desired_title)
     for cat in categories:
         root = cat.get("root", "")
@@ -89,7 +100,16 @@ def find_existing_category_folder(categories: list, desired_title: str,
                 return cat, real
         if sanitized_desired in existing:
             return cat, sanitized_desired
-        candidate, ratio = best_match(desired_title, existing, min_ratio=0.55)
+        # strict + allow_annotation: aquí se decide EN QUÉ CARPETA REAL cae
+        # el archivo, así que ser prefijo de una carpeta existente no basta.
+        # "Star Wars" (lo que queda de "Star Wars Xxx, A Porn Parody 2011"
+        # tras limpiar el nombre) puntuaba 0.90 contra "Star Wars Las
+        # aventuras de los jóvenes Jedi" y acababa en la categoría infantil.
+        # Caso real: porno subido a /datos2/seriespeques/. Con este modo ese
+        # par baja a 0.35, y la reutilización legítima sigue funcionando
+        # ("Desencanto (Disenchantment)", "Ranma (1989)").
+        candidate, ratio = best_match(desired_title, existing, min_ratio=0.55,
+                                       strict=True, allow_annotation=True)
         if ratio >= 0.90:
             return cat, candidate
         if known_year:

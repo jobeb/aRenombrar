@@ -16,6 +16,22 @@ class AmuleSearchResult:
     complete: bool = False
 
 
+def _no_console_kwargs() -> dict:
+    """En Windows, evita que amulecmd.exe abra una ventana de consola:
+    cuando el proceso padre no tiene consola propia (la app empaquetada
+    con PyInstaller, o arrancada con pythonw como hace lanzar.vbs según
+    cómo se lance), un hijo de consola como amulecmd recibe una consola
+    NUEVA visible -- el parpadeo de cmd que se ve al buscar. Con
+    CREATE_NO_WINDOW el hijo no crea ninguna. No-op en el resto de
+    plataformas (POSIX no tiene consolas aisladas)."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": startupinfo, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 def _find_amulecmd(custom_path: str) -> Optional[str]:
     candidates = []
     if custom_path:
@@ -39,7 +55,8 @@ def _find_amulecmd(custom_path: str) -> Optional[str]:
         if os.path.isfile(path):
             return path
         try:
-            subprocess.run([path, "--help"], capture_output=True, timeout=10)
+            subprocess.run([path, "--help"], capture_output=True, timeout=10,
+                           **_no_console_kwargs())
             return path
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             continue
@@ -71,6 +88,7 @@ class AmuleSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            **_no_console_kwargs(),
         )
         if self._proc.stdin is None or self._proc.stdout is None:
             raise RuntimeError("No se pudo abrir amulecmd")
@@ -172,7 +190,8 @@ class AmuleClient:
         if args is None:
             return ""
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                                    **_no_console_kwargs())
             combined = (result.stdout or "") + (result.stderr or "")
             return combined.strip()
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -199,17 +218,44 @@ class AmuleClient:
         except (RuntimeError, OSError):
             return None
 
-    def search_in_session(self, session: AmuleSession, query: str,
-                          search_type="Kad", wait_seconds=10,
-                          file_type: str = "") -> list[AmuleSearchResult]:
+    def iter_search_in_session(self, session: AmuleSession, query: str,
+                               search_type="Kad", file_type: str = "",
+                               poll_interval: float = 3.0,
+                               max_duration: float = 60.0):
+        """Igual que search_in_session pero SIN espera fija: lanza la
+        búsqueda y consulta "results" cada poll_interval segundos durante
+        max_duration como mucho, entregando cada vez la lista COMPLETA
+        acumulada hasta ese momento (aMule la va llenando sola con los
+        resultados que van llegando). El llamador puede ir mostrando y
+        actualizando la lista en vivo en vez de esperar los 10 segundos
+        de golpe. Generador: rinde una lista nueva por cada sondeo y
+        termina al agotarse max_duration."""
         cmd = f"search {search_type} {query}"
         if file_type:
             cmd += f" --type {file_type}"
         session.send(cmd)
-        _time.sleep(wait_seconds)
-        session.send("results", wait_seconds=0.5)
-        output = session.flush_output()
-        return self._parse_results(output)
+        deadline = _time.monotonic() + max_duration
+        while True:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return
+            _time.sleep(min(poll_interval, remaining))
+            session.send("results", wait_seconds=0.5)
+            output = session.flush_output()
+            yield self._parse_results(output)
+
+    def search_in_session(self, session: AmuleSession, query: str,
+                          search_type="Kad", wait_seconds=10,
+                          file_type: str = "") -> list[AmuleSearchResult]:
+        """Búsqueda de una sola pasada: espera fija y devuelve la lista
+        final. Para ir actualizando en vivo usa iter_search_in_session
+        (esta es justo esa llamada con poll_interval=max_duration=wait)."""
+        results = []
+        for current in self.iter_search_in_session(
+                session, query, search_type=search_type, file_type=file_type,
+                poll_interval=wait_seconds, max_duration=wait_seconds):
+            results = current
+        return results
 
     def download_in_session(self, session: AmuleSession, result_number: int) -> tuple[bool, str]:
         session.send(f"download {result_number}", wait_seconds=0.5)

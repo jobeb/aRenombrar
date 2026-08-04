@@ -25,6 +25,7 @@ import threading
 import time
 from pathlib import Path
 
+from core.adult_content import adult_reason, looks_adult
 from core.api_client import detect_episode
 from core.renamer import (build_name_for_media_info, rename_file,
                            is_video_file, is_book_file, is_comic_file, is_archive_file)
@@ -69,8 +70,24 @@ DEFAULT_POLL = 10   # segundos entre escaneos (por defecto)
 # tratamiento: sin esto, un archivo comprimido con "Mantener original"
 # configurado (no se mueve ni se borra) se detectaría y descomprimiría de
 # nuevo en cada ciclo de escaneo.
+# "adulto_omitido" va aquí (y no entre los estados que se reintentan) a
+# propósito: no es un fallo de identificación que pueda arreglarse en el
+# siguiente ciclo, es una decisión firme. Reintentarlo solo serviría para
+# volver a intentar clasificar porno solo, que es justo lo que no se quiere.
 _PROTECTED_STATUSES = ("subido", "renombrado", "identificado_manual", "subiendo", "duplicado",
-                       "descomprimido")
+                       "descomprimido", "descartado", "adulto_omitido")
+
+# Veces que se reintenta un archivo que falló por causas NO protegidas
+# (sin_resultados, confianza insuficiente...) antes de dejarlo en paz.
+# Sin este tope, _should_process borraba la marca y lo reprocesaba en CADA
+# ciclo de escaneo, para siempre: visto de verdad con una película que
+# sencillamente no existe en TMDB (una parodia), que acumuló >2000 entradas
+# de log reintentándose cada 5-10 s, gastando cuota de la API y volviendo a
+# aparecer en la lista de Archivos cada vez que el usuario la quitaba. Los
+# fallos transitorios de verdad (TMDB caído, corte de red) se resuelven de
+# sobra en los primeros intentos; a partir de ahí insistir no aporta nada.
+# Renombrar el archivo cambia su clave y vuelve a empezar de cero.
+_MAX_RETRY_ATTEMPTS = 3
 
 # Fragmentos (en minúsculas) que delatan "archivo bloqueado por otro
 # proceso" en el mensaje de error de rename_file(), sea cual sea el SO:
@@ -133,6 +150,10 @@ class AutoWatcher:
         self._thread            = None
         self._processed         = self._load_db()
         self._in_progress       = set()
+        # {clave: nº de reintentos ya gastados} -- puente entre
+        # _should_process (que borra la entrada para reprocesar) y _mark
+        # (que la vuelve a escribir), ver _MAX_RETRY_ATTEMPTS.
+        self._pending_attempts  = {}
         # Reutilización de carpetas de serie ya existentes en el FTP (evita
         # crear una carpeta duplicada por idioma/nombre corto distinto)
         self._series_folder_cache = {}
@@ -228,8 +249,20 @@ class AutoWatcher:
                 # se activaba el automático).
                 _log.debug("Saltado (%s): %s", status, name)
                 return False
-            # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar
-            _log.info("Reprocesando (estado anterior=%s): %s", status, name)
+            # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar,
+            # pero solo unas cuantas veces (ver _MAX_RETRY_ATTEMPTS): hay
+            # archivos que NUNCA van a identificarse (un título que no existe
+            # en TMDB), y reintentarlos en cada ciclo era un bucle infinito.
+            attempts = self._processed[key].get("attempts", 0)
+            if attempts >= _MAX_RETRY_ATTEMPTS:
+                _log.debug("Saltado (%s, %d intentos agotados): %s", status, attempts, name)
+                return False
+            _log.info("Reprocesando (estado anterior=%s, intento %d/%d): %s",
+                      status, attempts + 1, _MAX_RETRY_ATTEMPTS, name)
+            # La cuenta de intentos NO se borra con la entrada -- se lleva al
+            # siguiente _mark() (ver _pending_attempts), o el contador se
+            # reiniciaría solo y el tope no serviría de nada.
+            self._pending_attempts[key] = attempts + 1
             del self._processed[key]
             self._delete_entry(key)
         return True
@@ -453,6 +486,25 @@ class AutoWatcher:
             if self._load_db().get(key, {}).get("status", "") in _PROTECTED_STATUSES:
                 _log.info("Abandonando proceso: %s ya se gestionó a mano mientras se esperaba", path.name)
                 self._in_progress.discard(key)
+                return
+
+            # Contenido para adultos: fuera del automático, siempre.
+            # detect_episode() tira "Xxx"/"A Porn Parody"/el reparto como
+            # basura del nombre, así que a partir de aquí esa señal ya no
+            # existe y lo que queda ("Star Wars") se parece peligrosamente a
+            # títulos legítimos. Caso real: dos parodias porno archivadas en
+            # /datos2/seriespeques/ por casar con una serie preescolar.
+            # Se marca con estado protegido para que no se reintente en
+            # bucle; el usuario decide a mano qué hacer con él.
+            if looks_adult(path.name):
+                motivo = adult_reason(path.name)
+                _log.warning("Contenido adulto detectado (%s), fuera del automático: %s",
+                             motivo, path.name)
+                self.on_event("skip", f"Contenido adulto ({motivo}), no se clasifica solo: {path.name}")
+                self.on_file_event(key, "skip",
+                                    reason=f"Contenido para adultos detectado ({motivo}). "
+                                           f"Clasifícalo a mano para que no acabe en una carpeta equivocada.")
+                self._mark(key, "adulto_omitido")
                 return
 
             self.on_file_event(key, "start")
@@ -735,7 +787,11 @@ class AutoWatcher:
             # que ya tenía, porque antes esta función se saltaba
             # directamente a choose_category (solo género) sin comprobar
             # si la serie ya existía en OTRA categoría.
-            category, _existing_folder = self._find_category_with_existing_folder(type_cats, media_info.title)
+            # El nombre ORIGINAL (key), no new_path: si el archivo ya se
+            # renombró, el nombre limpio ya no conserva las marcas que
+            # delatan el contenido adulto.
+            category, _existing_folder = self._find_category_with_existing_folder(
+                type_cats, media_info.title, original_name=Path(key).name)
             if category is None:
                 category = choose_category(media_info.genre_ids, type_cats)
             if category is None:
@@ -918,7 +974,8 @@ class AutoWatcher:
 
     # ── Carpeta de serie en el FTP ─────────────────────────────────────────────
 
-    def _find_category_with_existing_folder(self, categories: list, title: str) -> tuple:
+    def _find_category_with_existing_folder(self, categories: list, title: str,
+                                             original_name: str = None) -> tuple:
         """Busca en TODAS las *categories* (ya filtradas por tipo de media)
         si el título a subir ya tiene carpeta en alguna de ellas -- para
         que la organización real del servidor prevalezca sobre la
@@ -945,7 +1002,8 @@ class AutoWatcher:
             return self._ftp_dir_cache[root]
 
         from core.ftp_categories import find_existing_category_folder
-        return find_existing_category_folder(categories, title, None, dir_lookup)
+        return find_existing_category_folder(categories, title, None, dir_lookup,
+                                              original_name=original_name)
 
     def _resolve_series_folder(self, category: dict, media_info) -> str:
         """Si ya existe en la raíz de *category* una carpeta con nombre muy
@@ -1005,6 +1063,12 @@ class AutoWatcher:
             "new_name": new_name,
             "ts":       time.time(),
         }
+        # Arrastra la cuenta de reintentos que dejó _should_process al borrar
+        # la entrada anterior -- solo para los estados de fallo, que son los
+        # únicos que se reintentan (ver _MAX_RETRY_ATTEMPTS).
+        attempts = self._pending_attempts.pop(key, 0)
+        if status not in _PROTECTED_STATUSES and attempts:
+            entry["attempts"] = attempts
         self._processed[key] = entry
         self._in_progress.discard(key)
         self._save_entry(key, entry)

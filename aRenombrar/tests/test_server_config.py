@@ -49,7 +49,7 @@ def test_shared_config_keys_excludes_ftp_connection_and_personal_state():
                     "ftp_parallel", "ftp_speed_limit", "ftp_retries",
                     "app_user_name", "shared_data_ftp_path",
                     "appearance", "color_theme", "last_dir", "table_col_widths",
-                    "table_hidden_columns",
+                    "table_hidden_columns", "table_sort",
                     "amule_search_type",
                     "skipped_update_version", "watch_folder", "poll_interval",
                     "auto_action", "manual_action", "auto_extract_archives", "min_confidence",

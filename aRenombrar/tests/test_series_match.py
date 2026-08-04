@@ -54,6 +54,29 @@ def test_similarity_still_boosts_meaningful_short_titles():
     assert series_similarity("Coco", "Coco (2017)") >= 0.90
 
 
+def test_similarity_same_series_split_across_two_folders_clears_ftp_threshold():
+    # Caso real opuesto al de Arcadia: la MISMA serie repartida en dos
+    # carpetas del servidor, una con el título en castellano (solo la T6) y
+    # otra con el original (T1-T5) -- el cruce con el FTP debe unirlas, o
+    # los 129 episodios de la segunda salen como "te faltan" estando ahí.
+    # 0.75 es el umbral de gui/app.py::_FTP_PRESENT_MIN_RATIO; se comprueba
+    # aquí para que un cambio en series_similarity que baje este parecido
+    # por debajo del listón no pase desapercibido.
+    ratio = series_similarity("Prodigiosa: Las aventuras de Ladybug",
+                              "Miraculous las aventuras de Ladybug")
+    assert ratio >= 0.75
+    # ...pero sin llegar al 0.90 que hace falta para REUTILIZAR la carpeta
+    # al subir (ver _find_category_with_existing_folder): subir ahí sería
+    # mucho más grave que solo contar episodios.
+    assert ratio < 0.90
+
+
+def test_similarity_arcadia_stays_below_the_ftp_merge_threshold():
+    # El contrapunto del test de arriba: bajar el listón del cruce FTP a
+    # 0.75 NO debe reabrir el caso Arcadia (series distintas).
+    assert series_similarity("Arcadia", "Los 3 de Adabo: Cuentos de Arcadia") < 0.75
+
+
 def test_similarity_does_not_false_positive_on_word_buried_at_the_end():
     # Caso real: "Arcadia" y "Los 3 de Adabo: Cuentos de Arcadia" se
     # fusionaron en la misma carpeta del FTP y se subieron episodios de

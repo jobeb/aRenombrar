@@ -156,6 +156,10 @@ DEFAULTS = {
     # de la cabecera (clic derecho) -- ver TableView.set_hidden y
     # _save_hidden_columns en gui/app.py. {tabla: [claves_ocultas]}.
     "table_hidden_columns": {},
+    # Orden elegido al pulsar una cabecera de una tabla (Archivos/Episodios/
+    # Liberar espacio/Descargar), guardado para persistir entre sesiones --
+    # ver _save_table_sort en gui/app.py. {tabla: {"key": cl, "asc": bool}}.
+    "table_sort": {},
     # Cuota de reservas por persona, en GB (ver core/reservations.py) --
     # configuración de SERVIDOR (core/server_config.py): el mismo límite
     # para todo el que reserve espacio contra este servidor, no una
@@ -202,13 +206,28 @@ DEFAULTS = {
     "missing_ep_hide_ai_dismissed": False,
     "missing_ep_hide_no_dub": False,
     "missing_ep_pin_favorites": True,
+    # Autocompletado por serie (pestaña "Episodios que faltan", botón "auto"
+    # de cada fila): lista de tmdb_id (str) con el autocompletado ACTIVO --
+    # la app busca en aMule y descarga los capítulos que faltan solos y de
+    # forma persistente (nuevos capítulos que van saliendo se añaden solos).
+    # Es personal de CADA instalación (config.json del usuario, no viaja por
+    # FTP), igual que los switches missing_ep_*. El estado "ya revisado" por
+    # episodio/serie se guarda en missing_ep_auto_checked (ver abajo).
+    "missing_ep_auto_complete": [],
+    # {tmdb_id_str: {season: [ep, ...]}} -- episodios de series con
+    # autocompletado que ya se intentaron descargar en una pasada anterior
+    # (o que ya estaban en el servidor). Sirve para no volver a golpear aMule
+    # con el mismo capítulo en cada ciclo de 30 min mientras no cambie nada:
+    # un capítulo marcado aquí no se reintenta hasta que se quite la entrada
+    # (se limpia solo cuando la serie deja de faltar o se desactiva el auto).
+    "missing_ep_auto_checked": {},
     "auto_watcher_running": False,
-    # amulecmd para descargar episodios que faltan -- host/puerto/contraseña
-    # del External Connections de aMule (Preferencias -> Control Remoto).
+    # aMule para buscar y descargar episodios que faltan -- host/puerto/
+    # contraseña del External Connections de aMule (Preferencias -> Control
+    # Remoto). El cliente habla el protocolo EC binario directamente por TCP.
     "amule_host": "localhost",
     "amule_port": 4712,
     "amule_password": "",
-    "amulecmd_path": r"C:\Program Files\aMule\bin\amulecmd.exe",
     # Red de búsqueda elegida en la pestaña Descargas ("Kad"/"Global"/"Local")
     # -- se persiste para que no vuelva a Kad al reiniciar.
     "amule_search_type": "Kad",
