@@ -1,4 +1,4 @@
-from core.download_quality import score_download, best_result
+from core.download_quality import score_download, best_result, is_adult_content
 from core.amule_client import AmuleSearchResult as R
 
 
@@ -93,3 +93,85 @@ def test_season_match_without_query_still_ranks_by_quality():
     low = score_download(_r(1, "Serie 720p"))
     high = score_download(_r(2, "Serie 1080p"))
     assert high > low
+
+
+# ---- Porno / contenido adulto ----
+
+def test_is_adult_content_detects_porn_markers():
+    assert is_adult_content("Serie S01E01 XXX 1080p.mkv")
+    assert is_adult_content("Serie S01E01 Porn 720p.avi")
+    assert is_adult_content("Hentai Collection 4K.mkv")
+    assert is_adult_content("Serie XXX Parody 1080p.mp4")
+    assert not is_adult_content("Serie S01E01 1080p.mkv")
+    assert not is_adult_content("Sex Education S01E01 1080p.mkv")  # título legítimo
+    assert not is_adult_content("Adult Swim 2x04 720p.mkv")
+
+
+def test_best_result_never_picks_porn_even_with_best_quality():
+    """Un XXX 4K con muchas fuentes NO debe ganar jamás a un capítulo normal."""
+    results = [
+        _r(1, "Los Simpsons 2x04 XXX 2160p 4K spa", sources=50, complete=True),
+        _r(2, "Los Simpsons 2x04 720p", sources=3, complete=False),
+    ]
+    best = best_result(results, "Los Simpsons 2x04")
+    assert best is not None
+    assert best.number == 2
+
+
+def test_best_result_returns_none_when_only_porn():
+    results = [
+        _r(1, "XXX Porn 1080p.mkv", sources=99, complete=True),
+        _r(2, "Hentai 4K.mkv", sources=10, complete=True),
+    ]
+    assert best_result(results, "Algo") is None
+
+
+def test_porn_never_scores_above_threshold():
+    assert score_download(_r(1, "XXX 4K 100 fuentes", sources=99, complete=True)) < 15.0
+    assert score_download(_r(1, "Serie 720p", sources=3, complete=True)) >= 15.0
+
+
+# ---- Precisión extra ----
+
+def test_best_result_rejects_other_series_with_same_episode():
+    """Buscando "Los Simpsons 2x04", un "Padre de Familia 2x04 1080p" (otra
+    serie, misma numeración) NO debe ganar al capítulo de la serie pedida."""
+    results = [
+        _r(1, "Padre de Familia 2x04 1080p spa HDTV", sources=9, complete=True),
+        _r(2, "Los Simpsons 2x04 720p", sources=3, complete=False),
+    ]
+    best = best_result(results, "Los Simpsons 2x04")
+    assert best.number == 2
+
+
+def test_best_result_prefers_real_episode_over_sample():
+    """Un "sample" / "trailer" del capítulo NO debe ganar al capítulo entero."""
+    results = [
+        _r(1, "Serie S01E01 sample 1080p.mkv", sources=5, complete=True),
+        _r(2, "Serie S01E01 720p.mkv", sources=3, complete=True),
+    ]
+    best = best_result(results, "Serie S01E01")
+    assert best.number == 2
+
+
+def test_non_video_extension_never_wins():
+    """Un .emulecollection / .srt no es un capítulo descargable."""
+    results = [
+        _r(1, "Serie S01E01 1080p.emulecollection", sources=9, complete=True),
+        _r(2, "Serie S01E01 720p.mkv", sources=3, complete=True),
+    ]
+    best = best_result(results, "Serie S01E01")
+    assert best.number == 2
+
+
+def test_cam_rip_penalized_over_web():
+    """Una captura de cine (cam/screener) no debe ganar a una copia web."""
+    low = score_download(_r(1, "Serie S01E01 CAM 1080p", sources=9, complete=True))
+    good = score_download(_r(1, "Serie S01E01 WEB-DL 1080p", sources=3, complete=False))
+    assert good > low
+
+
+def test_latino_audio_counts_as_spanish():
+    plain = score_download(_r(1, "Serie S01E01 1080p"))
+    lat = score_download(_r(1, "Serie S01E01 1080p latino"))
+    assert lat > plain

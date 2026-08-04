@@ -118,10 +118,36 @@ class TMDBClient:
             self._cache[cache_key] = result
         return result
 
-    def search_multi(self, query: str) -> list:
+    # detect_episode() devuelve "tv"/"anime"/"movie"; TMDB solo distingue
+    # "tv"/"movie" -- el anime es una serie más para su catálogo.
+    _TMDB_TYPE = {"tv": "tv", "anime": "tv", "movie": "movie"}
+
+    def search_multi(self, query: str, prefer_type: str = "") -> list:
+        """Resultados de /search/multi ordenados por popularidad.
+
+        *prefer_type* (el media_type que dedujo detect_episode del propio
+        nombre del archivo) sube al principio los resultados de ESE tipo,
+        dejando la popularidad solo para desempatar dentro de cada grupo.
+        Sin esto mandaba la popularidad a secas, y un título que existe
+        como película famosa Y como serie se resolvía siempre a favor de
+        la película: caso real, "Amadeus.1x05.Episodio.5...mkv" acababa
+        renombrado como "Amadeus (1984).mkv" (la película de Forman, 8
+        Óscar) pese a que el "1x05" del nombre no deja ninguna duda de que
+        es un episodio. El tipo detectado ya se conocía, solo que la
+        búsqueda lo tiraba a la basura.
+
+        No FILTRA, solo reordena: si no hay ningún resultado del tipo
+        preferido (una serie que TMDB solo tiene como película, o una
+        detección equivocada), los del otro tipo siguen ahí detrás en vez
+        de dejar al usuario sin nada que elegir."""
         data = self._get("/search/multi", query=query)
         results = [r for r in data.get("results", []) if r.get("media_type") in ("tv", "movie")]
-        return sorted(results, key=lambda r: r.get("popularity", 0), reverse=True)
+        preferred = self._TMDB_TYPE.get(prefer_type, "")
+        return sorted(
+            results,
+            key=lambda r: (bool(preferred) and r.get("media_type") == preferred,
+                           r.get("popularity", 0)),
+            reverse=True)
 
     def search_tv(self, query: str) -> list:
         data = self._get("/search/tv", query=query)

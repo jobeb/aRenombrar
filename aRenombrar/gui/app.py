@@ -50,6 +50,7 @@ from core.amule_client import AmuleSearchResult
 from core.ec_client import EcClient, EcConnectionError, EcAuthError
 from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively, series_similarity
+from core import remote_presence as rp
 from core.download_quality import best_result
 
 # Parecido mínimo para dar dos carpetas del FTP por la MISMA serie al
@@ -625,6 +626,151 @@ class _ConfirmDeleteDialog(ctk.CTkToplevel):
 
         self.update_idletasks()
         dw = max(470, self.winfo_reqwidth())
+        dh = self.winfo_reqheight()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._close(False))
+        self.wait_window()
+
+    def _close(self, result: bool):
+        self.result = result
+        self.destroy()
+
+
+class _RemoveEntryDialog(ctk.CTkToplevel):
+    """Qué hacer al pulsar la ✕ de una fila: quitarla de la lista, y
+    opcionalmente borrar el archivo en local y/o en el servidor.
+
+    Solo se muestran las opciones aplicables (ver
+    core.remote_presence.removal_options): borrar en local exige que el
+    archivo siga en disco, y borrar en el servidor exige además conocer su
+    ruta real allí. El diálogo aparece siempre, aunque solo quede una
+    opción, para que la ✕ signifique siempre lo mismo y nunca borre nada
+    sin preguntar."""
+
+    _TEXTOS = {
+        rp.QUITAR_LISTA: (
+            "Quitar solo de la lista",
+            "El archivo se queda donde está. Solo desaparece de aquí.",
+            None),
+        rp.QUITAR_Y_LOCAL: (
+            "Quitar y borrar en local",
+            "Además se borra el archivo de tu disco.",
+            "#c0392b"),
+        rp.QUITAR_LOCAL_Y_REMOTO: (
+            "Quitar y borrar en local y en el servidor",
+            "Además se borra de tu disco Y del servidor.",
+            "#c0392b"),
+    }
+
+    def __init__(self, parent, name: str, opciones: list, local_path: str, remote_path: str):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.result = None       # id de la acción, o None si se cancela
+        self.title("Quitar de la lista")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+
+        ctk.CTkLabel(self, text="¿Qué quieres hacer con este archivo?",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(padx=24, pady=(22, 6))
+        ctk.CTkLabel(self, text=name, font=ctk.CTkFont(size=12, weight="bold"),
+                     wraplength=440, justify="left").pack(padx=24, pady=(0, 14))
+
+        for opt in opciones:
+            etiqueta, detalle, color = self._TEXTOS[opt]
+            fila = ctk.CTkFrame(self, fg_color="transparent")
+            fila.pack(padx=24, pady=(0, 8), fill="x")
+            ctk.CTkButton(fila, text=etiqueta, width=380, anchor="w",
+                          fg_color=color or "transparent", border_width=1,
+                          hover_color=("gray85", "#3d1010") if color is None else "#96281b",
+                          command=lambda o=opt: self._close(o)).pack(fill="x")
+            ctk.CTkLabel(fila, text=detalle, font=ctk.CTkFont(size=11),
+                         text_color="#95a5a6", wraplength=440,
+                         justify="left").pack(anchor="w", padx=4, pady=(2, 0))
+
+        # Por qué no salen las otras: sin esto, que falte una opción parece
+        # un fallo de la app en vez de una consecuencia del estado del
+        # archivo.
+        faltan = []
+        if rp.QUITAR_Y_LOCAL not in opciones:
+            faltan.append("El archivo ya no está en tu disco.")
+        elif rp.QUITAR_LOCAL_Y_REMOTO not in opciones:
+            faltan.append("No consta subido al servidor (o no se sabe dónde quedó).")
+        if faltan:
+            ctk.CTkLabel(self, text=" ".join(faltan), font=ctk.CTkFont(size=11),
+                         text_color="#7f8c8d", wraplength=440,
+                         justify="left").pack(padx=24, pady=(4, 0))
+
+        ctk.CTkButton(self, text="Cancelar", width=120, fg_color="transparent",
+                      border_width=1,
+                      command=lambda: self._close(None)).pack(padx=24, pady=(16, 20))
+
+        self.update_idletasks()
+        dw = max(500, self.winfo_reqwidth())
+        dh = self.winfo_reqheight()
+        pw = parent.winfo_rootx() + parent.winfo_width() // 2
+        ph = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"{dw}x{dh}+{pw - dw//2}+{ph - dh//2}")
+
+        self.protocol("WM_DELETE_WINDOW", lambda: self._close(None))
+        self.wait_window()
+
+    def _close(self, result):
+        self.result = result
+        self.destroy()
+
+
+class _ConfirmRemovalDialog(ctk.CTkToplevel):
+    """Segunda confirmación de las acciones que borran archivos, con las
+    rutas EXACTAS a la vista. Un clic de más en la fila equivocada del
+    diálogo anterior borraría algo sin vuelta atrás."""
+
+    def __init__(self, parent, name: str, local_path: str, remote_path: str):
+        super().__init__(parent)
+        parent._apply_icon(self)
+        self.result = False
+        self.title("Confirmar borrado")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+        self.attributes("-topmost", True)
+
+        ctk.CTkLabel(self, text="Se va a borrar de verdad",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(padx=24, pady=(22, 6))
+        ctk.CTkLabel(self, text=name, font=ctk.CTkFont(size=12, weight="bold"),
+                     wraplength=440, justify="left").pack(padx=24, pady=(0, 12))
+
+        if local_path:
+            ctk.CTkLabel(self, text="En tu disco:", font=ctk.CTkFont(size=11),
+                         text_color="#95a5a6").pack(anchor="w", padx=24)
+            ctk.CTkLabel(self, text=local_path, font=ctk.CTkFont(size=11),
+                         text_color=PENDING_COLOR, wraplength=440,
+                         justify="left").pack(anchor="w", padx=24, pady=(0, 8))
+        if remote_path:
+            ctk.CTkLabel(self, text="En el servidor:", font=ctk.CTkFont(size=11),
+                         text_color="#95a5a6").pack(anchor="w", padx=24)
+            ctk.CTkLabel(self, text=remote_path, font=ctk.CTkFont(size=11),
+                         text_color=PENDING_COLOR, wraplength=440,
+                         justify="left").pack(anchor="w", padx=24, pady=(0, 8))
+
+        ctk.CTkLabel(self, text="Esta acción NO se puede deshacer.",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=ERROR_COLOR).pack(padx=24, pady=(6, 18))
+
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(padx=24, pady=(0, 20))
+        ctk.CTkButton(bf, text="Cancelar", width=120, fg_color="transparent", border_width=1,
+                      command=lambda: self._close(False)).pack(side="left", padx=6)
+        ctk.CTkButton(bf, text="Sí, borrar", width=140,
+                      fg_color=ERROR_COLOR, hover_color="#96281b",
+                      command=lambda: self._close(True)).pack(side="left", padx=6)
+
+        self.update_idletasks()
+        dw = max(500, self.winfo_reqwidth())
         dh = self.winfo_reqheight()
         pw = parent.winfo_rootx() + parent.winfo_width() // 2
         ph = parent.winfo_rooty() + parent.winfo_height() // 2
@@ -1765,7 +1911,7 @@ class App(_AppBase):
 
     def _on_auto_file_event(self, path, tipo, new_name=None, progress=None, speed=None,
                              media_info=None, confidence=None, reason=None, renamed_on_disk=True,
-                             size=None):
+                             size=None, remote_full=None):
         """Recibe eventos de archivo del AutoWatcher y actualiza la tabla."""
         path = str(Path(path))   # normalizar separadores antes de comparar/asignar
         def _update():
@@ -1853,7 +1999,12 @@ class App(_AppBase):
                 # el archivo pudo moverse/borrarse ya (mover a "procesados"
                 # o eliminar tras subir), así que Path(path).stat() podría
                 # fallar o dar un tamaño distinto al que de verdad se subió.
-                self._save_history_entry(fname, path, "ok", size or 0, local_path=path)
+                # remote_full lo manda AutoWatcher; antes se guardaba aquí
+                # la ruta LOCAL en el campo "remote", con lo que el historial
+                # no sabía dónde había quedado el archivo en el servidor.
+                # El "or path" solo cubre a un AutoWatcher que no lo envíe.
+                self._save_history_entry(fname, remote_full or path, "ok", size or 0,
+                                          local_path=path)
                 self._remove_uploaded_episode_from_missing_list(entry.media_info)
                 self._refresh_ftp_space()
 
@@ -13035,16 +13186,119 @@ class App(_AppBase):
         self._start_ftp_upload([entry])
 
     def _remove_entry(self, entry):
-        # Quitar una fila a mano es una decisión del usuario ("este archivo
-        # no lo quiero"), así que se le dice al modo automático que lo deje
-        # en paz -- si no, el siguiente escaneo de la carpeta vigilada lo
-        # vuelve a detectar y la fila reaparece sola, y quitarla se vuelve
-        # imposible (visto de verdad con una película que TMDB no tiene:
-        # volvía a la lista cada pocos segundos). Se marca "descartado"
-        # (estado protegido, ver core/auto_watcher.py::_PROTECTED_STATUSES).
-        # No pisa un estado protegido que ya hubiera (p.ej. "subido"): esos
-        # ya hacen que el watcher lo ignore y llevan información que no
-        # conviene perder.
+        """La ✕ de una fila: pregunta qué hacer y actúa en consecuencia.
+
+        Siempre pregunta, aunque la única opción posible sea quitarla de la
+        lista, para que la ✕ nunca borre nada por sorpresa."""
+        historial = self._load_history()
+        nombre    = entry.new_name or entry.name
+        remote    = rp.remote_path_from_history(historial, entry.path, nombre)
+
+        # Registro viejo con el campo "remote" estropeado (guardaba la ruta
+        # local): consta subido pero no se sabe dónde quedó. Solo en ese
+        # caso hay que preguntarle al servidor, y eso va en un hilo -- si
+        # está caído, hacerlo aquí congelaría la app hasta el timeout.
+        if not remote and rp.was_uploaded_according_to_history(historial, entry.path, nombre):
+            self._set_status(f"Buscando en el servidor: {nombre}", PENDING_COLOR)
+            threading.Thread(target=self._lookup_remote_then_ask,
+                              args=(entry, nombre), daemon=True).start()
+            return
+
+        self._ask_removal(entry, remote)
+
+    def _lookup_remote_then_ask(self, entry, nombre: str):
+        """Hilo: busca la ruta real en el servidor y luego abre el diálogo."""
+        try:
+            remote = self._ftp_lookup_uploaded_file(entry, nombre)
+        except Exception:
+            _log.warning("No se pudo buscar en el servidor: %s", nombre, exc_info=True)
+            remote = ""
+        self.after(0, lambda: self._ask_removal(entry, remote))
+
+    def _ftp_lookup_uploaded_file(self, entry, nombre: str) -> str:
+        """Ruta completa del archivo en el servidor, o "" si no aparece.
+
+        Reutiliza _existing_ftp_path_for_info para dar con la carpeta de la
+        serie/película (la misma lógica que decide dónde subirla) y lista
+        solo esa carpeta -- no se recorre el servidor entero."""
+        info = getattr(entry, "media_info", None)
+        if info is None:
+            return ""
+        with self._ftp_cmd_lock:
+            carpeta = self._existing_ftp_path_for_info(self.ftp, info, use_cache_only=False)
+            if not carpeta:
+                return ""
+            ficheros = self.ftp.list_files(carpeta) or []
+        for f in ficheros:
+            if Path(f).name == nombre:
+                return rp.join_remote(carpeta, Path(f).name)
+        return ""
+
+    def _ask_removal(self, entry, remote_path: str):
+        """Abre el diálogo con las opciones aplicables y ejecuta la elegida."""
+        if entry not in self.files:
+            return   # la fila ya no está (el watcher la movió, otra acción...)
+
+        local_path   = entry.path
+        local_exists = bool(local_path) and Path(local_path).exists()
+
+        opciones = rp.removal_options(local_exists, remote_path)
+        accion = _RemoveEntryDialog(self, entry.new_name or entry.name, opciones,
+                                     local_path, remote_path).result
+        if accion is None:
+            self._set_status("", None)
+            return
+
+        if not rp.is_destructive(accion):
+            self._drop_entry_row(entry)
+            return
+
+        borra_remoto = accion == rp.QUITAR_LOCAL_Y_REMOTO
+        if not _ConfirmRemovalDialog(self, entry.new_name or entry.name, local_path,
+                                      remote_path if borra_remoto else "").result:
+            return
+
+        if not borra_remoto:
+            # Solo disco: es instantáneo, no hace falta hilo.
+            if self._delete_local_file(entry, local_path):
+                self._drop_entry_row(entry)
+            return
+
+        # El borrado remoto abre conexión FTP: en el hilo de la interfaz
+        # congelaría la app hasta que el servidor responda (o hasta que
+        # venza el timeout, si está caído).
+        self._set_status(f"Borrando en el servidor: {entry.new_name or entry.name}", PENDING_COLOR)
+        threading.Thread(target=self._delete_entry_remote_then_local,
+                          args=(entry, local_path, remote_path), daemon=True).start()
+
+    def _delete_entry_remote_then_local(self, entry, local_path: str, remote_path: str):
+        """Hilo: borra primero en el servidor y, solo si eso va bien, en
+        disco. En ese orden a propósito -- si fallara el remoto tras haber
+        borrado el local, el archivo del servidor se quedaría sin ninguna
+        copia local desde la que reintentar."""
+        try:
+            ok, msg = self._delete_remote_file(remote_path)
+        except Exception as e:
+            ok, msg = False, str(e)
+
+        def _finish():
+            if not ok:
+                _log.warning("No se pudo borrar en el servidor: %s (%s)", remote_path, msg)
+                self._set_status(f"No se pudo borrar en el servidor: {msg}", ERROR_COLOR)
+                return   # la fila se queda, para poder reintentar
+            if self._delete_local_file(entry, local_path, remote_borrado=True):
+                self._drop_entry_row(entry)
+
+        self.after(0, _finish)
+
+    def _drop_entry_row(self, entry):
+        """Quita la fila de la tabla y le dice al modo automático que deje
+        el archivo en paz.
+
+        Sin ese aviso, el siguiente escaneo de la carpeta vigilada lo vuelve
+        a detectar, dispara el evento "start" y la fila reaparece sola, con
+        lo que quitarla se vuelve imposible (visto de verdad con una
+        película que TMDB no tiene: volvía cada pocos segundos)."""
         self._discard_from_auto_watcher(entry)
         self.files = [e for e in self.files if e is not entry]
         self._multi_selected.discard(entry)
@@ -13053,28 +13307,55 @@ class App(_AppBase):
             self._clear_detail()
         self._update_assign_button_label()
 
+    def _delete_local_file(self, entry, local_path: str, remote_borrado: bool = False) -> bool:
+        """Borra el archivo del disco. False si falla, para que la fila NO
+        desaparezca de la lista y se pueda reintentar: perder la fila tras
+        un borrado a medias dejaría el archivo huérfano y sin rastro."""
+        try:
+            if local_path and Path(local_path).exists():
+                os.remove(local_path)
+        except Exception as e:
+            _log.warning("Error borrando en local: %s", local_path, exc_info=True)
+            # Si el del servidor ya se borró hay que decirlo, o el usuario
+            # no sabe en qué estado ha quedado la cosa.
+            aviso = " (el del servidor SÍ se borró)" if remote_borrado else ""
+            self._set_status(f"No se pudo borrar en local: {e}{aviso}", ERROR_COLOR)
+            return False
+
+        destino = "en local y en el servidor" if remote_borrado else "en local"
+        self._set_status(f"Borrado {destino}: {entry.new_name or entry.name}", OK_COLOR)
+        return True
+
+    def _delete_remote_file(self, remote_path: str) -> tuple:
+        """Borra un archivo del servidor con conexión propia -- mismo
+        patrón que el borrado de la herramienta de liberar espacio (ver
+        _delete_cleanup_item): no se reutiliza self.ftp, que es el canal de
+        control compartido. Se llama desde un hilo, nunca desde la interfaz."""
+        own_ftp = FTPClient()
+        ok, msg = own_ftp.connect(
+            self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
+            self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
+            self.config_data.get("ftp_use_tls", False))
+        if not ok:
+            return False, msg or "no se pudo conectar"
+        try:
+            return own_ftp.delete_file(remote_path)
+        finally:
+            try:
+                own_ftp.disconnect()
+            except Exception:
+                pass
+
     def _discard_from_auto_watcher(self, entry):
         """Marca *entry* como "descartado" en auto_processed.json para que
         AutoWatcher no lo vuelva a meter en la lista. Silencioso si el
-        archivo ya tenía un estado protegido."""
-        try:
-            from core.auto_watcher import _processed_db_path, _DB_LOCK, _PROTECTED_STATUSES
-            import json as _json
-            with _DB_LOCK:
-                p = _processed_db_path()
-                db = {}
-                if p.exists():
-                    try:
-                        db = _json.loads(p.read_text(encoding="utf-8"))
-                    except Exception:
-                        db = {}
-                if db.get(entry.path, {}).get("status", "") in _PROTECTED_STATUSES:
-                    return
-                db[entry.path] = {"status": "descartado", "new_name": "", "ts": _time.time()}
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(_json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            _log.warning("No se pudo marcar como descartado: %s", entry.path, exc_info=True)
+        archivo ya tenía un estado protegido.
+
+        La escritura vive en core.auto_watcher.mark_discarded -- allí está
+        junto al lector que la interpreta y, a diferencia de un método de
+        App, se puede probar."""
+        from core.auto_watcher import mark_discarded
+        mark_discarded(entry.path)
 
     def _select_entry(self, entry):
         prev = self._selected_entry
@@ -13417,7 +13698,11 @@ class App(_AppBase):
             entry.error_msg = "No se pudo detectar el nombre"
             _log.warning("Busqueda: no se pudo detectar nombre para %r", entry.name)
             return
-        results = tmdb.search_multi(query)
+        # prefer_type: el "1x05"/"S01E05" del nombre ya dice si es serie o
+        # película -- sin pasarlo, mandaba la popularidad y un título que
+        # existe como las dos cosas se resolvía siempre a favor de la
+        # película (ver TMDBClient.search_multi).
+        results = tmdb.search_multi(query, prefer_type=det.get("media_type", ""))
         if not results:
             fallback = self._try_ai_fallback(entry, tmdb)
             if fallback:

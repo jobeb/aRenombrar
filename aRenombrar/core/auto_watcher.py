@@ -59,6 +59,46 @@ _DB_LOCK = threading.Lock()
 
 _log = get_logger("aRenombrar.auto", "auto_watcher.log", level=logging.DEBUG)
 
+
+def mark_discarded(path: str) -> bool:
+    """Marca *path* como "descartado" para que AutoWatcher lo deje en paz.
+
+    La llama la GUI cuando el usuario quita una fila a mano ("este archivo
+    no lo quiero"): sin esto el siguiente escaneo lo vuelve a detectar,
+    dispara el evento "start" y la fila reaparece sola, con lo que quitarla
+    se vuelve imposible.
+
+    Vive aquí, y no dentro de la clase App, por dos razones: la GUI estaba
+    duplicando el formato de las entradas y la lista de estados protegidos
+    (dos sitios que tenían que cambiar a la vez sin que nada lo comprobara),
+    y App no se puede instanciar en un test, así que el escritor no tenía
+    NINGUNA cobertura -- solo la tenía el lector.
+
+    Devuelve True si ha escrito la marca, False si no hacía falta porque el
+    archivo ya tenía un estado protegido ("subido", "identificado_manual"...):
+    esos ya hacen que el watcher lo ignore y llevan información que no
+    conviene perder.
+    """
+    try:
+        with _DB_LOCK:
+            p = _processed_db_path()
+            db = {}
+            if p.exists():
+                try:
+                    db = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    db = {}
+            if db.get(path, {}).get("status", "") in _PROTECTED_STATUSES:
+                return False
+            db[path] = {"status": "descartado", "new_name": "", "ts": time.time()}
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+            _log.info("Descartado a mano desde la lista: %s", Path(path).name)
+            return True
+    except Exception:
+        _log.warning("No se pudo marcar como descartado: %s", path, exc_info=True)
+        return False
+
 STABLE_WAIT  = 6    # segundos esperando que el archivo deje de crecer
 DEFAULT_POLL = 10   # segundos entre escaneos (por defecto)
 
@@ -110,7 +150,8 @@ class AutoWatcher:
           tipos: "start" | "renamed" | "queued" | "uploading" | "uploaded" | "skip" | "error"
           kwargs: new_name, progress, speed, size (bytes, solo en "uploaded" --
           ver _save_history_entry, necesario para que el historial/las
-          estadísticas compartidas no cuenten esta subida como 0 B)
+          estadísticas compartidas no cuenten esta subida como 0 B),
+          remote_full (ruta completa en el servidor, solo en "uploaded")
         upload_slots: UploadSlotManager compartido con la subida manual de la
           GUI, para que "Subidas simultáneas" limite el total real entre
           ambos orígenes. Si no se pasa (uso standalone/tests), se crea uno
@@ -579,7 +620,12 @@ class AutoWatcher:
                 lang = self.config.get("language", "es-ES")
                 media_type = detected.get("media_type", "tv")
                 _log.debug("Buscando en TMDB: '%s' (tipo=%s, lang=%s)", detected["title"], media_type, lang)
-                results = self.tmdb.search_multi(detected["title"])
+                # media_type no era solo para el log: se le pasa a la
+                # búsqueda para que los resultados de ESE tipo vayan
+                # primero (ver TMDBClient.search_multi). Antes mandaba la
+                # popularidad y "Amadeus 1x05" se identificaba como la
+                # película "Amadeus (1984)".
+                results = self.tmdb.search_multi(detected["title"], prefer_type=media_type)
                 if not results:
                     # Intentar búsqueda específica
                     if media_type == "tv":
@@ -954,7 +1000,13 @@ class AutoWatcher:
         if ok3:
             _log.info("FTP upload OK: %s -> %s", new_name, remote_path)
             self.on_event("ok", f"✓ Subido: {new_name}")
-            self.on_file_event(key, "uploaded", new_name=new_name, size=local_size)
+            # remote_full: la ruta REAL en el servidor. Sin esto la GUI
+            # guardaba en el historial la ruta local en el campo "remote"
+            # (ver gui/app.py, evento "uploaded"), así que de 500 registros
+            # 241 no sabían dónde había quedado el archivo -- justo el dato
+            # que hace falta para poder ofrecer "borrar también del servidor".
+            self.on_file_event(key, "uploaded", new_name=new_name, size=local_size,
+                                remote_full=f"{remote_path}/{remote_filename}")
             _mark_both("subido", new_name=new_name)
             from core.media_server_refresh import trigger_refresh
             trigger_refresh(self.config)

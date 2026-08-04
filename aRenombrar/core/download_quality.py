@@ -21,8 +21,34 @@ from dataclasses import dataclass
 from core.amule_client import AmuleSearchResult
 
 
-_LANG_RE = re.compile(r"\b(?:spa|spanish|español|espanol|castellano)\b",
+_LANG_RE = re.compile(r"\b(?:spa|spanish|español|espanol|castellano|latino)\b",
                       re.IGNORECASE)
+# Porno explícito (XXX, porn...). Un resultado adulto NUNCA debe ser elegido
+# como mejor candidato ni descargarse automáticamente; se excluye en
+# best_result (is_adult_content) y, por si alguien usa score_download suelto,
+# puntúa 0 (no pasa el umbral MIN_BEST_SCORE). Palabras deliberadamente
+# inequívocas: no se incluyen "sex"/"adult"/"erotic" porque aparecen en
+# títulos legítimos (Sex and the City, Sex Education, Adult Swim...).
+_PORN_RE = re.compile(
+    r"\b(?:xxx|porn|porno|hardcore|milf|hentai|onlyfans|bondage|jav|"
+    r"creampie|gangbang|bigboobs|bigtits)\b", re.IGNORECASE)
+
+# Muestras/trailers NO son el capítulo completo: penalizan fuerte.
+_SAMPLE_RE = re.compile(r"\b(?:sample|muestra|preview|trailer|demo)\b",
+                        re.IGNORECASE)
+# Capturas de cine / screeners / encodes de baja calidad.
+_SCR_RE = re.compile(r"\b(?:cam|screener|dvdscr|telecine|telesync|hdtc)\b",
+                     re.IGNORECASE)
+# Versiones corregidas: premian (proper/repack corrigen un release malo).
+_PROPER_RE = re.compile(r"\b(?:proper|repack|repackage)\b", re.IGNORECASE)
+
+# Extensiones que NO son un vídeo (un ".emulecollection", un ".srt", un
+# ".nfo"... no se pueden bajar como capítulo). Penalizan fuerte.
+_NON_VIDEO_EXTS = {
+    "srt", "sub", "idx", "txt", "nfo", "jpg", "jpeg", "png", "gif",
+    "emulecollection", "cue", "md5", "sfv", "pdf", "epub", "log", "ini",
+    "db", "torrent", "magnet",
+}
 # Grupos/collectores conocidos que tienden a dar capítulos fiables (se
 # distingue "grupots" a propósito porque se ve en nombres reales de aMule).
 _GRUPOS_RE = re.compile(r"\b(?:grupots|lnd|dts|cifra|avs|x264|hevvc|x265)\b",
@@ -62,6 +88,35 @@ def _parse_season_episode(name: str):
     if season is None or episode is None:
         return None
     return int(season), int(episode)
+
+
+def is_adult_content(name: str) -> bool:
+    """True si el nombre delata contenido adulto/porno (XXX, porn, hentai...).
+    Ver _PORN_RE: se usan solo marcadores inequívocos para no descartar
+    títulos legítimos como "Sex Education" o "Adult Swim"."""
+    return bool(name and _PORN_RE.search(name))
+
+
+def _title_words(text: str) -> set:
+    """Palabras significativas (>=3 chars, sin números) de un título o
+    consulta, para comparar que la SERIE coincide (no solo la numeración)."""
+    words = set(re.findall(r"[a-zA-Z\u00C0-\u024F]{3,}", (text or "").lower()))
+    return words
+
+
+def _title_overlap(query: str, name: str) -> int:
+    """Palabras del título compartidas entre la consulta y el nombre. Cuenta
+    solo el solapamiento real de la serie: si la consulta es "Los Simpsons
+    2x04" y el nombre es "Los Simpsons 2x04 720p", devuelve 2 (los, simpsons).
+    Palabras genéricas del episodio (episode, capitulo, x264...) no cuentan
+    porque no están en la consulta."""
+    q = _title_words(query)
+    if not q:
+        return 0
+    n = _title_words(name)
+    if not n:
+        return 0
+    return len(q & n)
 
 
 def _ext(name: str) -> str:
@@ -115,6 +170,9 @@ def score_download(result: AmuleSearchResult,
     if result is None:
         return 0.0
     name = result.name or ""
+    # Porno nunca puntúa: no pasa el umbral y jamás se destaca/descarga.
+    if is_adult_content(name):
+        return 0.0
     score = 0.0
 
     # Coincidencia temporada/episodio con la consulta (ver _parse_season_episode).
@@ -132,6 +190,27 @@ def score_download(result: AmuleSearchResult,
                 # del "2x04 720p" pedido, porque solo se puntuaba por calidad).
                 score -= 40.0
 
+    # Coincidencia del TÍTULO de la serie con la consulta. Además de la
+    # numeración (arriba) se exige que el resultado sea de la MISMA serie:
+    # buscando "Los Simpsons 2x04", un "Padre de Familia 2x04 1080p" tiene la
+    # numeración correcta pero NO se quiere. Solo suma si la consulta trae
+    # palabras del título (con "2x04" a secas no hay nada que comparar).
+    overlap = _title_overlap(query, name)
+    if overlap >= 2:
+        score += 12.0
+    elif overlap == 1:
+        score += 5.0
+    elif _title_words(query) and name and overlap == 0:
+        # Consulta con título pero resultado de OTRA serie (o sin relación):
+        # es tan inútil como un capítulo de otra temporada, así que se resta
+        # igual de agresivo (-40). Sin esto, un "Padre de Familia 2x04 1080p"
+        # ganaba al "Los Simpsons 2x04 720p" pedido porque su numeración
+        # coincidía y el resto del score solo premiaba calidad. Riesgo real:
+        # un resultado que prescinde del nombre de la serie ("2x04 título")
+        # también se resta, pero en aMule los nombres suelen llevar la serie
+        # y ese -40 es mejor que elegir el capítulo equivocado.
+        score -= 40.0
+
     # Idioma/audio español
     if _LANG_RE.search(name):
         score += 18.0
@@ -145,6 +224,9 @@ def score_download(result: AmuleSearchResult,
     # Extensión / contenedor
     ext = _ext(name)
     score += _EXT_WEIGHTS.get(ext, 0)
+    # Una extensión no-video NO es un capítulo descargable.
+    if ext in _NON_VIDEO_EXTS:
+        score -= 25.0
 
     # Grupos/contenedores de confianza
     if _GRUPOS_RE.search(name):
@@ -158,6 +240,14 @@ def score_download(result: AmuleSearchResult,
     for word in _QUALITY_WORDS:
         if word in lower:
             score += 3
+
+    # Muestras/trailers/capturas de cine NO son el capítulo completo.
+    if _SAMPLE_RE.search(name):
+        score -= 15.0
+    if _SCR_RE.search(name):
+        score -= 10.0
+    if _PROPER_RE.search(name):
+        score += 4.0
 
     # Fuentes (más = más fiable)
     score += min(result.sources, 10) * 1.5
@@ -200,9 +290,14 @@ def best_result(results: list, query: str = "") -> AmuleSearchResult | None:
     pedido (ver score_download)."""
     if not results:
         return None
-    best = results[0]
+    # Los resultados porno se descartan SIEMPRE: ni como mejor candidato ni
+    # como "segundo mejor" (un XXX 4K no debe ganar jamás).
+    candidates = [r for r in results if not is_adult_content(r.name)]
+    if not candidates:
+        return None
+    best = candidates[0]
     best_score = score_download(best, query)
-    for r in results[1:]:
+    for r in candidates[1:]:
         s = score_download(r, query)
         if s > best_score:
             best, best_score = r, s
