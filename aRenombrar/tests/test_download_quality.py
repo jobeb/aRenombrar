@@ -175,3 +175,148 @@ def test_latino_audio_counts_as_spanish():
     plain = score_download(_r(1, "Serie S01E01 1080p"))
     lat = score_download(_r(1, "Serie S01E01 1080p latino"))
     assert lat > plain
+
+
+# ---- Catalán ----
+
+def test_catalan_never_wins_over_spanish():
+    """Un capítulo en catalán (aunque sea 1080p con muchas fuentes) no debe
+    ganar a uno en español -- el usuario no quiere nada en catalán."""
+    results = [
+        _r(1, "Los Simpsons 2x04 català 1080p", sources=50, complete=True),
+        _r(2, "Los Simpsons 2x04 castellano 720p", sources=3, complete=False),
+    ]
+    best = best_result(results, "Los Simpsons 2x04")
+    assert best is not None
+    assert best.number == 2
+
+
+def test_catalan_detected_variants():
+    for name in ("Serie S01E01 català.mkv",
+                 "Serie S01E01 catalan 720p.mkv",
+                 "Serie S01E01 Catalan 1080p.avi",
+                 "Serie S01E01 VOSC.mkv",
+                 "Serie S01E01 doblaje catalán.avi",
+                 "Serie S01E01 Cat.Subs.x264.mkv",
+                 "Serie S01E01 Catsubs 720p.mkv",
+                 "Serie S01E01 Cat-Subs.x264.mkv",
+                 "Serie S01E01 [Cat] 1080p.mkv",
+                 "Serie S01E01 (CAT) 1080p.mkv"):
+        cat = score_download(_r(1, name, sources=9, complete=True))
+        es = score_download(_r(1, "Serie S01E01 castellano.mkv", sources=3,
+                                complete=False))
+        assert cat < es, f"catalán no penalizado: {name}"
+
+
+def test_cat_token_alone_is_not_catalan():
+    """"cat" suelto no delata catalán (puede ser categoría, cat-1, etc.); solo
+    penalizan marcadores inequívocos (català/catalan/catala/vosc, Cat.Subs y
+    el tag [Cat]/(CAT))."""
+    assert score_download(_r(1, "Serie S01E01 cat 1080p.mkv")) >= 0
+    assert score_download(_r(1, "Serie S01E01 categoria.mkv")) >= 0
+    assert score_download(_r(1, "Serie S01E01 catwoman.mkv")) >= 0
+
+
+def test_catalan_with_spanish_still_loses():
+    """Incluso "castellano + català" (dual) se penaliza: el doblaje catalán no
+    es lo que el usuario quiere, no debe ganar a un release solo en español."""
+    cat_dual = score_download(_r(1, "Los Simpsons 2x04 castellano+català 1080p",
+                                  sources=30, complete=True), "Los Simpsons 2x04")
+    es_only = score_download(_r(2, "Los Simpsons 2x04 castellano 720p",
+                                 sources=3, complete=False), "Los Simpsons 2x04")
+    assert es_only > cat_dual
+
+
+def test_catalan_subtitle_release_never_wins_real_case():
+    """Caso real reportado: "Crímenes - 1x11.Per.que.matem.720p.WEB-DL.AAC2.0.
+    Cat.Subs.x264-Hera_72 (Crims).mkv" (en catalán) no debe ganar al release
+    en español aunque tenga mejores fuentes."""
+    cat = _r(1, "Crímenes - 1x11.Per.que.matem.720p.WEB-DL.AAC2.0.Cat.Subs.x264-Hera_72 (Crims).mkv",
+             size="500 MB", sources=30, complete=True)
+    es = _r(2, "Crímenes - 1x11.Capítulo once.castellano.720p.mkv",
+            size="500 MB", sources=3, complete=False)
+    assert best_result([cat, es], "Crímenes 1x11").number == 2
+
+
+# ---- V.O.S. / Italiano (priorizar castellano) ----
+
+def test_vos_never_wins_over_spanish_dub():
+    """Un V.O.S. (audio original + subtítulos, sin doblaje) en 4K con muchas
+    fuentes NO debe ganar a un capítulo doblado al castellano."""
+    results = [
+        _r(1, "Los Simpsons 2x04 2160p 4K VOSE", sources=50, complete=True),
+        _r(2, "Los Simpsons 2x04 castellano 720p", sources=3, complete=False),
+    ]
+    best = best_result(results, "Los Simpsons 2x04")
+    assert best is not None
+    assert best.number == 2
+
+
+def test_vos_detected_variants():
+    for name in ("Serie S01E01 VOS.mkv",
+                 "Serie S01E01 V.O.S. 1080p.mkv",
+                 "Serie S01E01 VOSE.mkv",
+                 "Serie S01E01 VOSE_ES 720p.mkv",
+                 "Serie S01E01 VOSI.mkv",
+                 "Serie S01E01 Versión original subtitulada.mkv",
+                 "Serie S01E01 version original.mkv",
+                 "Serie S01E01 V.O.S 1080p.mkv"):
+        vos = score_download(_r(1, name, sources=9, complete=True))
+        es = score_download(_r(1, "Serie S01E01 castellano.mkv", sources=3,
+                                complete=False))
+        assert vos < es, f"V.O.S. no penalizado: {name}"
+
+
+def test_italian_never_wins_over_spanish():
+    """Un release italiano (aunque sea 1080p con muchas fuentes) no debe ganar
+    a uno en castellano."""
+    results = [
+        _r(1, "Los Simpsons 2x04 ITA 1080p", sources=50, complete=True),
+        _r(2, "Los Simpsons 2x04 castellano 720p", sources=3, complete=False),
+    ]
+    best = best_result(results, "Los Simpsons 2x04")
+    assert best is not None
+    assert best.number == 2
+
+
+def test_italian_detected_variants():
+    for name in ("Serie S01E01 ITA.mkv",
+                 "Serie S01E01 Italiano 720p.mkv",
+                 "Serie S01E01 Italian 1080p.avi",
+                 "Serie S01E01 Italiana 720p.mkv"):
+        ita = score_download(_r(1, name, sources=9, complete=True))
+        es = score_download(_r(1, "Serie S01E01 castellano.mkv", sources=3,
+                                complete=False))
+        assert ita < es, f"italiano no penalizado: {name}"
+
+
+def test_vos_still_eligible_when_only_option():
+    """La penalización no EXCLUYE V.O.S. del todo (a diferencia del porno): si
+    solo hay un V.O.S. correcto del capítulo, sigue pudiendo elegirse y
+    pasar el umbral (best_result no devuelve None)."""
+    results = [_r(1, "Serie 2x04 VOSE 1080p WEB-DL x264.mkv", sources=9, complete=True)]
+    best = best_result(results, "Serie 2x04")
+    assert best is not None
+    assert best.number == 1
+
+
+def test_vos_and_ita_unrelated_words_not_penalized():
+    """"vos"/"ita" no deben falsear coincidencias casuales (palabras normales
+    del nombre no penalizadas)."""
+    plain = score_download(_r(1, "Serie S01E01 720p castellano.mkv"))
+    assert score_download(_r(1, "Serie S01E01 720p.mkv")) >= 0
+    assert plain > score_download(_r(1, "Serie S01E01 720p.mkv"))
+
+
+def test_resident_alien_real_case_es_with_ita_subs_loses_to_pure_english_spanish():
+    """Caso real reportado por el usuario, contra datos reales de aMule:
+    buscando "Resident Alien 4x04", el release [BRrip] con audio ENG-SPA pero
+    SUBÍTULOS en italiano (ITA) no debe recomendarse por delante de la copia
+    en inglés+castellano con subs. Ambos, en torno a 865 MB / 1080p."""
+    ita_subs = _r(1, "[BRrip] Resident Alien 4x04 - Truth Hurts (USA-2025) "
+                     "[1080P-H264-AC3 ENG-SPA] [ITA subbed MiMMo - ottimo] [HDitaly].mkv",
+                  size="865 MB", sources=1, complete=False)
+    es = _r(2, "Resident.Alien.4x04.La.verdad.duele.(Spanish.English.Subs)."
+               "WEBRip.1080p.x264-AC3.mkv",
+            size="865 MB", sources=1, complete=False)
+    assert best_result([ita_subs, es], "Resident Alien 4x04").number == 2

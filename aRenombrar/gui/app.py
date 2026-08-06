@@ -1071,6 +1071,13 @@ class App(_AppBase):
         self._status_bar_debounce_id = None   # ver _ftp_row_live
         self._upload_history: list = []   # historial de subidas en memoria
         self._history_lock = threading.Lock()   # evita carreras al escribir upload_history.json
+        # Las operaciones EC de aMule deben serializarse: aMule solo atiende
+        # UNA conexión/búsqueda EC a la vez y una nueva conexión cierra a la
+        # anterior. Sin este lock, pulsar los botones ⬇ de varios episodios
+        # seguidos hacía que solo se descargara el último (cada botón abría
+        # su EcClient y mataba la conexión del anterior). Ver
+        # _auto_download_episode_on_amule / _downloads_ensure_session.
+        self._amule_ec_lock = threading.Lock()
         # Cupo de subidas simultáneas COMPARTIDO entre la cola manual y el modo
         # automático — "Subidas simultáneas" en Ajustes limita el total real,
         # no cada origen por separado (ver core/upload_slots.py).
@@ -2139,7 +2146,6 @@ class App(_AppBase):
             self._watch_sync_top_frame.grid_remove()
             self._watch_sync_top_visible = False
         elif self._downloads_visible:
-            self._downloads_close_session()
             self._downloads_frame.grid_remove()
             self._downloads_visible = False
         elif self._stats_visible:
@@ -4392,6 +4398,7 @@ class App(_AppBase):
         # episodios completan cada uno en su propio momento).
         if changed and getattr(self, "_missing_ep_visible", False):
             self._missing_ep_results = self._load_missing_episodes_from_cache()
+            self._invalidate_missing_ep_complete_rows()   # la caché en disco acaba de cambiar
             self._render_missing_episodes_table(reset_page=False)
             self._update_missing_ep_status_text()
 
@@ -7710,13 +7717,23 @@ class App(_AppBase):
 
         right_fr = ctk.CTkFrame(header, fg_color="transparent")
         right_fr.grid(row=0, column=2, sticky="e")
-        # Los 3 interruptores recuerdan su estado entre reinicios (ver
+
+        # Los interruptores van en una SEGUNDA línea del encabezado, no al
+        # lado del buscador: medidos de verdad (winfo_reqwidth) los cuatro
+        # que ya había pedían 972 px que, con los botones de la izquierda y
+        # el título, no cabían ni en la ventana por defecto (1200) -- el
+        # buscador se salía por la derecha. Con el quinto ("Ocultar
+        # completas") serían 1150. En su propia fila caben los cinco con
+        # sitio de sobra.
+        filters_fr = ctk.CTkFrame(header, fg_color="transparent")
+        filters_fr.grid(row=1, column=0, columnspan=3, sticky="e", padx=(0, 8))
+        # Los interruptores recuerdan su estado entre reinicios (ver
         # DEFAULTS en config.py) -- cada uno persiste al cambiar de estado
         # (ver _on_toggle_missing_ep_switch), no solo al cerrar la app.
         self._missing_ep_show_ignored_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_show_ignored", False))
         self._missing_ep_show_ignored_switch = ctk.CTkSwitch(
-            right_fr, text="Mostrar ignoradas", variable=self._missing_ep_show_ignored_var,
+            filters_fr, text="Mostrar ignoradas", variable=self._missing_ep_show_ignored_var,
             command=lambda: self._on_toggle_missing_ep_switch(
                 "missing_ep_show_ignored", self._missing_ep_show_ignored_var,
                 self._render_missing_episodes_table))
@@ -7724,7 +7741,7 @@ class App(_AppBase):
         self._missing_ep_hide_ai_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_hide_ai_dismissed", False))
         self._missing_ep_hide_ai_switch = ctk.CTkSwitch(
-            right_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
+            filters_fr, text="Ocultar descartados por IA", variable=self._missing_ep_hide_ai_var,
             command=lambda: self._on_toggle_missing_ep_switch(
                 "missing_ep_hide_ai_dismissed", self._missing_ep_hide_ai_var,
                 self._render_missing_episodes_table))
@@ -7732,7 +7749,7 @@ class App(_AppBase):
         self._missing_ep_hide_no_dub_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_hide_no_dub", False))
         self._missing_ep_hide_no_dub_switch = ctk.CTkSwitch(
-            right_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
+            filters_fr, text="Ocultar sin doblaje ES", variable=self._missing_ep_hide_no_dub_var,
             command=lambda: self._on_toggle_missing_ep_switch(
                 "missing_ep_hide_no_dub", self._missing_ep_hide_no_dub_var,
                 self._on_toggle_hide_no_dub))
@@ -7744,11 +7761,25 @@ class App(_AppBase):
         self._missing_ep_pin_favorites_var = ctk.BooleanVar(
             value=self.config_data.get("missing_ep_pin_favorites", True))
         self._missing_ep_pin_favorites_switch = ctk.CTkSwitch(
-            right_fr, text="Favoritos/protegidos primero", variable=self._missing_ep_pin_favorites_var,
+            filters_fr, text="Favoritos/protegidos primero", variable=self._missing_ep_pin_favorites_var,
             command=lambda: self._on_toggle_missing_ep_switch(
                 "missing_ep_pin_favorites", self._missing_ep_pin_favorites_var,
                 self._render_missing_episodes_table))
         self._missing_ep_pin_favorites_switch.pack(side="right", padx=4, pady=8)
+        # "Ocultar completas" activado = comportamiento de siempre (la tabla
+        # solo lista series con huecos). Al apagarlo se añaden las series sin
+        # ningún hueco, para ver el catálogo entero del servidor -- esas
+        # filas NO están en self._missing_ep_results (el escaneo nunca las
+        # devuelve), se reconstruyen aparte desde la caché en disco, ver
+        # _load_complete_series_from_cache.
+        self._missing_ep_hide_complete_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_ep_hide_complete", True))
+        self._missing_ep_hide_complete_switch = ctk.CTkSwitch(
+            filters_fr, text="Ocultar completas", variable=self._missing_ep_hide_complete_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_ep_hide_complete", self._missing_ep_hide_complete_var,
+                self._on_toggle_hide_complete))
+        self._missing_ep_hide_complete_switch.pack(side="right", padx=4, pady=8)
         # El recuento de series ocultas se funde en el propio texto del
         # interruptor (ver _update_missing_ep_dub_hidden_counter) en vez de
         # una etiqueta aparte al lado -- esa ocupaba demasiado sitio.
@@ -7862,6 +7893,11 @@ class App(_AppBase):
         self._missing_ep_next_btn.pack(side="left")
 
         self._missing_ep_results = self._load_missing_episodes_from_cache()
+        # Series completas (sin hueco): None = todavía no calculadas. Solo
+        # se cargan si el usuario apaga "Ocultar completas", y se invalidan
+        # (vuelta a None) cada vez que la caché en disco puede haber
+        # cambiado -- ver _missing_ep_all_rows.
+        self._missing_ep_complete_rows = None
         from core.spanish_dub_cache import load_cache as _load_spanish_dub_cache
         self._spanish_dub_cache = _load_spanish_dub_cache()
         self._missing_ep_cancel_event = None
@@ -8053,7 +8089,34 @@ class App(_AppBase):
     def _load_missing_episodes_from_cache(self) -> list:
         """Al abrir la vista, mostrar lo que ya se sabía del último
         escaneo (persistido en disco) en vez de una tabla vacía hasta que
-        el usuario pulse "Comprobar" a mano."""
+        el usuario pulse "Comprobar" a mano. Solo series CON hueco (o con
+        temporadas que TMDB no conoce) -- las completas viven en una lista
+        aparte, ver _load_complete_series_from_cache."""
+        return self._rows_from_missing_ep_cache(complete=False)
+
+    def _load_complete_series_from_cache(self) -> list:
+        """Series del servidor SIN ningún hueco conocido -- las que el
+        escaneo nunca devuelve (ver _scan_missing_episodes: solo añade una
+        fila si faltan episodios o hay temporadas desconocidas), pero que
+        sí quedan guardadas en missing_episodes_cache.json con su
+        "missing" vacío. Es lo que alimenta el interruptor "Ocultar
+        completas": apagarlo convierte la pestaña en el catálogo entero de
+        series del servidor, no solo las incompletas. Se calcula bajo
+        demanda (solo si el interruptor está apagado, ver
+        _missing_ep_all_rows), no en cada arranque.
+
+        Ojo: es lo que hay EN LA CACHÉ, o sea las series que algún escaneo
+        llegó a mirar -- una serie sin tmdb_id emparejado en Jellyfin/Plex
+        nunca entra en la caché y tampoco aparecerá aquí."""
+        return self._rows_from_missing_ep_cache(complete=True)
+
+    def _rows_from_missing_ep_cache(self, complete: bool) -> list:
+        """Reconstruye filas de tabla desde missing_episodes_cache.json --
+        con complete=False las series con hueco (lo de siempre), con
+        complete=True justo las contrarias (sin hueco ni temporadas
+        desconocidas). Mismo formato de fila en ambos casos, para que todo
+        lo demás (orden, filtros, dibujado de la fila, panel lateral) las
+        trate igual sin distinguir."""
         from core.missing_episodes import format_missing_summary, apply_season_split_filter
         from core.missing_episodes_cache import load_cache
         cache = load_cache()
@@ -8063,7 +8126,7 @@ class App(_AppBase):
                 continue
             missing = {int(k): v for k, v in (entry.get("missing") or {}).items()}
             unknown_seasons = set(entry.get("unknown_seasons", []))
-            if not missing and not unknown_seasons:
+            if bool(missing or unknown_seasons) == complete:
                 continue
             name = entry.get("name", "")
             episode_titles = {int(s): {int(e): t for e, t in eps.items()}
@@ -8146,7 +8209,15 @@ class App(_AppBase):
         tiene sentido seguir listándola como "con episodios pendientes".
         Debe llamarse desde el hilo de la GUI."""
         from core.missing_episodes import remove_series
-        if not remove_series(self._missing_ep_results, tmdb_id):
+        removed = remove_series(self._missing_ep_results, tmdb_id)
+        # Con "Ocultar completas" apagado, la serie borrada puede ser una
+        # sin huecos: esa vive en la otra lista, y aun así hay que sacarla
+        # de la caché en disco (si no, reaparecería en el próximo repintado
+        # aunque ya no esté en el servidor).
+        if self._missing_ep_complete_rows is not None:
+            if remove_series(self._missing_ep_complete_rows, tmdb_id):
+                removed = True
+        if not removed:
             return
 
         from core.missing_episodes_cache import load_cache, save_cache, remove_series_from_cache
@@ -8269,6 +8340,10 @@ class App(_AppBase):
     def _finish_missing_episodes_scan(self, results: list):
         self._missing_ep_scanning = False
         self._missing_ep_results = results
+        # El escaneo acaba de reescribir missing_episodes_cache.json (series
+        # que se completaron, series nuevas del servidor...) -- la lista de
+        # completas se recalcula la próxima vez que haga falta.
+        self._invalidate_missing_ep_complete_rows()
         self._set_missing_ep_scanning_ui(False)
         self._update_missing_ep_status_text()
         self._render_missing_episodes_table()
@@ -8289,6 +8364,16 @@ class App(_AppBase):
         self.config_data.set(config_key, var.get())
         self.config_data.save()
         then()
+
+    def _on_toggle_hide_complete(self):
+        """Al apagar "Ocultar completas" hay que traer de la caché las
+        series sin hueco (no están en self._missing_ep_results) -- se hace
+        perezosamente en _missing_ep_all_rows; aquí solo se invalida lo que
+        hubiera cacheado de antes, por si la caché en disco cambió desde la
+        última vez que se miraron. Sin red ni escaneo: todo sale del mismo
+        missing_episodes_cache.json que ya se usa al arrancar."""
+        self._invalidate_missing_ep_complete_rows()
+        self._render_missing_episodes_table()
 
     def _on_toggle_hide_no_dub(self):
         """Al activar "Ocultar sin doblaje ES": si hay episodios pendientes
@@ -8535,6 +8620,13 @@ class App(_AppBase):
             text = "🎉 No falta ningún episodio" + (f" -- último escaneo {when}" if when else "")
         else:
             text = f"{len(pending)} serie(s) con episodios que faltan" + (f" -- último escaneo {when}" if when else "")
+        # Con "Ocultar completas" apagado la tabla tiene más filas de las
+        # que dice el recuento de arriba (que es solo de series con hueco)
+        # -- decir cuántas se han sumado evita que parezca un descuadre.
+        if not self._missing_ep_hide_complete_var.get():
+            n_complete = self._missing_ep_complete_count()
+            if n_complete:
+                text += f" -- mostrando además {n_complete} completa(s)"
         self._missing_ep_status_lbl.configure(text=text)
 
     _MISSING_EP_SEARCH_DEBOUNCE_MS = 200   # ver _on_missing_ep_search_key
@@ -8579,8 +8671,34 @@ class App(_AppBase):
         self._missing_ep_page = new_page
         self._missing_ep_render_page()
 
+    def _missing_ep_all_rows(self) -> list:
+        """Todas las filas candidatas ANTES de aplicar filtros: las series
+        con hueco (self._missing_ep_results, lo de siempre) y, solo con
+        "Ocultar completas" apagado, también las que no tienen ninguno
+        (ver _load_complete_series_from_cache). Las completas se cargan la
+        primera vez que hacen falta y se cachean hasta que algo pueda
+        haberlas cambiado (_invalidate_missing_ep_complete_rows).
+
+        Una serie que esté en las dos listas (p.ej. si el cruce con el FTP
+        dejó su hueco a cero en memoria y la caché ya se reescribió) se
+        cuenta una sola vez, con la fila viva de _missing_ep_results."""
+        if self._missing_ep_hide_complete_var.get():
+            return self._missing_ep_results
+        if self._missing_ep_complete_rows is None:
+            self._missing_ep_complete_rows = self._load_complete_series_from_cache()
+        known = {r["tmdb_id"] for r in self._missing_ep_results}
+        return self._missing_ep_results + [r for r in self._missing_ep_complete_rows
+                                            if r["tmdb_id"] not in known]
+
+    def _invalidate_missing_ep_complete_rows(self):
+        """La lista de series completas se recalcula desde la caché en
+        disco la próxima vez que se pinte la tabla -- tras un escaneo, una
+        sincronización desde el FTP o cualquier otra cosa que reescriba
+        missing_episodes_cache.json."""
+        self._missing_ep_complete_rows = None
+
     def _missing_ep_visible_rows(self) -> list:
-        rows = [row for row in (self._visible_missing_ep_row(r) for r in self._missing_ep_results)
+        rows = [row for row in (self._visible_missing_ep_row(r) for r in self._missing_ep_all_rows())
                 if row is not None]
         rows.sort(key=self._missing_ep_sort_key_fn(self._missing_ep_sort_key),
                   reverse=not self._missing_ep_sort_asc)
@@ -8659,7 +8777,7 @@ class App(_AppBase):
         self._update_missing_ep_switch_counters()
 
         if not sorted_rows:
-            if self._missing_ep_results:
+            if self._missing_ep_all_rows():
                 msg = "Sin resultados que coincidan con el filtro."
             else:
                 msg = "Pulsa \"🔍 Comprobar\" para buscar episodios que faltan."
@@ -8754,6 +8872,14 @@ class App(_AppBase):
         if hide_ai_dismissed and ai_dismissed:
             return None
 
+        # Serie completa (sin hueco ni temporadas desconocidas): solo se ve
+        # con "Ocultar completas" apagado, y los filtros que recortan
+        # r["missing"] (ignorados, doblaje) no le aplican -- no hay nada
+        # que recortar, y pasarla por ellos la escondería de rebote en
+        # cuanto uno de esos interruptores estuviera activo.
+        if not r["missing"] and not r.get("unknown_seasons"):
+            return None if self._missing_ep_hide_complete_var.get() else r
+
         missing = r["missing"]
         if not show_ignored and (r.get("ignored_seasons") or r.get("ignored_episodes")):
             missing = apply_ignored_filter(missing, r.get("ignored_seasons"), r.get("ignored_episodes"))
@@ -8826,7 +8952,7 @@ class App(_AppBase):
         interruptor está activo -- tiene sentido mostrarlo pase lo que
         pase (con el interruptor apagado, cuántas hay para revelar; con
         él encendido, cuántas se están mostrando ahora)."""
-        return sum(1 for r in self._missing_ep_results if r.get("ignored"))
+        return sum(1 for r in self._missing_ep_all_rows() if r.get("ignored"))
 
     def _update_missing_ep_switch_counters(self):
         """Funde el recuento de cada filtro en el propio texto de su
@@ -8843,6 +8969,24 @@ class App(_AppBase):
         n_dub = len(self._missing_ep_dub_hidden_rows())
         self._missing_ep_hide_no_dub_switch.configure(
             text=f"Ocultar {n_dub} sin doblaje ES" if n_dub else "Ocultar sin doblaje ES")
+
+        # Con el interruptor encendido (lo normal) esto cuenta series que
+        # NO están en memoria, así que hay que mirar la caché en disco --
+        # es justo el número que el usuario ganaría al apagarlo.
+        n_complete = self._missing_ep_complete_count()
+        self._missing_ep_hide_complete_switch.configure(
+            text=f"Ocultar {n_complete} completas" if n_complete else "Ocultar completas")
+
+    def _missing_ep_complete_count(self) -> int:
+        """Cuántas series completas hay ahora mismo en la caché. Con
+        "Ocultar completas" apagado ya están cargadas en memoria; con el
+        interruptor encendido se cuentan directamente sobre el JSON, sin
+        construir las filas (solo hace falta el número)."""
+        if self._missing_ep_complete_rows is not None:
+            return len(self._missing_ep_complete_rows)
+        from core.missing_episodes_cache import load_cache
+        return sum(1 for key, entry in load_cache().items()
+                   if key != "_meta" and not (entry.get("missing") or entry.get("unknown_seasons")))
 
     def _show_missing_ep_dub_hidden_dialog(self):
         hidden = self._missing_ep_dub_hidden_rows()
@@ -8953,8 +9097,13 @@ class App(_AppBase):
             summary = f"{n_missing} episodio{'s' if n_missing != 1 else ''}"
             if n_seasons > 1:
                 summary += f" ({n_seasons} temporadas)"
-        else:
+        elif r.get("unknown_seasons"):
             summary = "Posible ID equivocado"   # sin huecos, pero con temporadas que TMDB no conoce
+        else:
+            # Serie completa -- solo se ve con "Ocultar completas" apagado
+            # (ver _visible_missing_ep_row).
+            n_have = sum((r.get("server_season_counts") or {}).values())
+            summary = "Completa" + (f" ({n_have} episodios)" if n_have else "")
         if has_warning:
             summary += " ⚠"
         if ai_verdict:
@@ -8963,6 +9112,8 @@ class App(_AppBase):
             summary_color = PENDING_COLOR   # la IA lo descarta -- ya no hace falta el color de aviso
         elif has_warning:
             summary_color = WARNING_COLOR
+        elif not n_missing:
+            summary_color = SUCCESS_COLOR   # serie completa
         else:
             summary_color = PENDING_COLOR
         c = _cell("summary")
@@ -9194,6 +9345,20 @@ class App(_AppBase):
         # El veredicto de la IA (si lo hay) se muestra en el panel lateral,
         # debajo de la sinopsis de la serie -- ver
         # _update_missing_ep_ai_verdict_label -- no aquí, para no duplicarlo.
+
+        # Serie completa (solo visible con "Ocultar completas" apagado): el
+        # bucle de temporadas de abajo no pinta nada porque no hay ningún
+        # hueco -- sin esta línea, desplegarla abriría un bloque vacío que
+        # parece un fallo.
+        if not r["missing"] and not r.get("unknown_seasons"):
+            n_have = sum((r.get("server_season_counts") or {}).values())
+            n_seasons_have = len(r.get("server_season_counts") or {})
+            detalle = f" -- {n_have} episodios en {n_seasons_have} temporada(s)" if n_have else ""
+            ctk.CTkLabel(detail_fr,
+                         text=f"✓ No falta ningún episodio según TMDB{detalle}",
+                         font=ctk.CTkFont(size=11), text_color=SUCCESS_COLOR, anchor="w").grid(
+                row=next_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            next_row += 1
 
         import itertools
         season_font = self._missing_ep_season_font
@@ -9428,7 +9593,6 @@ class App(_AppBase):
         self._show_amule_search_results(filename, series_name)
 
     def _show_amule_search_results(self, filename: str, series_name: str):
-        self._downloads_close_session()
         self._show_view("downloads")
         self._downloads_search_var.set(filename)
         self._downloads_do_search()
@@ -9445,37 +9609,41 @@ class App(_AppBase):
             ec = None
             try:
                 self.after(0, lambda: button.configure(fg_color=ICON_DL_BUSY, state="disabled"))
-                ec = EcClient(
-                    host=self.config_data.get("amule_host", "localhost"),
-                    port=self.config_data.get("amule_port", 4712),
-                    password=self.config_data.get("amule_password", ""),
-                    timeout=10.0,
-                )
-                try:
-                    ec.connect()
-                except (EcConnectionError, EcAuthError, OSError):
-                    self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
-                    return
-                st = self.config_data.get("amule_search_type", "Kad")
-                best = None
-                # Se lee en vivo: aMule va llenando la lista; sondeo modesto
-                # (2s) y se termina en cuanto el mejor alcanza el umbral y no
-                # mejora en el siguiente sondeo, para que el botón vuelva a
-                # su color rápido (límite 30s por seguridad).
-                last = None
-                for results in ec.iter_search(
-                        query, search_type=st, poll_interval=2.0, max_duration=20.0):
-                    candidate = best_result(results, query) if results else None
-                    if candidate is not None:
-                        best = candidate
-                        if last is not None and best is last:
-                            break
-                        last = best
-                if best is None:
-                    self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
-                    return
-                ok, _ = ec.download(best)
-                self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_OK if ok else ICON_DL_FAIL))
+                # Serializa con el resto de operaciones EC (botones ⬇,
+                # autocompletado, pestaña Descargas): aMule solo soporta una
+                # conexión a la vez, y abrir otra mata la conexión en curso.
+                with self._amule_ec_lock:
+                    ec = EcClient(
+                        host=self.config_data.get("amule_host", "localhost"),
+                        port=self.config_data.get("amule_port", 4712),
+                        password=self.config_data.get("amule_password", ""),
+                        timeout=10.0,
+                    )
+                    try:
+                        ec.connect()
+                    except (EcConnectionError, EcAuthError, OSError):
+                        self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
+                        return
+                    st = self.config_data.get("amule_search_type", "Kad")
+                    best = None
+                    # Se lee en vivo: aMule va llenando la lista; sondeo modesto
+                    # (2s) y se termina en cuanto el mejor alcanza el umbral y no
+                    # mejora en el siguiente sondeo, para que el botón vuelva a
+                    # su color rápido (límite 30s por seguridad).
+                    last = None
+                    for results in ec.iter_search(
+                            query, search_type=st, poll_interval=2.0, max_duration=20.0):
+                        candidate = best_result(results, query) if results else None
+                        if candidate is not None:
+                            best = candidate
+                            if last is not None and best is last:
+                                break
+                            last = best
+                    if best is None:
+                        self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
+                        return
+                    ok, _ = ec.download(best)
+                    self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_OK if ok else ICON_DL_FAIL))
             except Exception:
                 self.after(0, lambda: self._dl_btn_reset(button, ICON_DL_FAIL))
             finally:
@@ -9718,25 +9886,28 @@ class App(_AppBase):
             timeout=10.0,
         )
         try:
-            try:
-                ec.connect()
-            except (EcConnectionError, EcAuthError, OSError):
-                return False, "aMule no disponible"
-            st = self.config_data.get("amule_search_type", "Kad")
-            best = None
-            last = None
-            for results in ec.iter_search(
-                    query, search_type=st, poll_interval=2.0, max_duration=20.0):
-                candidate = best_result(results, query) if results else None
-                if candidate is not None:
-                    best = candidate
-                    if last is not None and best is last:
-                        break
-                    last = best
-            if best is None:
-                return False, "sin candidato que cumpla el umbral"
-            ok, _raw = ec.download(best)
-            return (True, "") if ok else (False, "aMule rechazó la descarga")
+            # Mismo lock que los botones ⬇: aMule solo soporta una conexión
+            # EC a la vez, y una conexión nueva cierra la anterior.
+            with self._amule_ec_lock:
+                try:
+                    ec.connect()
+                except (EcConnectionError, EcAuthError, OSError):
+                    return False, "aMule no disponible"
+                st = self.config_data.get("amule_search_type", "Kad")
+                best = None
+                last = None
+                for results in ec.iter_search(
+                        query, search_type=st, poll_interval=2.0, max_duration=20.0):
+                    candidate = best_result(results, query) if results else None
+                    if candidate is not None:
+                        best = candidate
+                        if last is not None and best is last:
+                            break
+                        last = best
+                if best is None:
+                    return False, "sin candidato que cumpla el umbral"
+                ok, _raw = ec.download(best)
+                return (True, "") if ok else (False, "aMule rechazó la descarga")
         finally:
             try:
                 ec.close()
@@ -9861,27 +10032,18 @@ class App(_AppBase):
         # barra de scroll del CTkScrollableFrame cuando había muchos
         # resultados. Al cambiar el tamaño, se repinta la página actual.
         self._downloads_table.enable_dynamic_page_size(lambda _size: self._downloads_rebuild_page())
-        self._downloads_session = None
-        self._downloads_amule = None
         # Token de búsqueda en curso: cada búsqueda nueva lo incrementa y
         # el hilo de la anterior lo compara para pararse solo (ver
         # _downloads_perform_search) -- sin esto, lanzar una búsqueda
         # mientras otra sigue sondeando seguía actualizando la lista vieja.
         self._downloads_search_token = 0
 
-    def _downloads_close_session(self):
-        if self._downloads_session:
-            try:
-                self._downloads_session.close()
-            except Exception:
-                pass
-            self._downloads_session = None
-            self._downloads_amule = None
-
-    def _downloads_ensure_session(self) -> bool:
-        if self._downloads_session and self._downloads_session.is_alive():
-            return True
-        self._downloads_close_session()
+    def _downloads_open_ec(self):
+        """Abre UNA conexión EC nueva (no reutilizable: aMule solo soporta
+        una conexión a la vez y una nueva cierra la anterior, así que no se
+        mantiene sesión persistente entre operaciones). Devuelve el EcClient
+        conectado o None si aMule no responde. Debe llamarse bajo
+        self._amule_ec_lock."""
         ec = EcClient(
             host=self.config_data.get("amule_host", "localhost"),
             port=self.config_data.get("amule_port", 4712),
@@ -9891,9 +10053,26 @@ class App(_AppBase):
         try:
             ec.connect()
         except (EcConnectionError, EcAuthError, OSError):
+            try:
+                ec.close()
+            except Exception:
+                pass
+            return None
+        return ec
+
+    def _downloads_ensure_session(self) -> bool:
+        """Ya no mantiene sesión persistente: la conexión EC se abre y se
+        cierra dentro de cada operación (ver _downloads_perform_search y
+        _downloads_do_download_worker). Se conserva solo como check barato
+        de que aMule responde."""
+        with self._amule_ec_lock:
+            ec = self._downloads_open_ec()
+        if ec is None:
             return False
-        self._downloads_amule = ec
-        self._downloads_session = ec
+        try:
+            ec.close()
+        except Exception:
+            pass
         return True
 
     def _on_downloads_red_changed(self, value: str):
@@ -9948,28 +10127,40 @@ class App(_AppBase):
 
     def _downloads_perform_search(self, query: str, token: int):
         st = self._downloads_search_type_var.get()
-        if not self._downloads_ensure_session():
-            if token == self._downloads_search_token:
-                self.after(0, lambda: self._downloads_status_lbl.configure(
-                    text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
-                self.after(0, self._downloads_enable_search_controls)
-            return
         ft_label = self._downloads_file_type_var.get()
         ft = self._downloads_type_map.get(ft_label, "")
+        ec = None
         try:
-            # Sin espera fija: se sondea EC SEARCH_RESULTS cada pocos
-            # segundos y se va mostrando la lista acumulada en vivo (ver
-            # EcClient.iter_search). Si el usuario lanza otra búsqueda,
-            # este hilo se para solo en el siguiente sondeo.
-            for results in self._downloads_amule.iter_search(
-                    query, search_type=st, file_type=ft):
-                if token != self._downloads_search_token:
+            # aMule solo soporta una conexión EC a la vez: la búsqueda se
+            # hace bajo el lock compartido con los botones ⬇ y el
+            # autocompletado, y la conexión se cierra al terminar.
+            with self._amule_ec_lock:
+                ec = self._downloads_open_ec()
+                if ec is None:
+                    if token == self._downloads_search_token:
+                        self.after(0, lambda: self._downloads_status_lbl.configure(
+                            text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
+                        self.after(0, self._downloads_enable_search_controls)
                     return
-                self.after(0, lambda r=results: self._downloads_display_results(r, live=True))
+                # Sin espera fija: se sondea EC SEARCH_RESULTS cada pocos
+                # segundos y se va mostrando la lista acumulada en vivo (ver
+                # EcClient.iter_search). Si el usuario lanza otra búsqueda,
+                # este hilo se para solo en el siguiente sondeo.
+                for results in ec.iter_search(
+                        query, search_type=st, file_type=ft):
+                    if token != self._downloads_search_token:
+                        return
+                    self.after(0, lambda r=results: self._downloads_display_results(r, live=True))
         except Exception as e:
             if token == self._downloads_search_token:
                 self.after(0, lambda: self._downloads_status_lbl.configure(
                     text=f"Error: {e}", text_color=ERROR_COLOR))
+        finally:
+            if ec is not None:
+                try:
+                    ec.close()
+                except Exception:
+                    pass
         if token == self._downloads_search_token:
             self.after(0, self._downloads_finish_search)
 
@@ -9993,7 +10184,7 @@ class App(_AppBase):
 
     def _downloads_display_results(self, results: list, live: bool = False):
         """live=True viene de una búsqueda que aún sigue sondeando
-        (iter_search_in_session): se pinta la lista acumulada sin tocar el
+        (EcClient.iter_search): se pinta la lista acumulada sin tocar el
         estado de la búsqueda (el orden manual elegido, la página y el
         texto "Buscando..." se mantienen; el texto final lo pone
         _downloads_finish_search). live=False es la llamada clásica de una
@@ -10221,17 +10412,30 @@ class App(_AppBase):
                          args=(result_number,), daemon=True).start()
 
     def _downloads_do_download_worker(self, result_number: int):
-        if not self._downloads_session or not self._downloads_session.is_alive():
-            self.after(0, lambda: self._downloads_status_lbl.configure(
-                text="Error: sesión aMule cerrada", text_color=ERROR_COLOR))
-            return
         result = next((r for r in self._downloads_results if r.number == result_number), None)
         if result is None or not getattr(result, "_ec_hash", None):
             self.after(0, lambda: self._downloads_status_lbl.configure(
                 text=f"Error: resultado #{result_number} sin hash MD4 para descargar",
                 text_color=ERROR_COLOR))
             return
-        ok, raw = self._downloads_amule.download(result)
+        ok = False
+        raw = ""
+        try:
+            with self._amule_ec_lock:
+                ec = self._downloads_open_ec()
+                if ec is None:
+                    self.after(0, lambda: self._downloads_status_lbl.configure(
+                        text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
+                    return
+                try:
+                    ok, raw = ec.download(result)
+                finally:
+                    try:
+                        ec.close()
+                    except Exception:
+                        pass
+        except Exception:
+            ok, raw = False, ""
         def _update():
             if ok:
                 self._downloads_status_lbl.configure(
@@ -10824,7 +11028,10 @@ class App(_AppBase):
 
     def _toggle_missing_ep_ignore(self, tmdb_id, ignored: bool):
         self._set_missing_episode_ignored(tmdb_id, ignored)
-        for r in self._missing_ep_results:
+        # _missing_ep_all_rows (y no solo _missing_ep_results) porque con
+        # "Ocultar completas" apagado la fila puede ser una serie completa,
+        # que vive en la otra lista -- si no, su botón 🚫 no cambiaba.
+        for r in self._missing_ep_all_rows():
             if r["tmdb_id"] == tmdb_id:
                 r["ignored"] = ignored
         self._update_missing_ep_status_text()
@@ -11121,10 +11328,17 @@ class App(_AppBase):
             new_ids = {row["tmdb_id"] for row in results} | {tmdb_id}
             self._missing_ep_results = [r for r in self._missing_ep_results if r["tmdb_id"] not in new_ids]
             self._missing_ep_results.extend(results)
+            # El reescaneo reescribió la caché en disco: esta serie puede
+            # acabar de pasar a "completa" (o dejar de serlo).
+            self._invalidate_missing_ep_complete_rows()
             if results:
                 self._set_status(f"\"{name}\" actualizada", SUCCESS_COLOR)
             elif removed_reason:
                 self._set_status(f"\"{name}\" {removed_reason} -- se quitó de la lista", WARNING_COLOR)
+            elif not self._missing_ep_hide_complete_var.get():
+                # Con "Ocultar completas" apagado no se quita de la lista:
+                # sigue ahí, ahora como completa.
+                self._set_status(f"\"{name}\" ya no tiene huecos -- ahora figura como completa", SUCCESS_COLOR)
             else:
                 self._set_status(f"\"{name}\" ya no tiene huecos -- se quitó de la lista", SUCCESS_COLOR)
             self._render_missing_episodes_table(reset_page=False)

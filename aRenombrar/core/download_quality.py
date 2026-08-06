@@ -5,7 +5,9 @@ El primer resultado "ideal" no obliga a ordenar la tabla: solo se usa para
 pintar de un color distinto la fila del MEJOR candidato. Criterios que
 cuenta el score (de mayor a menor peso):
 
-  * Idioma/audio: español/castellano/spanish/spa (patrón "spa")
+  * Idioma/audio: español/castellano/spanish/spa (patrón "spa"); se
+    penaliza fuerte V.O.S. (original + subtítulos, sin doblaje), italiano y
+    catalán para que el castellano gane siempre que exista.
   * Calidad de imagen: 4K/2160p > 1080p > 720p > SD
   * Contenedor/flags de grupo notable: MKV > MP4 > AVI; 1xH26x, WEB-DL, HDTV
   * Fiabilidad: más fuentes (sources) y completo (broadcast completo)
@@ -23,6 +25,18 @@ from core.amule_client import AmuleSearchResult
 
 _LANG_RE = re.compile(r"\b(?:spa|spanish|español|espanol|castellano|latino)\b",
                       re.IGNORECASE)
+# Catalán: el usuario NO quiere nada en catalán, así que un release que lo
+# delate se penaliza fuerte para que jamás gane a uno en español. "cat" suelto
+# NO cuenta (aparece en "categoría", "cat-1", "Catwoman"...), pero sí:
+#   * el idioma por su nombre (català/catalan/catalá/catala),
+#   * vosc ("versió original subtitulada en català"),
+#   * "Cat.Subs" / "Catsubs" / "Cat-Subs" (subtítulos en catalán, patrón
+#     habitual en nombres de aMule, p.ej.
+#     "Crímenes - 1x11...Cat.Subs.x264-Hera_72 (Crims).mkv"),
+#   * el tag de idioma "[Cat]" / "(CAT)" del nombre.
+_CAT_RE = re.compile(
+    r"catal[àa]n?\b|vosc\b|cat(?:\.|_|-|\s)?subs?\b|\[cat\]|\(cat\)",
+    re.IGNORECASE)
 # Porno explícito (XXX, porn...). Un resultado adulto NUNCA debe ser elegido
 # como mejor candidato ni descargarse automáticamente; se excluye en
 # best_result (is_adult_content) y, por si alguien usa score_download suelto,
@@ -32,6 +46,19 @@ _LANG_RE = re.compile(r"\b(?:spa|spanish|español|espanol|castellano|latino)\b",
 _PORN_RE = re.compile(
     r"\b(?:xxx|porn|porno|hardcore|milf|hentai|onlyfans|bondage|jav|"
     r"creampie|gangbang|bigboobs|bigtits)\b", re.IGNORECASE)
+# V.O.S. / VOSE / VOSI / "versión original subtitulada": audio en el idioma
+# ORIGINAL con subtítulos, SIN doblaje en español. El usuario prioriza el
+# castellano, así que un release V.O.S. se penaliza fuerte para que el doblaje
+# gane siempre que exista (pero sin excluirlo del todo: si no hay release
+# doblado, sigue siendo un capítulo válido que puede pasar el umbral). "vosc"
+# (V.O.S. en catalán) ya lo penaliza _CAT_RE; este patrón también le cae
+# encima, sin problema.
+_VOS_RE = re.compile(
+    r"(?:v\.?o\.?s(?:e|i)?(?:[_-]?es)?\b|vers[ií]on\s+original(?:\s+subtitulad[oa])?\b)",
+    re.IGNORECASE)
+# Italiano (ITA/Italiano/Italiana): mismo tratamiento que V.O.S., el usuario
+# no lo quiere por delante del castellano.
+_ITA_RE = re.compile(r"\b(?:ita|italian|italiano|italiana)\b", re.IGNORECASE)
 
 # Muestras/trailers NO son el capítulo completo: penalizan fuerte.
 _SAMPLE_RE = re.compile(r"\b(?:sample|muestra|preview|trailer|demo)\b",
@@ -68,7 +95,7 @@ _EXT_WEIGHTS = {"mkv": 8, "mp4": 6, "avi": 4, "mov": 3, "divx": 2}
 # Subcadenas que delatan fuente WEB / retransmisión / encode (dan puntos).
 _SOURCE_HINTS = {"web", "web-dl", "webdl", "hdtv", "dvdrip", "bluray", "bdrip", "h264", "hevc", "x264", "x265"}
 
-_QUALITY_WORDS = {"prover", "vose", "vose_es"}
+_QUALITY_WORDS = {"prover"}
 
 # Extrae "temporada, episodio" de un nombre de archivo o de una consulta de
 # búsqueda, con el mismo esqueleto que EPISODE_PATTERNS de core/api_client.py
@@ -214,6 +241,21 @@ def score_download(result: AmuleSearchResult,
     # Idioma/audio español
     if _LANG_RE.search(name):
         score += 18.0
+    # Catalán: penalización fuerte. Un release catalán no debe ganar ni
+    # siquiera cuando suma el español ("castellano + català" en dual audio:
+    # el doblaje sigue siendo catalán, el usuario no lo quiere). Se resta
+    # más de lo que puede sumar calidad+fuentes+idioma para que nunca gane.
+    if _CAT_RE.search(name):
+        score -= 60.0
+    # V.O.S. (original + subtítulos, sin doblaje): penalización fuerte para
+    # que el doblaje en castellano gane siempre que exista, sin excluir el
+    # resultado del todo (si solo hay V.O.S., sigue siendo un capítulo válido
+    # y puede pasar el umbral).
+    if _VOS_RE.search(name):
+        score -= 60.0
+    # Italiano: mismo tratamiento que V.O.S., priorizar el castellano.
+    if _ITA_RE.search(name):
+        score -= 60.0
 
     # Resolución
     for rx, w in _RES_WEIGHTS:

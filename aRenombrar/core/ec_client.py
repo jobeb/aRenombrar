@@ -471,8 +471,8 @@ class EcClient:
                     file_type: str = "", poll_interval: float = 3.0,
                     max_duration: float = 60.0):
         """Lanza la búsqueda y va entregando la lista acumulada cada
-        poll_interval segundos (generador), igual que
-        AmuleClient.iter_search_in_session."""
+        poll_interval segundos (generador), igual que el viejo
+        AmuleClient.iter_search_in_session (amulecmd)."""
         import time as _time
         self.start_search(query, search_type=search_type, file_type=file_type)
         deadline = _time.monotonic() + max_duration

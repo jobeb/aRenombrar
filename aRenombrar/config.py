@@ -206,6 +206,12 @@ DEFAULTS = {
     "missing_ep_hide_ai_dismissed": False,
     "missing_ep_hide_no_dub": False,
     "missing_ep_pin_favorites": True,
+    # "Ocultar completas": activado de fábrica (comportamiento de siempre --
+    # la tabla solo lista series con huecos). Al apagarlo se añaden a la
+    # lista las series del servidor que NO tienen ningún hueco, sacadas de
+    # missing_episodes_cache.json (ver App._load_complete_series_from_cache),
+    # para poder usar la pestaña como catálogo completo del servidor.
+    "missing_ep_hide_complete": True,
     # Autocompletado por serie (pestaña "Episodios que faltan", botón "auto"
     # de cada fila): lista de tmdb_id (str) con el autocompletado ACTIVO --
     # la app busca en aMule y descarga los capítulos que faltan solos y de
