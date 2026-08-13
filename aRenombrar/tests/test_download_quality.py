@@ -1,4 +1,5 @@
-from core.download_quality import score_download, best_result, is_adult_content
+from core.download_quality import (score_download, best_result, is_adult_content,
+                                   is_italian_only)
 from core.amule_client import AmuleSearchResult as R
 
 
@@ -320,3 +321,43 @@ def test_resident_alien_real_case_es_with_ita_subs_loses_to_pure_english_spanish
                "WEBRip.1080p.x264-AC3.mkv",
             size="865 MB", sources=1, complete=False)
     assert best_result([ita_subs, es], "Resident Alien 4x04").number == 2
+
+
+def test_italian_only_never_downloaded_even_when_only_option():
+    """Caso real: buscando "Star Trek Strange New Worlds 4x04" solo aparece un
+    release italiano (sin ningún español). No debe descargarse nada (best_result
+    devuelve None), en vez de bajar el italiano porque "pasa el umbral"."""
+    ita = _r(1, "Star.Trek.Strange.New.Worlds.4x04.Un.Caso.Di.Chiaroscuro."
+                "ITA.AMZN.WEB-DLRip.x264-UBi.mkv",
+             size="536 MB", sources=1, complete=False)
+    assert is_italian_only(ita.name)
+    assert score_download(ita, "Star Trek Strange New Worlds 4x04") < 15.0
+    assert best_result([ita], "Star Trek Strange New Worlds 4x04") is None
+
+
+def test_italian_detected_from_title_without_ita_token():
+    """Un nombre sin token ITA pero con título traducido al italiano (>=2
+    palabras-función inequívocas) también se considera solo-italiano."""
+    name = "Star.Trek.Strange.New.Worlds.4x04.Una.Storia.Di.Guerra.mkv"
+    assert is_italian_only(name)
+    assert best_result([_r(1, name)], "Star Trek Strange New Worlds 4x04") is None
+
+
+def test_italian_with_spanish_audio_stays_eligible():
+    """Un release con audio español + subs en italiano (ENG-SPA + ITA subbed)
+    NO es "solo italiano": se mantiene como candidato de emergencia (penalizado,
+    pero elegible si no hay otra cosa en español)."""
+    name = "[BRrip] Resident Alien 4x04 - Truth Hurts (USA-2025) " \
+           "[1080P-H264-AC3 ENG-SPA] [ITA subbed MiMMo - ottimo] [HDitaly].mkv"
+    assert not is_italian_only(name)
+    r = _r(1, name, size="865 MB", sources=1, complete=False)
+    assert best_result([r], "Resident Alien 4x04") is not None
+
+
+def test_spanish_title_words_not_flagged_as_italian():
+    """El castellano no debe caer en los marcadores de título italiano
+    (palabras sueltas como "la"/"un"/"de" compartidas no bastan: se exigen >=2
+    marcadores inequívocos y ausencia de rastro de español)."""
+    assert not is_italian_only("Serie 4x04 La verdad duele 720p castellano.mkv")
+    assert not is_italian_only("Serie 4x04 Un nuevo comienzo español.mkv")
+    assert not is_italian_only("Serie 4x04 El día de la bestia español.mkv")

@@ -15,6 +15,7 @@ import pytest
 
 from core.ec_client import (
     EC_OP_SEARCH_RESULTS,
+    EC_OP_STRINGS,
     EC_TAG_PARTFILE_HASH,
     EC_TAG_PARTFILE_NAME,
     EC_TAG_PARTFILE_SIZE_FULL,
@@ -145,3 +146,66 @@ def test_missing_hash_means_download_refused():
     ok, err = client.download(result)
     assert ok is False
     assert "hash" in err
+
+
+class _MultiSocket:
+    """Socket fake que entrega una cola de paquetes en orden (recv respeta el
+    tamaño pedido, para que _recv_exact lea cabecera y cuerpo por separado)."""
+
+    def __init__(self, packets):
+        self._queue = list(packets)
+        self._saw_recv = 0
+
+    def recv(self, n):
+        self._saw_recv += 1
+        while self._queue:
+            packet = self._queue[0]
+            chunk = packet[:n]
+            if len(packet) > n:
+                self._queue[0] = packet[n:]
+            else:
+                self._queue.pop(0)
+            if chunk:
+                return chunk
+        return b""
+
+    def sendall(self, data):
+        return None
+
+
+def test_iter_search_wake_event_skips_the_first_wait(monkeypatch):
+    """wake_event=Event() ya puesto despierta el primer sondeo de inmediato:
+    iter_search entrega su primer lote SIN esperar el poll_interval (lo que
+    permite enviar una descarga pendiente por la misma conexión al instante).
+    Sin wake_event sí se espera el intervalo antes del primer lote."""
+    import threading
+    import core.ec_client as mod
+    file_tag = _searchfile_tag(number=1, name="Serie S01E01 720p.mkv")
+    # ack de SEARCH_START + un lote de resultados por cada get_results()
+    ack = _make_packet(EC_OP_STRINGS, [])
+    batch = _make_packet(EC_OP_SEARCH_RESULTS, [file_tag])
+
+    slept = []
+    now = [0.0]
+    monkeypatch.setattr(mod._time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(mod._time, "monotonic", lambda: now[0])
+
+    # Sin wake_event: antes del primer lote se duerme poll_interval.
+    client = EcClient("127.0.0.1", 4712, "pw", sock=_MultiSocket([ack, batch]))
+    client._connected = True
+    it = iter(client.iter_search("X", poll_interval=5.0, max_duration=100.0))
+    first = next(it)
+    assert [r.name for r in first] == ["Serie S01E01 720p.mkv"]
+    assert slept and slept[0] == pytest.approx(5.0)
+
+    # Con wake_event ya puesto: el primer lote sale sin dormir.
+    slept.clear()
+    client2 = EcClient("127.0.0.1", 4712, "pw", sock=_MultiSocket([ack, batch]))
+    client2._connected = True
+    wake = threading.Event()
+    wake.set()
+    it2 = iter(client2.iter_search("X", poll_interval=5.0, max_duration=100.0,
+                                   wake_event=wake))
+    first2 = next(it2)
+    assert [r.name for r in first2] == ["Serie S01E01 720p.mkv"]
+    assert not slept

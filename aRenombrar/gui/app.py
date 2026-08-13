@@ -99,9 +99,6 @@ ICON_DL_IDLE   = ("#2980B9", "#155a8a")   # botón de descarga en reposo
 ICON_DL_BUSY   = ("#E67E22", "#b85c12")   # búsqueda + descarga en segundo plano
 ICON_DL_OK     = ("#27AE60", "#147a3d")   # descarga lanzada a aMule con éxito
 ICON_DL_FAIL   = ("#C0392B", "#8a1f16")   # no se encontró/como lanzado
-# Botón "⚡" de autocompletado por serie (pestaña Episodios que faltan): se
-# pinta del color de marca cuando el autocompletado está ACTIVO para la serie.
-ICON_AUTO_ON   = ("#2980B9", "#155a8a")
 CONTAINER_GAP = 8   # separación estándar entre contenedores principales de la UI
 QUEUED_COLOR  = "#3498db"
 SELECTED_ROW_COLOR = ("#c8e6d0", "#204a34")   # (modo claro, modo oscuro) — fila seleccionada
@@ -1078,6 +1075,16 @@ class App(_AppBase):
         # su EcClient y mataba la conexión del anterior). Ver
         # _auto_download_episode_on_amule / _downloads_ensure_session.
         self._amule_ec_lock = threading.Lock()
+        # Mientras la pestaña Descargas tiene una BÚSQUEDA abierta, la conexión
+        # EC en curso es la única que aMule admite: las descargas que el usuario
+        # pida durante la búsqueda se envían por ESA misma conexión entre
+        # sondeos, sin esperar a que la búsqueda termine (ver
+        # _downloads_perform_search / _downloads_do_download_worker). Este
+        # lock protege la cola de descargas pendientes y el flag.
+        self._downloads_jobs_lock = threading.Lock()
+        self._downloads_pending_jobs = []
+        self._downloads_search_active = False
+        self._downloads_wake = threading.Event()
         # Cupo de subidas simultáneas COMPARTIDO entre la cola manual y el modo
         # automático — "Subidas simultáneas" en Ajustes limita el total real,
         # no cada origen por separado (ver core/upload_slots.py).
@@ -7821,6 +7828,7 @@ class App(_AppBase):
         # tabla; ver el mismo arreglo en _build_files_tab.
         self._missing_ep_name_font = ctk.CTkFont(size=13, weight="bold")
         self._missing_ep_summary_font = ctk.CTkFont(size=11)
+        self._missing_ep_icon_font = ctk.CTkFont(size=16)   # iconos de los botones 🚫/↻/🗑 (estilo unificado)
         self._missing_ep_detail_font = ctk.CTkFont(size=11)         # lista de episodios al desplegar
         self._missing_ep_season_font = ctk.CTkFont(size=12, weight="bold")   # cabecera de cada temporada
 
@@ -7835,13 +7843,13 @@ class App(_AppBase):
             ColumnSpec("logo", "", width=28),
             ColumnSpec("fav", "", width=28),
             ColumnSpec("lock", "", width=28),
+            ColumnSpec("auto", "", width=28),
             ColumnSpec("name", "Serie", expand=True, resizable=True, sortable=True),
             ColumnSpec("premiere", "Estreno", width=80, sortable=True),
             ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100,
                        sortable=True),
             ColumnSpec("trending", "Tendencia", width=70, sortable=True),
-            ColumnSpec("ignore", "", width=90),
-            ColumnSpec("auto", "", width=36),
+            ColumnSpec("ignore", "", width=36),
             ColumnSpec("rescan", "", width=36),
             ColumnSpec("delete", "", width=36),
         ], header_right_pad=30)   # ver TableView.__init__ -- medido a mano contra esta tabla en concreto
@@ -7903,9 +7911,11 @@ class App(_AppBase):
         self._missing_ep_cancel_event = None
         self._missing_ep_scanning = False
         self._missing_ep_row_widgets = {}
-        self._missing_ep_auto_widgets = {}   # tmdb_id -> botón "⚡" de autocompletado (ver _build_missing_ep_row)
+        self._missing_ep_auto_widgets = {}   # tmdb_id -> etiqueta "⚡" de autocompletado (ver _build_missing_ep_row)
         self._missing_ep_auto_worker = None
         self._missing_ep_auto_busy = set()   # tmdb_ids en proceso (anti-duplicado, ver _auto_complete_series_single)
+        self._missing_ep_auto_countdown_lbls = {}   # tmdb_id -> label "⏳" de cuenta atrás del reintento (ver _build_missing_ep_detail_frame)
+        self._missing_ep_auto_countdown_after = None   # id del after() del ticker de cuenta atrás
         self._missing_ep_page = 0
         self._missing_ep_selected_tmdb_id = None   # serie pulsada, ver _show_missing_ep_poster
         self._missing_ep_expanded = set()   # tmdb_ids con la fila desplegada
@@ -9075,6 +9085,20 @@ class App(_AppBase):
         lock_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["name"]:
                        self._toggle_missing_ep_reservation(tid, name))
 
+        # Autocompletar (⚡): igual que ★/🔒 -- CTkLabel + bind (rendimiento
+        # con ~500 series cacheadas), sin marco, y CAMBIA DE COLOR al estar
+        # activado (acento mientras está puesto, gris en reposo).
+        auto_active = self._is_missing_ep_auto_enabled(tmdb_id)
+        c = _cell("auto")
+        auto_btn = ctk.CTkLabel(
+            c, text="⚡", cursor="hand2",
+            text_color=ACCENT if auto_active else PENDING_COLOR)
+        auto_btn.pack(fill="both", expand=True)
+        auto_btn.bind("<Button-1>", lambda ev, tid=tmdb_id:
+                      self._toggle_missing_ep_auto_complete(tid))
+        attach_tooltip(auto_btn, lambda tid=tmdb_id: self._auto_btn_tooltip(tid))
+        self._missing_ep_auto_widgets[tmdb_id] = auto_btn
+
         name_color = PENDING_COLOR if r.get("ignored") else None
         c = _cell("name")
         name_lbl = ctk.CTkLabel(c, text=r["name"], font=self._missing_ep_name_font,
@@ -9132,7 +9156,10 @@ class App(_AppBase):
         is_ignored = r.get("ignored")
         c = _cell("ignore")
         ignore_series_btn = ctk.CTkButton(c, text="🚫" if not is_ignored else "↺",
-                      fg_color=ICON_IGNORE if not is_ignored else ICON_RESTORE,
+                      height=24, font=self._missing_ep_icon_font,
+                      fg_color="transparent", border_width=1,
+                      text_color=ICON_IGNORE if not is_ignored else ICON_RESTORE,
+                      hover_color=("gray88", "#2b2b2b"),
                       command=lambda tid=tmdb_id, ig=not is_ignored:
                       self._toggle_missing_ep_ignore(tid, ig))
         attach_tooltip(ignore_series_btn, lambda:
@@ -9140,26 +9167,15 @@ class App(_AppBase):
                        else "Restaurar serie (volver a contarla como faltante)")
         ignore_series_btn.pack(fill="both", expand=True)
 
-        auto_active = self._is_missing_ep_auto_enabled(tmdb_id)
-        c = _cell("auto")
-        auto_btn = ctk.CTkButton(
-            c, text="⚡", height=24,
-            fg_color=ICON_AUTO_ON if auto_active else "transparent",
-            border_width=1,
-            command=lambda tid=tmdb_id: self._toggle_missing_ep_auto_complete(tid))
-        attach_tooltip(auto_btn, lambda tid=tmdb_id: (
-            "Autocompletar ACTIVO: la app busca y descarga sola los capítulos que "
-            "faltan de esta serie, también los nuevos que vayan saliendo. Pulsa para "
-            "desactivar." if self._is_missing_ep_auto_enabled(tid)
-            else "Activar autocompletado: busca y descarga los capítulos que faltan de "
-                 "esta serie de forma autónoma y persistente (los nuevos que salgan "
-                 "también los añade)."))
-        auto_btn.pack(fill="both", expand=True)
-        self._missing_ep_auto_widgets[tmdb_id] = auto_btn
-
+        # "↻" en vez de "🔄": el emoji U+1F504 renderiza con un recuadro
+        # visible en este sistema (mismo artefacto de fuente que ▼/▶, ver
+        # arriba el comentario del triángulo de expansión) y duplicaba el
+        # marco del propio botón. U+21BB es un glifo de texto plano.
         c = _cell("rescan")
-        rescan_btn = ctk.CTkButton(c, text="🔄", height=24,
+        rescan_btn = ctk.CTkButton(c, text="↻", height=24,
+                      font=self._missing_ep_icon_font,
                       fg_color="transparent", border_width=1,
+                      hover_color=("gray88", "#2b2b2b"),
                       command=lambda row=r: self._rescan_single_missing_ep_series(row))
         rescan_btn.pack(fill="both", expand=True)
 
@@ -9167,7 +9183,7 @@ class App(_AppBase):
         # nada que ver con los sashes -- se conserva a mano, col_padx()
         # solo modela el margen IZQUIERDO de cada columna.
         c = _cell("delete", padx=(self._missing_ep_table.col_padx("delete")[0], 12))
-        ctk.CTkButton(c, text="🗑", height=24,
+        ctk.CTkButton(c, text="🗑", height=24, font=self._missing_ep_icon_font,
                       fg_color="transparent", border_width=1,
                       text_color=ERROR_COLOR, hover_color=("gray85", "#3d1010"),
                       command=lambda row=r: self._confirm_delete_missing_ep_series(row)
@@ -9342,6 +9358,21 @@ class App(_AppBase):
                 row=next_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
             next_row += 1
 
+        tmdb_id = r["tmdb_id"]
+        # Cuenta atrás del reintento automático (solo con autocompletado
+        # ACTIVO): vive aquí, en el detalle desplegable de la fila, porque es
+        # donde el usuario mira qué capítulos faltan -- no en la fila (las
+        # etiquetas de esa fila usan grid columnas fijas y no hay hueco). Se
+        # actualiza cada segundo con _update_missing_ep_auto_countdown.
+        if self._is_missing_ep_auto_enabled(tmdb_id):
+            countdown_lbl = ctk.CTkLabel(
+                detail_fr, text="", font=ctk.CTkFont(size=10), text_color=ACCENT,
+                anchor="w")
+            countdown_lbl.grid(row=next_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            next_row += 1
+            self._missing_ep_auto_countdown_lbls[tmdb_id] = countdown_lbl
+            self._update_missing_ep_auto_countdown(tmdb_id)
+
         # El veredicto de la IA (si lo hay) se muestra en el panel lateral,
         # debajo de la sinopsis de la serie -- ver
         # _update_missing_ep_ai_verdict_label -- no aquí, para no duplicarlo.
@@ -9363,7 +9394,6 @@ class App(_AppBase):
         import itertools
         season_font = self._missing_ep_season_font
         season_links = self.config_data.get("custom_links_season", [])
-        tmdb_id = r["tmdb_id"]
         lines_by_season = itertools.groupby(self._missing_episode_lines(r), key=lambda t: t[0])
 
         for season, lines in lines_by_season:
@@ -9679,6 +9709,16 @@ class App(_AppBase):
     # retardo inicial tras arrancar la app.
     _AUTO_COMPLETE_INTERVAL = 30 * 60
     _AUTO_COMPLETE_STARTUP_DELAY = 45
+    # Reintento con espera CRECIENTE (backoff exponencial) de episodios que
+    # fallaron: tras el intento nº n, la siguiente pasada se reintenta pasados
+    # _AUTO_RETRY_BASE_S * FACTOR**(n-1) segundos (30 min, 1 h, 2 h, 4 h...),
+    # con tope MAX. Así un capítulo que aún no está bien indexado en Kad se
+    # vuelve a probar cada vez más espaciado en vez de quedarse en "checked"
+    # para siempre (real: 3x08 de La casa del dragón se probó una vez sin
+    # candidato y nunca volvió a intentarse, aunque el release apareció luego).
+    _AUTO_RETRY_BASE_S = 30 * 60
+    _AUTO_RETRY_FACTOR = 2
+    _AUTO_RETRY_MAX_S = 7 * 24 * 3600
 
     def _auto_complete_series(self) -> set:
         """Sets de tmdb_id (str) con el autocompletado activo."""
@@ -9688,7 +9728,8 @@ class App(_AppBase):
         return str(tmdb_id) in self._auto_complete_series()
 
     def _auto_checked_map(self) -> dict:
-        """{tmdb_id_str: {season: [ep, ...]}} de episodios ya probados."""
+        """{tmdb_id_str: {season: [ep, ...]}} de episodios ya resueltos
+        (descargados y/o subidos al servidor): no se reintentan."""
         return dict(self.config_data.get("missing_ep_auto_checked") or {})
 
     def _set_auto_checked_episode(self, tmdb_id: int, season: int, episode: int):
@@ -9698,6 +9739,135 @@ class App(_AppBase):
         if episode not in entry[str(season)]:
             entry[str(season)].append(episode)
             self.config_data.set("missing_ep_auto_checked", checked)
+
+    def _unset_auto_checked_episode(self, tmdb_id: int, season: int, episode: int):
+        """Quita un episodio del mapa checked -- se usa al migrar entradas
+        legacy (probadas una vez sin backoff) al mapa de reintentos."""
+        checked = self._auto_checked_map()
+        entry = checked.get(str(tmdb_id))
+        if entry:
+            eps = entry.get(str(season))
+            if eps and episode in eps:
+                eps.remove(episode)
+                if not eps:
+                    entry.pop(str(season), None)
+            self.config_data.set("missing_ep_auto_checked", checked)
+
+    def _auto_retry_map(self) -> dict:
+        """{tmdb_id_str: {season: {ep: {"tries": int, "ts": epoch}}}} de BOCHES
+        fallidos (no había candidato en aMule): se reintentan con espera
+        creciente (ver _AUTO_RETRY_*). "tries" = nº de intentos ya hechos,
+        "ts" = época del último."""
+        return dict(self.config_data.get("missing_ep_auto_retries") or {})
+
+    def _set_auto_retry_episode(self, tmdb_id: int, season: int, episode: int):
+        retries = self._auto_retry_map()
+        eps = retries.setdefault(str(tmdb_id), {}).setdefault(str(season), {})
+        prev = eps.get(str(episode)) or {"tries": 0}
+        eps[str(episode)] = {"tries": int(prev["tries"]) + 1, "ts": int(_time.time())}
+        self.config_data.set("missing_ep_auto_retries", retries)
+
+    def _clear_auto_retry_episode(self, tmdb_id: int, season: int, episode: int):
+        retries = self._auto_retry_map()
+        entry = retries.get(str(tmdb_id))
+        if entry:
+            eps = entry.get(str(season))
+            if eps:
+                eps.pop(str(episode), None)
+                if not eps:
+                    entry.pop(str(season), None)
+            self.config_data.set("missing_ep_auto_retries", retries)
+
+    def _auto_retry_wait_for(self, tries: int) -> float:
+        """Segundos de espera para un episodio con *tries* intentos fallidos
+        (backoff exponencial, tope _AUTO_RETRY_MAX_S)."""
+        return min(self._AUTO_RETRY_BASE_S * (self._AUTO_RETRY_FACTOR ** (tries - 1)),
+                   self._AUTO_RETRY_MAX_S)
+
+    def _auto_series_next_retry_at(self, tmdb_id: int) -> tuple | None:
+        """Calcula cuándo se podrá volver a intentar el primer capítulo de la
+        serie que esté en espera de reintento: devuelve (epoch de la próxima
+        pasada en que toque, tries del episodio) o None si la serie no tiene
+        NINGÚN reintento pendiente ni capítulo que reintentar. Se usa para la
+        cuenta atrás del botón ⚡ / detalle de la fila."""
+        retries = (self._auto_retry_map().get(str(tmdb_id)) or {})
+        now = _time.time()
+        best = None
+        best_tries = None
+        for _season, eps in retries.items():
+            for ep, rec in eps.items():
+                tries = int(rec.get("tries", 1))
+                wait = self._auto_retry_wait_for(tries)
+                at = int(rec.get("ts", 0)) + wait
+                if at < now:
+                    at = now   # ya tocaba: se reintenta en la próxima pasada inmediata
+                if best is None or at < best:
+                    best = at
+                    best_tries = tries
+        if best is not None:
+            return best, best_tries
+        return None
+
+    @staticmethod
+    def _auto_countdown_text(at_epoch: float | None) -> str:
+        """Texto breve de cuenta atrás para el botón ⚡ / detalle: cuánto
+        falta hasta la próxima oportunidad de reintento (la pasada del worker
+        que coincide), o "max 30 min" si ya toca (el worker pasa cada 30 min)."""
+        if at_epoch is None:
+            return ""
+        remaining = at_epoch - _time.time()
+        if remaining <= 0:
+            return "reintento en la próxima pasada (max 30 min)"
+        total = int(remaining)
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"próximo reintento en {h} h {m} min"
+        if m:
+            return f"próximo reintento en {m} min {s} s"
+        return f"próximo reintento en {s} s"
+
+    def _auto_btn_tooltip(self, tid: int) -> str:
+        base = ("Autocompletar ACTIVO: la app busca y descarga sola los capítulos que "
+                "faltan de esta serie, también los nuevos que vayan saliendo. Pulsa para "
+                "desactivar." if self._is_missing_ep_auto_enabled(tid)
+                else "Activar autocompletado: busca y descarga los capítulos que faltan de "
+                     "esta serie de forma autónoma y persistente (los nuevos que salgan "
+                     "también los añade).")
+        if self._is_missing_ep_auto_enabled(tid):
+            nxt = self._auto_series_next_retry_at(tid)
+            if nxt is not None:
+                base += "\n\n⏳ " + self._auto_countdown_text(nxt[0])
+        return base
+
+    def _update_missing_ep_auto_countdown(self, tmdb_id: int):
+        """Ticker (after 1000 ms) de la etiqueta de cuenta atrás del detalle
+        de una serie: actualiza el texto y reprograma la siguiente actualización
+        mientras la etiqueta (y la fila) sigan existiendo."""
+        lbl = self._missing_ep_auto_countdown_lbls.get(tmdb_id)
+        if lbl is None:
+            return
+        try:
+            if not lbl.winfo_exists():
+                # Si la entrada del dict ya apunta a OTRO label (fila
+                # reconstruida), no tocar el nuevo: solo se limpia cuando
+                # sigue siendo este mismo widget.
+                if self._missing_ep_auto_countdown_lbls.get(tmdb_id) is lbl:
+                    self._missing_ep_auto_countdown_lbls.pop(tmdb_id, None)
+                return
+            nxt = self._auto_series_next_retry_at(tmdb_id)
+            if nxt is not None:
+                text = "⏳ " + self._auto_countdown_text(nxt[0])
+            else:
+                text = "⏳ Sin reintentos pendientes: se probará en la próxima pasada habitual"
+            lbl.configure(text=text)
+        except Exception:
+            _log.exception("Autocompletado: fallo al actualizar la cuenta atrás de %s", tmdb_id)
+            return
+        try:
+            lbl.after(1000, lambda: self._update_missing_ep_auto_countdown(tmdb_id))
+        except Exception:
+            pass
 
     def _toggle_missing_ep_auto_complete(self, tmdb_id: int):
         """Interruptor del botón "⚡" de una fila: activa/desactiva el
@@ -9713,6 +9883,15 @@ class App(_AppBase):
         self.config_data.set("missing_ep_auto_complete", sorted(series))
         self.config_data.save()
         self._refresh_missing_ep_auto_button(tmdb_id, new_state)
+        if not new_state:
+            # Quitar la cuenta atrás del detalle de la serie si estaba puesta
+            # (desactivar el autocompletado la deja sin sentido).
+            lbl = self._missing_ep_auto_countdown_lbls.pop(tmdb_id, None)
+            if lbl is not None:
+                try:
+                    lbl.destroy()
+                except Exception:
+                    pass
         name = ""
         row = self._missing_ep_results and next(
             (r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
@@ -9729,7 +9908,7 @@ class App(_AppBase):
     def _refresh_missing_ep_auto_button(self, tmdb_id: int, active: bool):
         btn = self._missing_ep_auto_widgets.get(tmdb_id)
         if btn is not None:
-            btn.configure(fg_color=ICON_AUTO_ON if active else "transparent")
+            btn.configure(text_color=ACCENT if active else PENDING_COLOR)
 
     def _start_missing_ep_auto_worker(self):
         """Hilo daemon que recorre las series con autocompletado: arranca al
@@ -9823,13 +10002,34 @@ class App(_AppBase):
 
         checked = (self._auto_checked_map().get(str(tmdb_id)) or {})
         checked_seasons = {int(s): set(eps) for s, eps in checked.items()}
+        retries = (self._auto_retry_map().get(str(tmdb_id)) or {})
+        now = _time.time()
 
         # Header de capítulos faltantes que de verdad hay que intentar.
         pending = []
         for season in sorted(fresh.get("missing", {})):
             for ep in fresh["missing"][season]:
+                # Migración de marcados "checked" legacy: el formato antiguo
+                # anotaba aquí TAMBIÉN los intentos fallidos (no distinguía
+                # éxito de fracaso). Si un episodio sigue faltando, ese
+                # intento fue un fracaso -- se quita de checked y cae como
+                # pendiente ya mismo (los releases que aparecieron mientras
+                # tanto se cogen en esta pasada; los futuros fallos sí llevan
+                # backoff).
                 if ep in checked_seasons.get(season, set()):
-                    continue   # ya probado (descargado o sin candidato) en una pasada anterior
+                    self._unset_auto_checked_episode(tmdb_id, season, ep)
+                # Reintento retrasado: si el episodio ya se intentó y falló
+                # (sin candidato en aMule), esperar a que toque según el
+                # backoff antes de volver a golpear Kad (los capítulos que aún
+                # no están indexados aparecen con el tiempo; reintentar cada
+                # 30 min en bucle no sirve y castiga la red).
+                rec = retries.get(str(season), {}).get(str(ep))
+                if rec is not None:
+                    tries = int(rec.get("tries", 1))
+                    wait = min(self._AUTO_RETRY_BASE_S * (self._AUTO_RETRY_FACTOR ** (tries - 1)),
+                               self._AUTO_RETRY_MAX_S)
+                    if now - int(rec.get("ts", 0)) < wait:
+                        continue   # aún no toca reintentarlo
                 pending.append((season, ep))
 
         # Guardia rápida local: que no esté ya en upload_history (aunque el
@@ -9842,6 +10042,7 @@ class App(_AppBase):
         for season, episode in pending:
             if self._auto_episode_in_history(history_remote_paths, series_name, season, episode):
                 self._set_auto_checked_episode(tmdb_id, season, episode)
+                self._clear_auto_retry_episode(tmdb_id, season, episode)
                 continue
             to_download.append((season, episode))
 
@@ -9857,10 +10058,18 @@ class App(_AppBase):
             # temporada×episodio, el título no hace falta.
             query = f"{series_name} {season}x{episode:02d}"
             ok, why = self._auto_amule_download_series(query)
-            self._set_auto_checked_episode(tmdb_id, season, episode)
             if ok:
+                # Éxito: queda "checked" (no se vuelve a reintentar) y se
+                # borra cualquier reintento previo.
+                self._set_auto_checked_episode(tmdb_id, season, episode)
+                self._clear_auto_retry_episode(tmdb_id, season, episode)
                 _log.info("Autocompletado: descarga lanzada para '%s'", query)
             else:
+                # Fallo (sin candidato, aMule caído...): NO se marca checked.
+                # Se registra en el mapa de reintentos con backoff exponencial
+                # para volver a probarlo en pasadas futuras, cada vez más
+                # espaciado (ver _AUTO_RETRY_*).
+                self._set_auto_retry_episode(tmdb_id, season, episode)
                 _log.info("Autocompletado: '%s' no se pudo descargar (%s)", query, why)
 
     def _auto_episode_in_history(self, history_remote_paths: set, series_name: str,
@@ -10097,6 +10306,13 @@ class App(_AppBase):
         self._on_downloads_red_changed(st)
         self._downloads_search_token += 1
         token = self._downloads_search_token
+        # Una búsqueda nueva VACÍA la lista anterior de inmediato (no cuando
+        # llegue el primer sondeo con datos): no se debe seguir viendo los
+        # resultados de la búsqueda previa mientras la nueva arranca (la
+        # conexión EC puede tardar en devolver el primer lote).
+        self._downloads_results = []
+        self._downloads_page = 0
+        self._downloads_rebuild_page()
         self._downloads_status_lbl.configure(
             text=f'Buscando "{query}" en {st}... (los resultados se actualizan solos, hasta 1 minuto)',
             text_color=PENDING_COLOR)
@@ -10142,15 +10358,38 @@ class App(_AppBase):
                             text="Error: no se pudo conectar con aMule", text_color=ERROR_COLOR))
                         self.after(0, self._downloads_enable_search_controls)
                     return
-                # Sin espera fija: se sondea EC SEARCH_RESULTS cada pocos
-                # segundos y se va mostrando la lista acumulada en vivo (ver
-                # EcClient.iter_search). Si el usuario lanza otra búsqueda,
-                # este hilo se para solo en el siguiente sondeo.
-                for results in ec.iter_search(
-                        query, search_type=st, file_type=ft):
-                    if token != self._downloads_search_token:
-                        return
-                    self.after(0, lambda r=results: self._downloads_display_results(r, live=True))
+                # Mientras esta búsqueda tiene la conexión, las descargas que
+                # el usuario pida se atienden por ESTA misma conexión entre
+                # sondeos (ver _downloads_drain_jobs), en vez de esperar a que
+                # la búsqueda termine y abrir otra conexión.
+                self._downloads_search_active = True
+                self._downloads_wake.clear()
+                try:
+                    # Se sondea EC SEARCH_RESULTS cada pocos segundos y se va
+                    # mostrando la lista acumulada en vivo (ver
+                    # EcClient.iter_search). Si el usuario lanza otra búsqueda,
+                    # este hilo se para solo en el siguiente sondeo. El
+                    # wake_event permite despertar el sondeo en cuanto llega
+                    # una descarga pendiente, para enviarla sin esperar el
+                    # intervalo.
+                    for results in ec.iter_search(
+                            query, search_type=st, file_type=ft,
+                            wake_event=self._downloads_wake):
+                        if token != self._downloads_search_token:
+                            return
+                        self._downloads_drain_jobs(ec)
+                        self.after(0, lambda r=results: self._downloads_display_results(r, live=True))
+                    # La búsqueda terminó su tiempo: atender lo que quedase.
+                    self._downloads_drain_jobs(ec)
+                finally:
+                    # Libera el flag y falla las descargas pendientes que no se
+                    # llegaron a enviar, para que sus hilos despierten y
+                    # reintenten por su cuenta (ver _downloads_do_download_worker).
+                    with self._downloads_jobs_lock:
+                        self._downloads_search_active = False
+                        for job in self._downloads_pending_jobs:
+                            if job["ok"] is None:
+                                job["done"].set()
         except Exception as e:
             if token == self._downloads_search_token:
                 self.after(0, lambda: self._downloads_status_lbl.configure(
@@ -10163,6 +10402,29 @@ class App(_AppBase):
                     pass
         if token == self._downloads_search_token:
             self.after(0, self._downloads_finish_search)
+
+    def _downloads_drain_jobs(self, ec):
+        """Envía por la conexión EC *ec* (la de la búsqueda en curso) las
+        descargas pendientes que haya pedido el usuario. Solo lo llama el
+        hilo de la búsqueda: aMule admite una sola conexión EC, así que la
+        descarga se hace por la misma conexión entre sondeos en vez de abrir
+        otra (que mataría la búsqueda)."""
+        with self._downloads_jobs_lock:
+            jobs = list(self._downloads_pending_jobs)
+        for job in jobs:
+            if job["ok"] is not None:
+                continue
+            try:
+                ok, raw = ec.download(job["result"])
+            except Exception as e:
+                ok, raw = False, str(e)
+            job["ok"], job["raw"] = ok, raw
+            job["done"].set()
+            with self._downloads_jobs_lock:
+                try:
+                    self._downloads_pending_jobs.remove(job)
+                except ValueError:
+                    pass
 
     def _downloads_enable_search_controls(self):
         self._downloads_type_menu.configure(state="normal")
@@ -10418,6 +10680,32 @@ class App(_AppBase):
                 text=f"Error: resultado #{result_number} sin hash MD4 para descargar",
                 text_color=ERROR_COLOR))
             return
+        # Si hay una BÚSQUEDA abierta, aMule solo admite esa conexión EC: la
+        # descarga se encola y la envía el hilo de la búsqueda por la misma
+        # conexión entre sondeos (ver _downloads_drain_jobs), sin esperar a
+        # que la búsqueda finalice. Si no hay búsqueda, se abre conexión propia
+        # bajo el lock compartido.
+        with self._downloads_jobs_lock:
+            search_active = self._downloads_search_active
+            if search_active:
+                job = {"result": result, "ok": None, "raw": "", "done": threading.Event()}
+                self._downloads_pending_jobs.append(job)
+                self._downloads_wake.set()
+        if search_active:
+            # Se espera a que el hilo de la búsqueda lo envíe (despierto al
+            # instante por el wake_event). Si la búsqueda termina sin llegar a
+            # atenderlo, su finally despierta el job con ok=None y aquí se
+            # reintenta con conexión propia.
+            job["done"].wait(timeout=45)
+            if job["ok"] is None:
+                self._downloads_do_download_direct(result, result_number)
+                return
+            ok, raw = job["ok"], job["raw"]
+            self._downloads_report_download(result_number, ok, raw)
+            return
+        self._downloads_do_download_direct(result, result_number)
+
+    def _downloads_do_download_direct(self, result, result_number: int):
         ok = False
         raw = ""
         try:
@@ -10436,17 +10724,18 @@ class App(_AppBase):
                         pass
         except Exception:
             ok, raw = False, ""
-        def _update():
-            if ok:
-                self._downloads_status_lbl.configure(
-                    text=f"Descarga #{result_number} enviada a aMule (revísalo en la cola de aMule)",
-                    text_color=SUCCESS_COLOR)
-            else:
-                debug = f" (raw: {raw[:200]})" if raw else ""
-                self._downloads_status_lbl.configure(
-                    text=f"Error al iniciar descarga #{result_number}.{debug}",
-                    text_color=ERROR_COLOR)
-        self.after(0, _update)
+        self._downloads_report_download(result_number, ok, raw)
+
+    def _downloads_report_download(self, result_number: int, ok: bool, raw: str):
+        if ok:
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text=f"Descarga #{result_number} enviada a aMule (revísalo en la cola de aMule)",
+                text_color=SUCCESS_COLOR))
+        else:
+            debug = f" (raw: {raw[:200]})" if raw else ""
+            self.after(0, lambda: self._downloads_status_lbl.configure(
+                text=f"Error al iniciar descarga #{result_number}.{debug}",
+                text_color=ERROR_COLOR))
 
     def _toggle_missing_ep_expand(self, tmdb_id):
         if tmdb_id in self._missing_ep_expanded:
@@ -11345,7 +11634,7 @@ class App(_AppBase):
         else:
             widgets = self._missing_ep_row_widgets.get(tmdb_id)
             if widgets and widgets.get("rescan_btn"):
-                widgets["rescan_btn"].configure(state="normal", text="🔄")
+                widgets["rescan_btn"].configure(state="normal", text="↻")
 
     def _confirm_delete_missing_ep_series(self, r: dict):
         if not self.config_data.get("ftp_host", ""):

@@ -221,12 +221,17 @@ DEFAULTS = {
     # episodio/serie se guarda en missing_ep_auto_checked (ver abajo).
     "missing_ep_auto_complete": [],
     # {tmdb_id_str: {season: [ep, ...]}} -- episodios de series con
-    # autocompletado que ya se intentaron descargar en una pasada anterior
-    # (o que ya estaban en el servidor). Sirve para no volver a golpear aMule
-    # con el mismo capítulo en cada ciclo de 30 min mientras no cambie nada:
-    # un capítulo marcado aquí no se reintenta hasta que se quite la entrada
-    # (se limpia solo cuando la serie deja de faltar o se desactiva el auto).
+    # autocompletado que YA ESTÁN RESUELTOS (descarga lanzada y/o subidos al
+    # servidor): no se vuelven a intentar. Los intentos FALLIDOS no van aquí,
+    # van a missing_ep_auto_retries (backoff exponencial, ver app.py).
     "missing_ep_auto_checked": {},
+    # {tmdb_id_str: {season: {ep: {"tries": int, "ts": epoch}}}} -- episodios
+    # que se intentaron y fallaron (p.ej. sin candidato en aMule). Se
+    # reintentan automáticamente con espera CRECIENTE (backoff exponencial:
+    # 30 min, 1 h, 2 h, 4 h...) hasta que haya candidato, la serie deje de
+    # faltar o se desactive el autocompletado. "tries" = nº de intentos ya
+    # hechos, "ts" = época del último.
+    "missing_ep_auto_retries": {},
     "auto_watcher_running": False,
     # aMule para buscar y descargar episodios que faltan -- host/puerto/
     # contraseña del External Connections de aMule (Preferencias -> Control

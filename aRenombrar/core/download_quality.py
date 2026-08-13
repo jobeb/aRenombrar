@@ -7,7 +7,9 @@ cuenta el score (de mayor a menor peso):
 
   * Idioma/audio: español/castellano/spanish/spa (patrón "spa"); se
     penaliza fuerte V.O.S. (original + subtítulos, sin doblaje), italiano y
-    catalán para que el castellano gane siempre que exista.
+    catalán para que el castellano gane siempre que exista. El italiano SIN
+    español se excluye por completo (is_italian_only), igual que el porno:
+    si lo único disponible es italiano, no se descarga nada.
   * Calidad de imagen: 4K/2160p > 1080p > 720p > SD
   * Contenedor/flags de grupo notable: MKV > MP4 > AVI; 1xH26x, WEB-DL, HDTV
   * Fiabilidad: más fuentes (sources) y completo (broadcast completo)
@@ -56,9 +58,21 @@ _PORN_RE = re.compile(
 _VOS_RE = re.compile(
     r"(?:v\.?o\.?s(?:e|i)?(?:[_-]?es)?\b|vers[ií]on\s+original(?:\s+subtitulad[oa])?\b)",
     re.IGNORECASE)
-# Italiano (ITA/Italiano/Italiana): mismo tratamiento que V.O.S., el usuario
-# no lo quiere por delante del castellano.
+# Italiano (ITA/Italiano/Italiana): ver is_italian_only() -- si el release es
+# italiano y no trae NINGÚN rastro de español, se EXCLUYE (como el porno); si
+# además lleva español (dual ENG-SPA, "Spanish subs"...), solo se penaliza.
 _ITA_RE = re.compile(r"\b(?:ita|italian|italiano|italiana)\b", re.IGNORECASE)
+# Marcadores de TÍTULO en italiano (palabras-función y lexemas inequívocos,
+# ausentes del castellano/inglés) por si el nombre no lleva el token ITA pero
+# el título está traducido al italiano (p.ej. "Un Caso Di Chiaroscuro"). Se
+# exigen >=2 para no falsear con palabras sueltas compartidas ("la", "un"...).
+_ITA_TITLE_RE = re.compile(
+    r"\b(?:il|lo|gli|le|di|del|della|dello|dei|delle|degli|nel|nella|nello|"
+    r"nei|negli|sul|sulla|sullo|sui|sulle|dal|dalla|dai|dalle|dagli|"
+    r"sempre|dopo|perche|perché|senza|dove|quando|tutto|tutta|tutti|tutte|"
+    r"niente|nulla|troppo|ancora|adesso|davvero|amore|morte|notte|giorno|"
+    r"storia|famiglia|fratelli|uomini|donne|ragazzi|bambini|signore|grazie|"
+    r"ecco|avanti|basta|ciao)\b", re.IGNORECASE)
 
 # Muestras/trailers NO son el capítulo completo: penalizan fuerte.
 _SAMPLE_RE = re.compile(r"\b(?:sample|muestra|preview|trailer|demo)\b",
@@ -122,6 +136,25 @@ def is_adult_content(name: str) -> bool:
     Ver _PORN_RE: se usan solo marcadores inequívocos para no descartar
     títulos legítimos como "Sex Education" o "Adult Swim"."""
     return bool(name and _PORN_RE.search(name))
+
+
+def is_italian_only(name: str) -> bool:
+    """True si el resultado es italiano SIN rastro de español: se excluye
+    SIEMPRE de best_result (el usuario no quiere descargas en italiano, ni
+    siquiera cuando no hay ningún release en español). NO excluye los releases
+    que además traen español (dual "ENG-SPA", "Spanish subs"...): esos solo se
+    penalizan (-60) y siguen siendo un candidato válido de emergencia."""
+    if not name:
+        return False
+    # Hay rastro de español (audio o subs): no es "solo italiano".
+    if _LANG_RE.search(name):
+        return False
+    # Marcador explícito ITA/Italiano...
+    if _ITA_RE.search(name):
+        return True
+    # ...o título traducido al italiano (>=2 palabras-función inequívocas):
+    # cubre nombres que no llevan el token ITA pero sí el título en italiano.
+    return len(_ITA_TITLE_RE.findall(name)) >= 2
 
 
 def _title_words(text: str) -> set:
@@ -199,6 +232,9 @@ def score_download(result: AmuleSearchResult,
     name = result.name or ""
     # Porno nunca puntúa: no pasa el umbral y jamás se destaca/descarga.
     if is_adult_content(name):
+        return 0.0
+    # Italiano sin español tampoco (ver is_italian_only).
+    if is_italian_only(name):
         return 0.0
     score = 0.0
 
@@ -333,8 +369,12 @@ def best_result(results: list, query: str = "") -> AmuleSearchResult | None:
     if not results:
         return None
     # Los resultados porno se descartan SIEMPRE: ni como mejor candidato ni
-    # como "segundo mejor" (un XXX 4K no debe ganar jamás).
-    candidates = [r for r in results if not is_adult_content(r.name)]
+    # como "segundo mejor" (un XXX 4K no debe ganar jamás). El italiano SIN
+    # español también (is_italian_only): si lo único que hay es italiano, no
+    # se destaca/descarga nada.
+    candidates = [r for r in results
+                  if not is_adult_content(r.name)
+                  and not is_italian_only(r.name)]
     if not candidates:
         return None
     best = candidates[0]

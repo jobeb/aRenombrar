@@ -54,6 +54,8 @@ Se mantiene el mismo contrato de datos que core/amule_client.py
 import hashlib
 import socket
 import struct
+import threading
+import time as _time
 from typing import List, Optional, Tuple
 
 from core.amule_client import AmuleSearchResult
@@ -469,18 +471,28 @@ class EcClient:
 
     def iter_search(self, query: str, search_type: str = "Kad",
                     file_type: str = "", poll_interval: float = 3.0,
-                    max_duration: float = 60.0):
+                    max_duration: float = 60.0, wake_event: "threading.Event | None" = None):
         """Lanza la búsqueda y va entregando la lista acumulada cada
         poll_interval segundos (generador), igual que el viejo
-        AmuleClient.iter_search_in_session (amulecmd)."""
-        import time as _time
+        AmuleClient.iter_search_in_session (amulecmd).
+
+        *wake_event*: si se pasa, la espera entre sondeos usa
+        event.wait(poll_interval) en vez de sleep, de modo que quien llame
+        puede interrumpir la pausa (set()) para procesar algo sobre la MISMA
+        conexión EC (p.ej. una descarga por hash) sin esperar el intervalo."""
+        if wake_event is not None and not isinstance(wake_event, threading.Event):
+            raise TypeError("wake_event debe ser un threading.Event")
         self.start_search(query, search_type=search_type, file_type=file_type)
         deadline = _time.monotonic() + max_duration
         while True:
             remaining = deadline - _time.monotonic()
             if remaining <= 0:
                 return
-            _time.sleep(min(poll_interval, remaining))
+            if wake_event is not None:
+                wake_event.wait(min(poll_interval, remaining))
+                wake_event.clear()
+            else:
+                _time.sleep(min(poll_interval, remaining))
             yield self.get_results()
 
     # ---- Parseo de resultados ----
