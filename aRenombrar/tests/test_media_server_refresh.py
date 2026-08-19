@@ -417,6 +417,7 @@ def test_get_jellyfin_usage_stats_parses_movies_and_series(monkeypatch):
         {
             "Id": "movie1", "Name": "Pelicula Vista", "Type": "Movie",
             "ProviderIds": {"Tmdb": "111"}, "DateCreated": "2023-01-01T00:00:00Z",
+            "ProductionYear": 2020,
             "UserData": {"Played": True, "PlayCount": 2, "LastPlayedDate": "2024-03-01T00:00:00Z"},
         },
         {
@@ -449,6 +450,8 @@ def test_get_jellyfin_usage_stats_parses_movies_and_series(monkeypatch):
     assert stats["movie1"]["play_count"] == 2
     assert stats["movie1"]["tmdb_id"] == 111
     assert stats["movie1"]["media_type"] == "movie"
+    assert stats["movie1"]["year"] == "2020"
+    assert stats["series1"]["year"] == ""   # payload sin ProductionYear
     assert stats["movie2"]["fully_watched"] is False
     assert stats["series1"]["fully_watched"] is True   # UnplayedItemCount == 0
     assert stats["series1"]["media_type"] == "tv"
@@ -554,13 +557,15 @@ def test_get_plex_usage_stats_parses_movies_and_shows(monkeypatch):
     ]}}
     shows_payload = {"MediaContainer": {"Metadata": [
         {"ratingKey": "s1", "title": "Serie Completa", "leafCount": 10, "viewedLeafCount": 10,
-         "lastViewedAt": 1700000000, "addedAt": 1600000000, "Guid": [{"id": "tmdb://333"}]},
+         "lastViewedAt": 1700000000, "addedAt": 1600000000, "Guid": [{"id": "tmdb://333"}],
+         "year": 2015},
         {"ratingKey": "s2", "title": "Serie A Medias", "leafCount": 10, "viewedLeafCount": 4,
          "addedAt": 1600000000},
     ]}}
     movies_payload = {"MediaContainer": {"Metadata": [
         {"ratingKey": "m1", "title": "Pelicula Vista", "viewCount": 3,
-         "lastViewedAt": 1700000000, "addedAt": 1600000000, "Guid": [{"id": "tmdb://111"}]},
+         "lastViewedAt": 1700000000, "addedAt": 1600000000, "Guid": [{"id": "tmdb://111"}],
+         "year": 2021},
         {"ratingKey": "m2", "title": "Pelicula Sin Ver", "viewCount": 0, "addedAt": 1600000000},
     ]}}
 
@@ -577,9 +582,12 @@ def test_get_plex_usage_stats_parses_movies_and_shows(monkeypatch):
     assert stats["s1"]["fully_watched"] is True
     assert stats["s1"]["media_type"] == "tv"
     assert stats["s1"]["tmdb_id"] == 333
+    assert stats["s1"]["year"] == "2015"
     assert stats["s2"]["fully_watched"] is False
     assert stats["m1"]["fully_watched"] is True
     assert stats["m1"]["play_count"] == 3
+    assert stats["m1"]["year"] == "2021"
+    assert stats["m2"]["year"] == ""
     assert stats["m2"]["fully_watched"] is False
 
 

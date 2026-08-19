@@ -878,6 +878,34 @@ class AutoWatcher:
             # organizando por serie/temporada según TMDB.
             remote_filename = new_name if self.config.get("rename_remote", True) else Path(key).name
 
+            # "Ya existe en el servidor": si en la carpeta remota de destino
+            # ya hay un archivo con EXACTAMENTE este mismo nombre y ya está
+            # completo, no se sube. find_duplicate (justo debajo) excluye a
+            # propósito el nombre exacto (others = [f for f in existing if
+            # f != current_filename]) porque asume que un archivo ya subido
+            # con ese nombre ES el propio -- pero eso falla cuando el mismo
+            # contenido se descarga dos veces (p.ej. la misma película con
+            # otra fuente): el nombre limpio coincide y un STOR posterior
+            # sobrescribía en silencio la copia ya subida. Visto de verdad:
+            # "La Odisea (2026)" descargada dos veces, la 2ª subida machacó
+            # la 1ª. En modo automático no hay diálogo de "sobrescribir"
+            # como en la subida manual: se omite. Un parcial más pequeño no
+            # cuenta como "ya existe": se sube de nuevo para completarse.
+            remote_file_full = f"{remote_path.rstrip('/')}/{remote_filename}"
+            remote_size = self.ftp.get_remote_size(remote_file_full)
+            try:
+                local_size = Path(new_path).stat().st_size
+            except OSError:
+                local_size = 0
+            if remote_size is not None and remote_size >= local_size:
+                _log.info("Ya existe en el servidor, se omite: %s (ya existe %s)", new_name, remote_filename)
+                self.on_event("skip", f"Ya existe en el servidor ({remote_filename}): {new_name}")
+                self.on_file_event(key, "skip", new_name=new_name,
+                                    reason=f"Ya existe en el servidor: {remote_filename}")
+                _mark_both("duplicado", new_name=new_name)
+                self.upload_slots.release_ticket_unused(ticket)
+                return
+
             # Detección de duplicados: ¿ya hay en esa carpeta remota un
             # archivo DISTINTO que representa el mismo contenido (mismo
             # episodio, u otra versión de la misma película)? En modo

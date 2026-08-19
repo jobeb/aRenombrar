@@ -200,10 +200,122 @@ class TMDBClient:
     def get_movie_details(self, movie_id: int) -> dict:
         return self._get(f"/movie/{movie_id}")
 
+    # Listas de películas que alimentan la pestaña "Películas" (recomendar
+    # lo que no está en el servidor, ver gui/app.py::_scan_missing_movies).
+    # Cada endpoint devuelve el mismo formato de resultado que /search/movie
+    # (id, title, release_date, poster_path, vote_average, popularity,
+    # overview, genre_ids) -- solo cambia la fuente; /trending ya añade
+    # "media_type": "movie" a cada resultado, los otros tres no, así que se
+    # normaliza aquí para que el escaneo no tenga que distinguir.
+    def _movie_list(self, endpoint: str, page: int = 1) -> list:
+        data = self._get(endpoint, page=page)
+        results = []
+        for r in data.get("results", []) or []:
+            item = dict(r)
+            item["media_type"] = "movie"
+            results.append(item)
+        return results
+
+    def get_trending_movies(self, page: int = 1, window: str = "week") -> list:
+        return self._movie_list(f"/trending/movie/{window}", page=page)
+
+    def get_popular_movies(self, page: int = 1) -> list:
+        return self._movie_list("/movie/popular", page=page)
+
+    def get_upcoming_movies(self, page: int = 1) -> list:
+        return self._movie_list("/movie/upcoming", page=page)
+
+    def get_now_playing_movies(self, page: int = 1) -> list:
+        return self._movie_list("/movie/now_playing", page=page)
+
+    # Listas de series que alimentan la pestaña "Recomendado" (ver
+    # core/missing_movies.py). Igual que _movie_list pero normalizando los
+    # campos de las series (name/original_name/first_air_date en vez de
+    # title/original_title/release_date) y con media_type="tv", para que
+    # build_movie_rows trate ambos tipos con el mismo código.
+    def _tv_list(self, endpoint: str, page: int = 1) -> list:
+        data = self._get(endpoint, page=page)
+        results = []
+        for r in data.get("results", []) or []:
+            item = dict(r)
+            item["media_type"] = "tv"
+            item["title"] = r.get("name", r.get("original_name", ""))
+            item["original_title"] = r.get("original_name", "")
+            item["release_date"] = r.get("first_air_date", "")
+            results.append(item)
+        return results
+
+    def get_trending_tv(self, page: int = 1, window: str = "week") -> list:
+        return self._tv_list(f"/trending/tv/{window}", page=page)
+
+    def get_popular_tv(self, page: int = 1) -> list:
+        return self._tv_list("/tv/popular", page=page)
+
+    def get_on_the_air_tv(self, page: int = 1) -> list:
+        return self._tv_list("/tv/on_the_air", page=page)
+
+    def get_movie_watch_providers(self, movie_id: int, region: str = "ES") -> dict:
+        """Disponibilidad de una película fuera del cine para la región
+        pedida -- devuelve {"flatrate": ["Netflix", ...], "rent": [...],
+        "buy": [...], "free": [...], "ads": [...]} con los NOMBRES de los
+        proveedores que TMDB registra para esa película en esa región, o {}
+        si la película no aparece (solo en cines, o no distribuida allí).
+
+        Alimenta el filtro "Solo disponibles en plataformas" de la pestaña
+        Películas: una película con alguna de estas listas no vacía ya se
+        puede conseguir (streaming/alquiler/compra/DVD), y la que devuelve
+        {} no -- solo está en cines, no se puede bajar todavía.
+
+        El endpoint /movie/{id}/watch/providers responde con un mapa por
+        país; nos quedamos con la entrada de *region* (código ISO 3166-1
+        alfa-2, p.ej. "ES") y de ella solo los nombres, que es lo único que
+        la GUI necesita mostrar."""
+        try:
+            data = self._get(f"/movie/{movie_id}/watch/providers")
+        except Exception:
+            return {}
+        region_data = (data.get("results") or {}).get(region) or {}
+        out = {}
+        for key in ("flatrate", "rent", "buy", "free", "ads"):
+            names = [p.get("provider_name", "") for p in (region_data.get(key) or [])]
+            names = [n for n in names if n]
+            if names:
+                out[key] = names
+        return out
+
     def get_genres(self, media_type: str) -> list:
         """Lista de géneros TMDB [{"id": int, "name": str}, ...] en el idioma configurado."""
         endpoint = "/genre/tv/list" if media_type == "tv" else "/genre/movie/list"
         return self._get(endpoint).get("genres", [])
+
+    def get_movie_certification(self, movie_id: int, region: str = "ES",
+                                fallback_region: str = "US") -> str:
+        """Clasificación por edad de una película (PG-13, 12, 18...) para la
+        región pedida, o "" si TMDB no la registra.
+
+        Viene de /movie/{id}/release_dates, que agrupa las certificaciones
+        por país (ISO 3166-1). Se prefiere *region* (p.ej. "ES"); si no
+        declara ninguna certificación se prueba *fallback_region* ("US") --
+        las películas españolas suelen tener certificación US aunque la ES
+        esté vacía, y un dato aproximado es mejor que "sin dato".
+
+        Devuelve la primera certificación no vacía del primer release con
+        alguna; si no hay nada, "". Alimenta la ficha de detalle de la
+        pestaña Películas."""
+        try:
+            data = self._get(f"/movie/{movie_id}/release_dates")
+        except Exception:
+            return ""
+        results = (data.get("results") or []) or []
+        for country in (region, fallback_region):
+            for entry in results:
+                if entry.get("iso_3166_1") != country:
+                    continue
+                for rd in (entry.get("release_dates") or []):
+                    cert = (rd.get("certification") or "").strip()
+                    if cert:
+                        return cert
+        return ""
 
     def build_media_info(self, result: dict, season=None, episode=None):
         media_type = result.get("media_type", "tv")
@@ -272,7 +384,13 @@ EPISODE_PATTERNS = [
     # un segundo episodio opcional, mismas tres formas y mismo motivo que
     # el patrón de arriba (temporada repetida = de fiar directamente;
     # rango compacto "1x01-02" = solo si es consecutivo, ver detect_episode).
-    (r"(\d{1,2})[xX](\d{2,3})(?:[\s\-]+\d{1,2}[xX](\d{2,3})(?!\d)|-(\d{2,3})(?!\d))?", "tv"),
+    # (?<!\d) antes del nº de temporada: un "1080x264"/"1080X264" de
+    # resolución+códec (caso real: "La Odisea (The Asylum) (2026) Web Dl
+    # 1080X264 E-AC3...mkv") NO debe partirse en "80x264" (temporada 80,
+    # episodio 264) -- sin el lookbehind el regex encontraba el match en el
+    # "80X264" que hay dentro de "1080X264" porque el escaneo empieza en
+    # cualquier posición.
+    (r"(?<!\d)(\d{1,2})[xX](\d{2,3})(?:[\s\-]+\d{1,2}[xX](\d{2,3})(?!\d)|-(\d{2,3})(?!\d))?", "tv"),
     # Episode.1078 / Episodio 5 / Episode07
     (r"[Ee]pisod[eo]s?[\s.\-]*(\d{1,4})", "anime"),
     # Ep.01 / Ep01
@@ -297,7 +415,7 @@ EPISODE_PATTERNS = [
 # que todo lo que viene después también es ruido, aunque el resto de la
 # cola (nombres de subidor, grupo, etc.) no esté en ninguna lista.
 JUNK_MARKERS = [
-    r"\b(1080p|720p|480p|2160p|4K|HDR10?\+?|SDR|UHD|\d{1,2}-?[Bb]it)\b",
+    r"\b(1080p|720p|480p|2160p|4K|HDR10?\+?|SDR|UHD|HD|SD|HQ|\d{1,2}-?[Bb]it)\b",
     r"\b(BluRay|Blu-Ray|BDRip|BDRemux|BRRemux|WEB-?DL|WEBRip|HDTV|DVDRip|DVDScr|HDRip|BRRip|CAM|TS|AMZN|NF|DSNP)\b",
     r"\b(x264|x265|HEVC|AVC|H\.264|H\.265|AV1)\b",
     r"\b(E?AC3|AAC|DTS|DD5\.1|DD\+|TrueHD|Atmos|FLAC|MP3)\b",

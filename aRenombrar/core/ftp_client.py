@@ -346,7 +346,8 @@ class FTPClient:
             total += self.get_folder_size(f"{path.rstrip('/')}/{sub}", max_depth - 1)
         return total
 
-    def delete_folder_recursive(self, path: str, max_depth: int = 8) -> tuple[bool, str]:
+    def delete_folder_recursive(self, path: str, max_depth: int = 8,
+                                progress_cb: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
         """Borra una carpeta completa (todos sus archivos y subcarpetas,
         y al final la propia carpeta) del servidor FTP -- para la
         herramienta de liberar espacio (primera vez que la app borra algo
@@ -356,18 +357,30 @@ class FTPClient:
         que no esté vacía. Se detiene y devuelve el fallo en cuanto algo
         no se puede borrar, en vez de seguir a medias -- mejor que el
         usuario vea un error claro a que quede la carpeta parcialmente
-        vaciada sin saberlo."""
+        vaciada sin saberlo.
+
+        progress_cb: callback opcional (str) -> None llamado con la ruta de
+        cada archivo/carpeta justo ANTES de intentar borrarla -- para que
+        la GUI pueda mostrar "Eliminando …" durante un borrado largo (una
+        serie puede tener cientos de archivos y tardar minutos; sin esto
+        la app parece colgada, ver _delete_cleanup_item_worker)."""
         if not self.is_connected():
             return False, "No conectado al servidor FTP."
         if max_depth <= 0:
             return False, "Profundidad máxima de subcarpetas alcanzada"
         try:
             for sub in self.list_dirs(path):
-                ok, msg = self.delete_folder_recursive(f"{path.rstrip('/')}/{sub}", max_depth - 1)
+                ok, msg = self.delete_folder_recursive(f"{path.rstrip('/')}/{sub}", max_depth - 1,
+                                                       progress_cb=progress_cb)
                 if not ok:
                     return False, msg
             for name in self.list_files(path):
-                self.ftp.delete(f"{path.rstrip('/')}/{name}")
+                item_path = f"{path.rstrip('/')}/{name}"
+                if progress_cb:
+                    progress_cb(item_path)
+                self.ftp.delete(item_path)
+            if progress_cb:
+                progress_cb(path)
             self.ftp.rmd(path)
             return True, "Carpeta eliminada"
         except ftplib.all_errors as e:
@@ -727,11 +740,15 @@ class FTPClient:
         except OSError as e:
             return False, f"Error de archivo: {e}"
 
-    def delete_file(self, remote_file: str) -> tuple[bool, str]:
-        """Borra un archivo del servidor FTP."""
+    def delete_file(self, remote_file: str, progress_cb: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
+        """Borra un archivo del servidor FTP. progress_cb: igual que en
+        delete_folder_recursive -- se llama con la ruta justo antes de
+        borrarla, para feedback visual en borrados largos."""
         if not self.ftp:
             return False, "No conectado"
         try:
+            if progress_cb:
+                progress_cb(remote_file)
             self.ftp.delete(remote_file)
             return True, remote_file
         except ftplib.all_errors as e:

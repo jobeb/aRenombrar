@@ -34,6 +34,7 @@ class CleanupItem:
     media_type: str              # "tv" | "movie"
     ftp_path: str
     category_name: str
+    year: str = ""               # año de estreno (Jellyfin ProductionYear / Plex year)
     size_bytes: int = 0
     fully_watched: bool = False
     play_count: int = 0
@@ -173,6 +174,7 @@ def merge_usage_entries(a: dict, b: dict) -> dict:
         "name": a.get("name") or b.get("name"),
         "tmdb_id": a.get("tmdb_id") or b.get("tmdb_id"),
         "media_type": a.get("media_type") or b.get("media_type"),
+        "year": a.get("year") or b.get("year") or "",
         "fully_watched": bool(a.get("fully_watched")) or bool(b.get("fully_watched")),
         "play_count": (a.get("play_count") or 0) + (b.get("play_count") or 0),
         "last_played": last_played,

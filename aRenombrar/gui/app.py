@@ -49,7 +49,7 @@ from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, fil
 from core.amule_client import AmuleSearchResult
 from core.ec_client import EcClient, EcConnectionError, EcAuthError
 from core.auto_watcher import AutoWatcher
-from core.series_match import best_match, match_names_exclusively, series_similarity
+from core.series_match import best_match, match_names_exclusively, normalize_series_name, series_similarity
 from core import remote_presence as rp
 from core.download_quality import best_result
 
@@ -1051,6 +1051,15 @@ class App(_AppBase):
         self._rename_overwrite_all  = False
         self._upload_slot_of        = {}
         self._upload_skip_events    = []
+        # Serializa las confirmaciones de sobrescribir/duplicado/atascado
+        # entre los workers de subida en paralelo: sin esto, cada worker que
+        # encontrara un archivo existente abría SU diálogo a la vez (todos
+        # veían _upload_overwrite_all=False antes de que ninguno contestara)
+        # y contestar "Sobrescribir todos" al primero no evitaba que los
+        # demás repitieran la pregunta. Con el lock, solo un worker pregunta
+        # a la vez; al contestar "todos", los que esperan el lock ven el flag
+        # ya activo y saltan directo a sobrescribir (ver _upload_entry_with).
+        self._upload_confirm_lock  = threading.Lock()
 
         # Reutilización de carpetas de serie ya existentes en el FTP (evita
         # crear una carpeta duplicada por idioma/nombre corto distinto)
@@ -1096,6 +1105,7 @@ class App(_AppBase):
         self.title(f"aRenombrar v{__version__}")
         self.geometry("1200x820")
         self.minsize(1000, 680)
+        self._apply_window_state()
 
         self._icon_path  = None   # .ico — solo Windows, vía iconbitmap()
         self._icon_photo = None   # PNG — macOS/Linux, vía iconphoto(); hay
@@ -1227,6 +1237,15 @@ class App(_AppBase):
         # configurada o la descarga falla; los valores locales se quedan
         # como estaban.
         self.after(2200, self._sync_server_config_from_ftp)
+        # Episodios que faltan y Películas: la caché compartida se refresca
+        # desde el FTP también al abrir la app (no solo al entrar en cada
+        # pestaña) -- así un cliente que la tiene abierta en otra pestaña
+        # se entera igualmente de los cambios que otro usuario hizo (p.ej.
+        # un capítulo ya subido que ya no falta), sin tener que visitar la
+        # pestaña a mano. El freno _*_SYNC_MIN_INTERVAL evita repetir la
+        # consulta si el <FocusIn> de arranque ya la hizo.
+        self.after(2300, self._sync_missing_episodes_from_ftp)
+        self.after(2400, self._sync_missing_movies_from_ftp)
         # Detector de episodios que faltan: comprobación periódica en
         # segundo plano (silenciosa, sin diálogo) para que la caché esté ya
         # al día cuando el usuario abra el diálogo a mano -- ver
@@ -1268,6 +1287,48 @@ class App(_AppBase):
                 window.iconbitmap(self._icon_path)
             elif self._icon_photo:
                 window.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
+
+    def _apply_window_state(self):
+        """Restaura el tamaño/posición (y el estado maximizado, si aplica)
+        de la ventana principal guardados al cerrar la última vez (ver
+        _save_window_state). La geometría se aplica antes de entrar en
+        mainloop; el maximizado se agenda con after porque Tk necesita que
+        la ventana esté ya creada/visible para cambiar de estado."""
+        geom = self.config_data.get("window_geometry") or ""
+        if geom:
+            try:
+                self.geometry(geom)
+            except Exception:
+                pass
+        if self.config_data.get("window_maximized"):
+            self.after(100, lambda: self._restore_maximized())
+
+    def _restore_maximized(self):
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
+
+    def _save_window_state(self):
+        """Guarda el estado actual de la ventana principal (geometría +
+        maximizada/no) en la config, para restaurarlo en el próximo
+        arranque. Se llama al cerrar (ver _force_quit). Si la ventana está
+        maximizada, se guarda su geometría enmarcada y la marca de
+        maximizada; si no, solo la geometría."""
+        try:
+            maximized = self.state() == "zoomed"
+            if maximized:
+                # En maximizado, geometry() devuelve la geometría de
+                # pantalla completa del escritorio -- guardar esa no tiene
+                # sentido para restaurar el tamaño normal; mejor conservar
+                # la que tenía antes de maximizar si se conoce.
+                geom = self.config_data.get("window_geometry") or self.geometry()
+            else:
+                geom = self.geometry()
+            self.config_data.set("window_geometry", geom)
+            self.config_data.set("window_maximized", maximized)
         except Exception:
             pass
 
@@ -1322,6 +1383,16 @@ class App(_AppBase):
         self._build_missing_episodes_tab(self._missing_ep_frame)
         self._startup_mark("  _build_missing_episodes_tab()")
 
+        # Vista de películas y series recomendadas (oculta por defecto) --
+        # misma pantalla completa que Episodios que faltan, pero recomendando
+        # películas y series de las listas de TMDB que NO están en el servidor
+        # (ver core/missing_movies.py y _scan_missing_movies).
+        self._movies_frame = ctk.CTkFrame(self._main_frame, fg_color="transparent")
+        self._movies_frame.grid_columnconfigure(0, weight=1)
+        self._movies_visible = False
+        self._build_movies_tab(self._movies_frame)
+        self._startup_mark("  _build_movies_tab()")
+
         # Panel de configuracion (oculto por defecto) -- construcción
         # DIFERIDA a la primera vez que se entra de verdad (ver
         # _show_view), no aquí. Medido en real: con las 7 pestañas de
@@ -1366,6 +1437,7 @@ class App(_AppBase):
         self._last_category_upload_stats_sync_ts = 0.0
         self._last_cleanup_candidates_sync_ts = 0.0
         self._last_missing_episodes_sync_ts = 0.0
+        self._last_missing_movies_sync_ts = 0.0
 
         # Mirror local de los veredictos de doblaje compartidos (ver
         # core/shared_dub_verdicts.py) -- último estado conocido antes de
@@ -1552,6 +1624,20 @@ class App(_AppBase):
         self._tray_btn.grid(row=0, column=7, padx=(0, 16))
 
         self.bind("<Configure>", self._on_root_resize, add="+")
+        # Volver a la app (p.ej. tras minimizar a bandeja o trabajar en otra
+        # ventana): refrescar las cachés compartidas de "Episodios que
+        # faltan" y "Películas" desde el FTP, igual que al arrancar -- así
+        # el usuario ve los cambios que otro cliente hizo mientras tanto,
+        # sin tener que salir y volver a entrar en cada pestaña. El freno
+        # _*_SYNC_MIN_INTERVAL amortigua los <FocusIn> que Tk dispara con
+        # frecuencia (cada vez que cambia el foco entre widgets hijos).
+        self.bind("<FocusIn>", self._on_root_focus_in, add="+")
+
+    def _on_root_focus_in(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        self._sync_missing_episodes_from_ftp()
+        self._sync_missing_movies_from_ftp()
 
     def _header_needed_width(self) -> int:
         """Ancho necesario AHORA MISMO para mostrar toda la cabecera con
@@ -2017,9 +2103,15 @@ class App(_AppBase):
                 # la ruta LOCAL en el campo "remote", con lo que el historial
                 # no sabía dónde había quedado el archivo en el servidor.
                 # El "or path" solo cubre a un AutoWatcher que no lo envíe.
-                self._save_history_entry(fname, remote_full or path, "ok", size or 0,
+                # filename = entry.name (el ORIGINAL, nunca se sobreescribe
+                # al renombrar -- ver FileEntry) para que el historial
+                # muestre el nombre con el que llegó el archivo, no el que
+                # se le puso al renombrar; el nombre final sigue visible en
+                # la columna "destino" (remote incluye el nombre remoto).
+                self._save_history_entry(entry.name, remote_full or path, "ok", size or 0,
                                           local_path=path)
                 self._remove_uploaded_episode_from_missing_list(entry.media_info)
+                self._remove_uploaded_movie_from_movies_list(entry.media_info)
                 self._refresh_ftp_space()
 
             elif tipo == "skip":
@@ -2050,6 +2142,7 @@ class App(_AppBase):
     # botones de alternancia independientes cada uno con su propia lógica.
     _NAV_LABELS = {
         "files": "📁 Archivos",
+        "movies": "🎬 Recomendado",
         "missing_ep": "🔍 Episodios",
         "downloads": "📥 Descargar",
         "cleanup": "🗑 Liberar espacio",
@@ -2065,6 +2158,8 @@ class App(_AppBase):
             return "config"
         if self._missing_ep_visible:
             return "missing_ep"
+        if self._movies_visible:
+            return "movies"
         if self._downloads_visible:
             return "downloads"
         if self._history_visible:
@@ -2140,6 +2235,9 @@ class App(_AppBase):
         elif self._missing_ep_visible:
             self._missing_ep_frame.grid_remove()
             self._missing_ep_visible = False
+        elif self._movies_visible:
+            self._movies_frame.grid_remove()
+            self._movies_visible = False
         elif self._history_visible:
             self._history_frame.grid_remove()
             self._history_visible = False
@@ -2171,6 +2269,11 @@ class App(_AppBase):
             self._sync_favorites_from_ftp()
             self._sync_shared_dub_verdicts_from_ftp()
             self._sync_missing_episodes_from_ftp()
+        elif view_key == "movies":
+            self._movies_frame.grid(row=0, column=0, sticky="nsew")
+            self._movies_visible = True
+            self._sync_favorites_from_ftp()
+            self._sync_missing_movies_from_ftp()
         elif view_key == "history":
             self._history_frame.grid(row=0, column=0, sticky="nsew")
             self._history_visible = True
@@ -2656,6 +2759,8 @@ class App(_AppBase):
         content_w = max(100, w - 40)   # descontar el padding interno del panel
         self._detail_title.configure(width=content_w)
         self._detail_episode.configure(wraplength=content_w)
+        self._detail_meta.configure(width=content_w)
+        self._detail_cert.configure(width=content_w)
         self._detail_overview.configure(width=content_w)
         self._detail_error.configure(width=content_w)
         self._detail_ftp_path_lbl.configure(wraplength=content_w)
@@ -2663,6 +2768,8 @@ class App(_AppBase):
         # El wrap cambia con el ancho, así que el número de líneas (y por
         # tanto el alto que necesitan) también cambia.
         self._autosize_textbox(self._detail_title)
+        self._autosize_textbox(self._detail_meta)
+        self._autosize_textbox(self._detail_cert)
         self._autosize_textbox(self._detail_overview)
         self._autosize_textbox(self._detail_error)
 
@@ -2845,6 +2952,22 @@ class App(_AppBase):
         self._detail_year.pack()
         self._detail_confidence = ctk.CTkLabel(scroll, text="", font=ctk.CTkFont(size=11))
         self._detail_confidence.pack()
+        # Categoría (tipo · año · nota · géneros) y clasificación por edad --
+        # mismas líneas que el panel lateral de Recomendado, para que el
+        # detalle de Archivos muestre la misma información que el resto de
+        # pestañas (ver _update_detail/_preview_result).
+        self._detail_meta = ctk.CTkTextbox(
+            scroll, width=215, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._detail_meta.configure(state="disabled")
+        self._detail_meta.pack(pady=(2, 0), fill="x")
+        self._detail_cert = ctk.CTkTextbox(
+            scroll, width=215, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._detail_cert.configure(state="disabled")
+        self._detail_cert.pack(pady=(0, 0), fill="x")
         self._detail_overview = ctk.CTkTextbox(
             scroll, width=215, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -3222,6 +3345,19 @@ class App(_AppBase):
         la misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
         return self._shared_data_path("aRenombrar_episodios_que_faltan.json")
+
+    def _missing_movies_remote_path(self) -> str:
+        """Ruta remota de la caché compartida de "Películas" (ver
+        core/missing_movies_cache.py) -- archivo propio dentro de la misma
+        carpeta compartida, mismo motivo que
+        _missing_episodes_remote_path. La caché de películas era personal
+        de cada instalación por decisión de diseño (el cruce con el
+        servidor de medios local no tenía sentido compartirlo); ahora el
+        flag "in_server" SÍ se comparte, para que un cliente sepa que otra
+        instalación del mismo servidor ya subió una película sin tener que
+        esperar a que su propio Jellyfin/Plex la reindexe -- ver
+        _push_missing_movies_to_ftp/_sync_missing_movies_from_ftp."""
+        return self._shared_data_path("aRenombrar_peliculas.json")
 
     def _sync_server_config_from_ftp(self):
         """Descarga la configuración compartida del servidor y la aplica en
@@ -4256,18 +4392,24 @@ class App(_AppBase):
                 if up_ok:
                     self.after(0, lambda: self._apply_synced_cleanup_candidates(
                         {"items": remaining, "last_scan_ts": remote_data.get("last_scan_ts"),
-                         "scanned_by": remote_data.get("scanned_by", "")}, force=True))
+                         "scanned_by": remote_data.get("scanned_by", "")}, force=True, rerender=False))
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_synced_cleanup_candidates(self, payload: dict, force: bool = False):
+    def _apply_synced_cleanup_candidates(self, payload: dict, force: bool = False,
+                                         rerender: bool = True):
         """Aplica una lista de "Liberar espacio" ya sincronizada (de
         _sync_cleanup_candidates_from_ftp o _push_cleanup_deletion_to_ftp)
         -- guarda el mirror local y repinta si la pestaña está visible.
         force=True se usa tras un borrado propio: ese resultado siempre
         es el más fresco posible (se acaba de aplicar aquí mismo), así
-        que no tiene sentido comparar marcas de tiempo contra él."""
+        que no tiene sentido comparar marcas de tiempo contra él.
+        rerender=False se usa cuando la lista ya se repintó justo antes
+        (el borrado propio repinta en _finish_delete_cleanup_item): el
+        mirror se actualiza igual, pero no se vuelve a redibujar la
+        página, evitando que la lista "parpadee" dos veces por cada
+        elemento borrado."""
         from core.cleanup_candidates_cache import save_cache
         if not force:
             current_ts = getattr(self, "_cleanup_last_scan_ts", None) or 0
@@ -4280,9 +4422,15 @@ class App(_AppBase):
             save_cache(self._cleanup_raw_items, self._cleanup_last_scan_ts, self._cleanup_scanned_by)
         except Exception:
             _log.warning("Liberar espacio: no se pudo guardar el mirror local tras sincronizar", exc_info=True)
-        if getattr(self, "_cleanup_visible", False):
+        if getattr(self, "_cleanup_visible", False) and rerender:
             self._populate_cleanup_category_filters()
-            self._apply_cleanup_filters()
+            # Tras un borrado propio (force=True desde
+            # _push_cleanup_deletion_to_ftp), la lista local ya se actualizó
+            # y re-renderizó preservando la página (_finish_delete_cleanup_item):
+            # este re-render remoto no debe volver a la página 1 (ver
+            # _apply_cleanup_filters). En un sync de entrada (force=False)
+            # no se toca la página, que de todas formas se acaba de entrar.
+            self._apply_cleanup_filters(preserve_page=force)
             age = _time.time() - self._cleanup_last_scan_ts if self._cleanup_last_scan_ts else None
             when_txt = self._fmt_cleanup_scan_age(age)
             by_txt = f" (por {self._cleanup_scanned_by})" if self._cleanup_scanned_by else ""
@@ -4380,6 +4528,60 @@ class App(_AppBase):
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
 
+    def _push_missing_movies_to_ftp(self):
+        """Comparte la caché ACTUAL de "Películas" (ver
+        core/missing_movies_cache.py) -- llamado tras cualquier cambio
+        local que la deje al día (una película subida, un escaneo que
+        detecta que ya está en el servidor). A diferencia de episodios,
+        aquí no se reemplaza la caché remota entera: se hace MERGE con lo
+        que ya hubiera publicado otro cliente, conservando los datos de
+        cada película (título, cartel, watch...) de la versión más completa
+        y combinando el flag "in_server" con OR (si cualquiera de los dos
+        clientes dice que la película ya está en su servidor, queda
+        marcada como en servidor -- así una instalación cuya biblioteca
+        todavía no ha reindexado la película no la "desmarca" para las
+        demás)."""
+        remote_path = self._missing_movies_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            from core.missing_movies_cache import load_cache, merge_movies_cache
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    _log.warning(
+                        "Películas: no se pudo conectar al FTP para compartir la caché (%s)", _msg)
+                    return
+                remote_cache = {}
+                raw = own_ftp.download_bytes(remote_path)
+                if raw:
+                    try:
+                        parsed = _json.loads(raw.decode("utf-8"))
+                        if isinstance(parsed, dict):
+                            remote_cache = parsed
+                    except ValueError:
+                        remote_cache = {}
+                payload = merge_movies_cache(load_cache(), remote_cache)
+                data = _json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+                up_ok, _up_msg = own_ftp.upload_bytes(data, remote_path)
+                if up_ok:
+                    _log.info("Películas: caché compartida con %d película(s)",
+                              len([k for k in payload if k != "_meta"]))
+                else:
+                    _log.warning("Películas: no se pudo subir la caché compartida (%s)", _up_msg)
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
     def _apply_synced_missing_episodes(self, remote_cache: dict):
         """Aplica una caché de "Episodios que faltan" ya sincronizada
         (de _sync_missing_episodes_from_ftp) -- fusiona sobre el mirror
@@ -4452,6 +4654,86 @@ class App(_AppBase):
                 if not isinstance(remote_cache, dict):
                     return
                 self.after(0, lambda: self._apply_synced_missing_episodes(remote_cache))
+            finally:
+                own_ftp.disconnect()
+        threading.Thread(target=worker, daemon=True).start()
+
+    _MISSING_MOVIES_SYNC_MIN_INTERVAL = 20   # segundos, ver _sync_missing_movies_from_ftp
+
+    def _apply_synced_missing_movies(self, remote_cache: dict):
+        """Aplica una caché de "Películas" ya sincronizada (de
+        _sync_missing_movies_from_ftp) -- propaga sobre el mirror local el
+        flag "in_server=True" de lo que haya publicado otro cliente del
+        mismo servidor (si otro cliente ya subió una película, se marca
+        como en servidor aquí también, aunque este Jellyfin/Plex aún no la
+        haya reindexado), la guarda, y reconstruye self._movies_results con
+        la MISMA función que ya usa el arranque (_rows_from_movies_cache).
+        NO añade ni borra entradas (ver apply_remote_in_server): un
+        descarte local con 🚫 no debe reaparecer por el solo hecho de que
+        otro cliente la tenga compartida. Solo si el merge trajo algo
+        nuevo de verdad y la pestaña Películas está visible se repinta la
+        tabla."""
+        from core.missing_movies_cache import load_cache, save_cache, apply_remote_in_server
+        previous = load_cache()
+        merged, changed = apply_remote_in_server(previous, remote_cache)
+        if not changed:
+            return
+        try:
+            save_cache(merged)
+        except Exception:
+            _log.warning("Películas: no se pudo guardar el mirror local tras sincronizar",
+                         exc_info=True)
+            return
+        # Refrescar _movies_results SIEMPRE (aunque la pestaña no esté
+        # visible ahora): el sync de arranque/volver a la app puede
+        # aplicarse antes de que el usuario abra la pestaña, y así al
+        # entrar ya muestra el flag en servidor actualizado. El repintado
+        # de la tabla sí se condiciona a que la pestaña esté visible.
+        self._movies_results = self._rows_from_movies_cache()
+        self._refresh_movies_genre_filter_options()
+        if getattr(self, "_movies_visible", False):
+            self._render_movies_table(reset_page=False)
+            self._update_movies_status_text()
+
+    def _sync_missing_movies_from_ftp(self):
+        """Refresca el mirror local de "Películas" desde el FTP en segundo
+        plano -- mismo patrón y mismo freno que
+        _sync_missing_episodes_from_ftp. Se llama al entrar en la pestaña
+        Películas y también al abrir la app / volver a ella (ver
+        _on_root_focus_in), para que un cliente vea qué películas ya han
+        subido los demás sin tener que salir y entrar."""
+        now = _time.time()
+        if now - self._last_missing_movies_sync_ts < self._MISSING_MOVIES_SYNC_MIN_INTERVAL:
+            return
+        self._last_missing_movies_sync_ts = now
+
+        remote_path = self._missing_movies_remote_path()
+        if not remote_path:
+            return
+
+        def worker():
+            from core.ftp_client import FTPClient as _FTPClient
+            import json as _json
+            own_ftp = _FTPClient()
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                raw = own_ftp.download_bytes(remote_path)
+                if raw is None:
+                    return
+                try:
+                    remote_cache = _json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    return
+                if not isinstance(remote_cache, dict):
+                    return
+                self.after(0, lambda: self._apply_synced_missing_movies(remote_cache))
             finally:
                 own_ftp.disconnect()
         threading.Thread(target=worker, daemon=True).start()
@@ -5264,133 +5546,153 @@ class App(_AppBase):
         # tanda de subida.
         is_batch = len(self._upload_queue) > 1
 
-        # Detección de duplicados: ¿ya hay en esta misma carpeta remota un
-        # archivo DISTINTO que representa el mismo contenido (mismo
-        # episodio, u otra versión de la misma película)? Distinto de la
-        # comprobación de "ya existe" de más abajo, que solo mira el nombre
-        # remoto exacto -- esto detecta el mismo contenido llegado con un
-        # nombre de archivo diferente (otra fuente/calidad/grupo). Solo se
-        # comprueba una vez por entrada (no en cada reintento) para no
-        # listar la carpeta remota una y otra vez ni repreguntar lo mismo.
-        if not getattr(entry, "_duplicate_checked", False):
+        # Si el archivo remoto con el MISMO nombre ya está completo (o más
+        # grande), es un archivo ya subido de verdad: no hace falta avisar
+        # también de "posible contenido duplicado" con otro nombre -- el
+        # diálogo de sobreescribir ya es suficiente, y preguntar dos veces
+        # seguidas era confuso (real: al re-subir un archivo existente que
+        # además tenía otra versión en la carpeta salían dos diálogos).
+        remote_size = ftp_conn.get_remote_size(remote_file)
+        prev_remote_size = getattr(entry, "_last_upload_remote_size", None)
+        stalled = (remote_size is not None and prev_remote_size is not None
+                   and remote_size <= prev_remote_size)
+        entry._last_upload_remote_size = remote_size
+        already_exists = remote_size is not None and remote_size >= local_size
+        force_overwrite = False
+
+        # Detección de duplicados — solo cuando el archivo con el nombre
+        # exacto NO está completo (no existe o es un parcial más pequeño que
+        # se reanudará solo): aquí sí tiene sentido preguntar — ¿hay en esta
+        # misma carpeta remota un archivo DISTINTO que representa el mismo
+        # contenido (mismo episodio, u otra versión de la misma película)?
+        # Distinto de la comprobación de "ya existe" de abajo, que solo mira
+        # el nombre remoto exacto -- esto detecta el mismo contenido llegado
+        # con un nombre de archivo diferente (otra fuente/calidad/grupo).
+        # Solo se comprueba una vez por entrada (no en cada reintento) para
+        # no listar la carpeta remota una y otra vez ni repreguntar lo mismo.
+        # (Va FUERA del lock de abajo: list_files es una llamada de red, y
+        # mantener el lock durante ella frenaría en serie a todos los workers
+        # de la tanda aunque no tuvieran nada que confirmar.)
+        dup = None
+        if not already_exists and not getattr(entry, "_duplicate_checked", False):
             entry._duplicate_checked = True
             from core.duplicate_detect import find_duplicate
             existing_files = ftp_conn.list_files(remote_dir)
             dup = find_duplicate(existing_files, info, remote_filename)
-            if dup and not self._upload_duplicate_ignore_all:
+
+        # Los diálogos de confirmación se serializan con
+        # self._upload_confirm_lock: con varias subidas en paralelo, varios
+        # workers podían llegar a este punto a la vez (todos veían
+        # _upload_overwrite_all=False antes de que ninguno contestara) y
+        # cada uno abría su propio diálogo -- contestar "Sobrescribir todos"
+        # al primero no cancelaba los demás ya en pantalla. Manteniendo el
+        # lock, solo un worker pregunta a la vez, y los que esperan el lock
+        # tras contestar "todos" ven el flag ya activo y saltan directo al
+        # elif de abajo sin volver a preguntar.
+        with self._upload_confirm_lock:
+            if already_exists and not self._upload_overwrite_all:
+                # Estado visible en la columna "Estado": si no se distingue de
+                # "En cola" es fácil no darse cuenta de que hay un diálogo
+                # esperando respuesta (p.ej. cuando el modo automático ya subió
+                # este mismo archivo antes) y la fila parece quedarse "colgada"
+                # sin explicación.
                 prev_status = entry.status
                 entry.status = "esperando_confirmacion"
                 self.after(0, lambda e=entry: self._update_row(e))
                 answer = [None]
                 ev = threading.Event()
-                def _ask(d=dup, ans=answer, e=ev):
-                    dlg = _OverwriteDialog(
-                        self, d,
-                        title="Posible contenido duplicado",
-                        message=("Ya hay un archivo distinto en el servidor que parece "
-                                 "ser el mismo contenido:"),
-                        overwrite_label="Subir de todas formas",
-                        all_label="Subir todas de todas formas",
-                        close_result="skip",
-                        show_all_button=is_batch)
+                def _ask(rf=remote_file, ans=answer, e=ev):
+                    dlg = _OverwriteDialog(self, rf, show_all_button=is_batch)
                     ans[0] = dlg.result
                     e.set()
                 self.after(0, _ask)
                 ev.wait()
                 if answer[0] == "all":
-                    self._upload_duplicate_ignore_all = True
-                elif answer[0] != "overwrite":   # "skip" (Omitir o cerrado con la X)
+                    self._upload_overwrite_all = True
+                    force_overwrite = True
+                elif answer[0] == "skip":
+                    # Omitir o cerrar el diálogo (por defecto también "skip"):
+                    # vuelve al estado de antes de preguntar en vez de quedarse
+                    # marcado "Omitido" — es un "ahora no", no una exclusión
+                    # permanente, así que la fila queda lista para reintentarse
+                    # normalmente más adelante.
                     entry.status = prev_status
                     self.after(0, lambda e=entry: self._update_row(e))
                     return True, "omitido"
+                else:   # "overwrite"
+                    force_overwrite = True
+            elif already_exists and self._upload_overwrite_all:
+                # "Sobrescribir todos" ya activo de un archivo anterior de esta tanda
+                force_overwrite = True
+            else:
+                # El archivo con el nombre exacto NO está completo: si además
+                # de la comprobación de "ya existe" de arriba se encontró un
+                # duplicado real (el mismo contenido con otro nombre) hay que
+                # preguntar igualmente si se sube o no.
+                if dup and not self._upload_duplicate_ignore_all:
+                    prev_status = entry.status
+                    entry.status = "esperando_confirmacion"
+                    self.after(0, lambda e=entry: self._update_row(e))
+                    answer = [None]
+                    ev = threading.Event()
+                    def _ask(d=dup, ans=answer, e=ev):
+                        dlg = _OverwriteDialog(
+                            self, d,
+                            title="Posible contenido duplicado",
+                            message=("Ya hay un archivo distinto en el servidor que parece "
+                                     "ser el mismo contenido:"),
+                            overwrite_label="Subir de todas formas",
+                            all_label="Subir todas de todas formas",
+                            close_result="skip",
+                            show_all_button=is_batch)
+                        ans[0] = dlg.result
+                        e.set()
+                    self.after(0, _ask)
+                    ev.wait()
+                    if answer[0] == "all":
+                        self._upload_duplicate_ignore_all = True
+                    elif answer[0] != "overwrite":   # "skip" (Omitir o cerrado con la X)
+                        entry.status = prev_status
+                        self.after(0, lambda e=entry: self._update_row(e))
+                        return True, "omitido"
 
-        # Solo preguntar si el archivo remoto ya está completo (o más grande):
-        # eso es un archivo ya subido de verdad. Si el remoto existe pero es
-        # más pequeño, es una subida anterior interrumpida a medias — se
-        # reanuda sola más abajo (try_resume) sin interrumpir con un diálogo.
-        remote_size = ftp_conn.get_remote_size(remote_file)
-        # Comparado con lo que había ANTES del intento anterior (si lo hubo):
-        # si el archivo remoto sigue exactamente igual de grande tras un
-        # intento fallido, lo más probable es que el servidor no pudiera
-        # escribir más (p.ej. disco lleno) y solo cerrara la conexión, sin
-        # devolver un error FTP claro — eso se ve como un WinError de
-        # conexión genérico, muy confuso para diagnosticar sin este aviso.
-        prev_remote_size = getattr(entry, "_last_upload_remote_size", None)
-        stalled = (remote_size is not None and prev_remote_size is not None
-                   and remote_size <= prev_remote_size)
-        entry._last_upload_remote_size = remote_size
-        force_overwrite = False
-        if remote_size is not None and remote_size >= local_size and not self._upload_overwrite_all:
-            # Estado visible en la columna "Estado": si no se distingue de
-            # "En cola" es fácil no darse cuenta de que hay un diálogo
-            # esperando respuesta (p.ej. cuando el modo automático ya subió
-            # este mismo archivo antes) y la fila parece quedarse "colgada"
-            # sin explicación.
-            prev_status = entry.status
-            entry.status = "esperando_confirmacion"
-            self.after(0, lambda e=entry: self._update_row(e))
-            answer = [None]
-            ev = threading.Event()
-            def _ask(rf=remote_file, ans=answer, e=ev):
-                dlg = _OverwriteDialog(self, rf, show_all_button=is_batch)
-                ans[0] = dlg.result
-                e.set()
-            self.after(0, _ask)
-            ev.wait()
-            if answer[0] == "all":
-                self._upload_overwrite_all = True
-                force_overwrite = True
-            elif answer[0] == "skip":
-                # Omitir o cerrar el diálogo (por defecto también "skip"):
-                # vuelve al estado de antes de preguntar en vez de quedarse
-                # marcado "Omitido" — es un "ahora no", no una exclusión
-                # permanente, así que la fila queda lista para reintentarse
-                # normalmente más adelante.
-                entry.status = prev_status
-                self.after(0, lambda e=entry: self._update_row(e))
-                return True, "omitido"
-            else:   # "overwrite"
-                force_overwrite = True
-        elif remote_size is not None and remote_size >= local_size and self._upload_overwrite_all:
-            # "Sobrescribir todos" ya activo de un archivo anterior de esta tanda
-            force_overwrite = True
-        elif stalled and not self._upload_overwrite_all:
-            # El archivo remoto no avanzó nada desde el intento anterior:
-            # seguir reanudando el mismo punto para siempre no lleva a
-            # ningún sitio si ese punto está atascado (p.ej. un parcial
-            # dañado de un corte anterior) — dar la opción de empezar de
-            # cero en vez de reintentar sin fin sin ninguna salida.
-            prev_status = entry.status
-            entry.status = "esperando_confirmacion"
-            self.after(0, lambda e=entry: self._update_row(e))
-            answer = [None]
-            ev = threading.Event()
-            def _ask(rf=remote_file, ans=answer, e=ev, rs=remote_size, ls=local_size):
-                dlg = _OverwriteDialog(
-                    self, rf,
-                    title="La subida no avanza",
-                    message=(f"Este archivo lleva al menos un intento sin avanzar en "
-                             f"el servidor (sigue en {_fmt_size(rs)} de {_fmt_size(ls)}). "
-                             f"Puede que el punto de reanudación esté dañado."),
-                    overwrite_label="Empezar de cero",
-                    all_label="Empezar de cero (todos)",
-                    close_result="skip",
-                    show_all_button=is_batch)
-                ans[0] = dlg.result
-                e.set()
-            self.after(0, _ask)
-            ev.wait()
-            if answer[0] == "all":
-                self._upload_overwrite_all = True
-                force_overwrite = True
-            elif answer[0] == "overwrite":
-                force_overwrite = True
-            else:   # "skip" (Omitir o cerrado con la X)
-                entry.status = prev_status
-                self.after(0, lambda e=entry: self._update_row(e))
-                return True, "omitido"
-        elif stalled and self._upload_overwrite_all:
-            force_overwrite = True
+                if stalled and not self._upload_overwrite_all:
+                    # El archivo remoto no avanzó nada desde el intento anterior:
+                    # seguir reanudando el mismo punto para siempre no lleva a
+                    # ningún sitio si ese punto está atascado (p.ej. un parcial
+                    # dañado de un corte anterior) — dar la opción de empezar de
+                    # cero en vez de reintentar sin fin sin ninguna salida.
+                    prev_status = entry.status
+                    entry.status = "esperando_confirmacion"
+                    self.after(0, lambda e=entry: self._update_row(e))
+                    answer = [None]
+                    ev = threading.Event()
+                    def _ask(rf=remote_file, ans=answer, e=ev, rs=remote_size, ls=local_size):
+                        dlg = _OverwriteDialog(
+                            self, rf,
+                            title="La subida no avanza",
+                            message=(f"Este archivo lleva al menos un intento sin avanzar en "
+                                     f"el servidor (sigue en {_fmt_size(rs)} de {_fmt_size(ls)}). "
+                                     f"Puede que el punto de reanudación esté dañado."),
+                            overwrite_label="Empezar de cero",
+                            all_label="Empezar de cero (todos)",
+                            close_result="skip",
+                            show_all_button=is_batch)
+                        ans[0] = dlg.result
+                        e.set()
+                    self.after(0, _ask)
+                    ev.wait()
+                    if answer[0] == "all":
+                        self._upload_overwrite_all = True
+                        force_overwrite = True
+                    elif answer[0] == "overwrite":
+                        force_overwrite = True
+                    else:   # "skip" (Omitir o cerrado con la X)
+                        entry.status = prev_status
+                        self.after(0, lambda e=entry: self._update_row(e))
+                        return True, "omitido"
+                elif stalled and self._upload_overwrite_all:
+                    force_overwrite = True
 
         free = self._get_free_space_with_jellyfin_fallback(ftp_conn, root)
         if free is not None and free < local_size:
@@ -5455,8 +5757,11 @@ class App(_AppBase):
                 del entry._last_upload_remote_size
             self._ftp_row_set(entry, "Subido", 1, 0)
             self._mark_auto_processed(entry.path, "subido", entry.new_name)
+            # filename = entry.name (el ORIGINAL) -- ver el mismo comentario
+            # en el modo automático: el historial muestra cómo llegó el
+            # archivo, el nombre final queda en la columna "destino".
             self._save_history_entry(
-                entry.new_name or Path(entry.path).name,
+                entry.name,
                 remote_file, "ok", size, local_path=entry.path)
             _log.info("Subida: OK %r (%s)", remote_filename, _fmt_size(size))
             from core.media_server_refresh import trigger_refresh
@@ -5465,6 +5770,7 @@ class App(_AppBase):
             # a diferencia del mismo hook en _on_auto_file_event (que ya
             # corre dentro de self.after), aquí sí hay que agendarlo.
             self.after(0, lambda mi=entry.media_info: self._remove_uploaded_episode_from_missing_list(mi))
+            self.after(0, lambda mi=entry.media_info: self._remove_uploaded_movie_from_movies_list(mi))
             self.after(0, self._refresh_ftp_space)
             self._apply_manual_post_process_action(entry)
         elif msg == "cancelado":
@@ -5482,7 +5788,7 @@ class App(_AppBase):
             self.after(0, lambda: self._set_status("Disco lleno en servidor", ERROR_COLOR))
             self._upload_cancel.set()
             self._save_history_entry(
-                entry.new_name or Path(entry.path).name,
+                entry.name,
                 remote_file, "error", size, error_msg=entry.error_msg, local_path=entry.path)
             _log.error("Subida: disco lleno en servidor, cancelando %r", remote_filename)
         else:
@@ -5496,7 +5802,7 @@ class App(_AppBase):
                 entry.error_msg = msg
             self._ftp_row_set(entry, "Error", 0, 0)
             self._save_history_entry(
-                entry.new_name or Path(entry.path).name,
+                entry.name,
                 remote_file, "error", size, error_msg=entry.error_msg, local_path=entry.path)
             _log.error("Subida: ERROR %r — %s", remote_filename, entry.error_msg)
 
@@ -7686,6 +7992,1292 @@ class App(_AppBase):
                 text=msg, text_color=SUCCESS_COLOR if ok else ERROR_COLOR))
         threading.Thread(target=worker, daemon=True).start()
 
+    # ── Recomendador de películas (TMDB + Jellyfin/Plex) ──
+    # Pantalla completa (_build_movies_tab), mismo patrón que "Episodios que
+    # faltan" pero cruzando las listas de TMDB (tendencias, populares,
+    # próximos estrenos, en emisión) con las películas que YA están en el
+    # servidor para recomendar solo las que no tiene (core/missing_movies.py
+    # y core/missing_movies_cache.py). La descarga se lanza desde aquí a
+    # aMule cuando el usuario pulsa "⬇" -- la pestaña solo informa.
+
+    def _build_movies_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+
+        # -- Barra de título, mismo estilo que la de Episodios que faltan --
+        header = ctk.CTkFrame(parent, fg_color=("gray90", "gray20"), corner_radius=8)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, CONTAINER_GAP))
+        header.grid_columnconfigure(0, weight=1, uniform="movies_sides")
+        header.grid_columnconfigure(1, weight=0)
+        header.grid_columnconfigure(2, weight=1, uniform="movies_sides")
+
+        left_fr = ctk.CTkFrame(header, fg_color="transparent")
+        left_fr.grid(row=0, column=0, sticky="w")
+        self._movies_scan_btn = ctk.CTkButton(
+            left_fr, text="🔍 Recomendar", width=120,
+            command=lambda: self._start_movies_scan(force_full=False))
+        self._movies_scan_btn.pack(side="left", padx=(12, 4), pady=8)
+        self._movies_full_btn = ctk.CTkButton(
+            left_fr, text="Reescaneo completo", width=140, fg_color="transparent", border_width=1,
+            command=lambda: self._start_movies_scan(force_full=True))
+        self._movies_full_btn.pack(side="left", padx=(0, 4), pady=8)
+        self._movies_cancel_btn = ctk.CTkButton(
+            left_fr, text="Cancelar", width=90, fg_color=ERROR_COLOR, hover_color="#96281b",
+            command=self._cancel_movies_scan)
+        # (empaquetado solo mientras escanea, ver _set_movies_scanning_ui)
+
+        ctk.CTkLabel(header, text="Recomendado",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=1, padx=16, pady=8)
+
+        right_fr = ctk.CTkFrame(header, fg_color="transparent")
+        right_fr.grid(row=0, column=2, sticky="e")
+
+        # El único interruptor va en la SEGUNDA línea del encabezado, no al
+        # lado del buscador -- mismo motivo de espacio que los filtros de
+        # Episodios que faltan. Recuerda su estado entre reinicios (ver
+        # DEFAULTS en config.py) -- se persiste al cambiar (ver
+        # _on_toggle_missing_ep_switch), no solo al cerrar la app.
+        filters_fr = ctk.CTkFrame(header, fg_color="transparent")
+        filters_fr.grid(row=1, column=0, columnspan=3, sticky="e", padx=(0, 8))
+        # "Todo/Películas/Series": recorta la tabla por tipo de obra. Se
+        # persiste al cambiar (missing_movies_type_filter), como el resto de
+        # interruptores de esta línea.
+        self._movies_type_filter_var = ctk.StringVar(
+            value=self.config_data.get("missing_movies_type_filter", "all"))
+        # Referencia al propio botón (no solo su StringVar): el filtro lee
+        # aquí el valor pulsado de verdad (ver _movies_visible_rows), porque
+        # el SegmentedButton NO actualiza un StringVar externo a menos que se
+        # le pase variable= -- y aquí los valores del botón son etiquetas
+        # legibles ("Todo"/"Películas"/"Series"), distintas de las claves
+        # internas que guarda el var, así que vincularlos no era posible tal
+        # cual. Leer el botón directamente es la fuente de verdad visual.
+        self._movies_type_filter_btn = ctk.CTkSegmentedButton(
+            filters_fr, values=["Todo", "Películas", "Series"],
+            command=self._on_movies_type_filter_changed)
+        type_filter = self._movies_type_filter_btn
+        type_filter.set("Todo" if self._movies_type_filter_var.get() == "all"
+                        else ("Películas" if self._movies_type_filter_var.get() == "movies" else "Series"))
+        type_filter.pack(side="right", padx=(8, 8), pady=8)
+        self._movies_hide_in_server_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_movies_hide_in_server", True))
+        self._movies_hide_in_server_switch = ctk.CTkSwitch(
+            filters_fr, text="Ocultar ya en el servidor", variable=self._movies_hide_in_server_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_movies_hide_in_server", self._movies_hide_in_server_var,
+                self._render_movies_table))
+        self._movies_hide_in_server_switch.pack(side="right", padx=(4, 12), pady=8)
+        # "Solo disponibles en plataformas": descarta las películas que solo
+        # están en cines (sin watch providers en TMDB para la región) -- las
+        # que no se pueden bajar todavía. Ver core.missing_movies.
+        self._movies_watch_only_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_movies_watch_only", True))
+        self._movies_watch_only_switch = ctk.CTkSwitch(
+            filters_fr, text="Disponibles en plataformas", variable=self._movies_watch_only_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_movies_watch_only", self._movies_watch_only_var,
+                self._render_movies_table))
+        self._movies_watch_only_switch.pack(side="right", padx=(4, 4), pady=8)
+        # "Ocultar asiáticas": descarta el contenido de Asia oriental y del
+        # sur (China, Japón, Corea, India/Bollywood, Tailandia...) que llena
+        # de sobra las listas de tendencias/populares de TMDB. Activo de
+        # fábrica (missing_movies_hide_asian). Ver apply_origin_filter en
+        # core/missing_movies.
+        self._movies_hide_asian_var = ctk.BooleanVar(
+            value=self.config_data.get("missing_movies_hide_asian", True))
+        self._movies_hide_asian_switch = ctk.CTkSwitch(
+            filters_fr, text="Ocultar asiáticas", variable=self._movies_hide_asian_var,
+            command=lambda: self._on_toggle_missing_ep_switch(
+                "missing_movies_hide_asian", self._movies_hide_asian_var,
+                self._render_movies_table))
+        self._movies_hide_asian_switch.pack(side="right", padx=(4, 4), pady=8)
+        # "Últimos X años": recorta la tabla por año de estreno (release_date
+        # de TMDB), contando hacia atrás desde el año actual (último año =
+        # año actual y el anterior). "Todos" no filtra. Se persiste al
+        # cambiar (missing_movies_year_filter). Ojo con pack(side="right"):
+        # se empaqueta primero el combo y después la etiqueta para que en
+        # pantalla quede "Años: [selector]" (de izquierda a derecha).
+        #
+        # Editable (state="normal") para poder teclear un número libre (p.ej.
+        # "20" o "20 años") en vez de limitarse a las opciones del desplegable
+        # -- el parsing aguanta "20"/"20 años"/"20años" (ver _movies_visible_rows).
+        year_values = ["1", "2", "3", "5", "8", "10", "Todos"]
+        saved_year = self.config_data.get("missing_movies_year_filter", "1")
+        self._movies_year_filter_combo = ctk.CTkComboBox(
+            filters_fr, values=year_values,
+            width=80, state="normal", command=self._on_movies_year_filter_changed)
+        self._movies_year_filter_combo.set(
+            saved_year if (saved_year == "Todos" or re.match(r"^\d+\s*años?$", saved_year))
+            else (saved_year if saved_year.isdigit() else "1"))
+        self._movies_year_filter_combo.bind(
+            "<KeyRelease>", self._on_movies_year_key)
+        self._movies_year_filter_combo.bind(
+            "<Return>", self._on_movies_year_filter_enter)
+        self._movies_year_filter_combo.pack(side="right", padx=(0, 4), pady=8)
+        ctk.CTkLabel(filters_fr, text="Años:",
+                     font=ctk.CTkFont(size=12)).pack(side="right", padx=(8, 2), pady=8)
+        # "Género": recorta la tabla por género TMDB (terror, comedia,
+        # animación...). El selector se puebla con los géneros presentes en
+        # las filas ACTUALES (ver _refresh_movies_genre_filter_options), que
+        # viajan en el campo "genres" de cada fila en el idioma configurado;
+        # "Anime" es un alias de "Animación" (ver row_matches_genre en
+        # core/missing_movies.py). Se persiste al cambiar
+        # (missing_movies_genre_filter), como el resto de esta línea.
+        self._movies_genre_filter_combo = None   # creado en _refresh_movies_genre_filter_options
+        self._movies_genre_filter_combo_label = None
+        self._movies_filters_fr = filters_fr
+        self._refresh_movies_genre_filter_options()
+        self._movies_search_entry = ctk.CTkEntry(right_fr, width=180, placeholder_text="Filtrar por nombre...")
+        self._movies_search_entry.pack(side="right", padx=4, pady=8)
+        self._movies_search_entry.bind("<KeyRelease>", self._on_movies_search_key)
+        self._movies_search_debounce_id = None   # ver _on_movies_search_key
+        self._movies_year_debounce_id = None     # ver _on_movies_year_key
+
+        # -- Barra de estado / progreso (una u otra, nunca las dos) --
+        self._movies_status_lbl = ctk.CTkLabel(
+            parent, text="Sin comprobar todavía", text_color=PENDING_COLOR,
+            font=ctk.CTkFont(size=12), anchor="w")
+        self._movies_status_lbl.grid(row=1, column=0, sticky="w", pady=(0, 6))
+        self._movies_progress = ctk.CTkProgressBar(parent)
+        self._movies_progress.set(0)
+        # (empaquetado solo mientras escanea)
+
+        # -- Cuerpo: tabla a la izquierda, ficha de la película a la derecha --
+        # Columna 0: tabla (se expande). Columna 1: separador arrastrable.
+        # Columna 2: panel lateral (ancho fijo, pero ajustable a mano) --
+        # mismo patrón de 3 columnas que _build_missing_episodes_tab (ver
+        # _movies_sash_press/_motion/_release más abajo).
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="nsew")
+        parent.grid_rowconfigure(2, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)
+        body.grid_columnconfigure(2, weight=0)
+        body.grid_rowconfigure(0, weight=1)
+
+        self._movies_empty_msg = None   # label "sin resultados"/"pulsa Recomendar", ver _movies_render_page
+        # Compartidas entre todas las filas -- crear un CTkFont nuevo por
+        # cada película (llamada a Tcl) se notaba con muchas filas; ver el
+        # mismo arreglo en _build_missing_episodes_tab.
+        self._movies_name_font = ctk.CTkFont(size=13, weight="bold")
+        self._movies_summary_font = ctk.CTkFont(size=11)
+        self._movies_icon_font = ctk.CTkFont(size=16)   # iconos de los botones ⬇/🚫 (estilo unificado)
+
+        # TableView: mismo componente que el resto de listas (ver
+        # gui/table_view.py). "Título" es la columna expand=True; las de
+        # año/lista/nota son fijas y ordenables; "En servidor" y los botones
+        # de acción van al final. La columna "auto" (⚡) va justo después de
+        # favorito/proteger (antes que el título), SIEMPRE presente para que
+        # las columnas de películas y series cuadren con la cabecera (antes
+        # solo se pintaba en las filas de serie y las de película quedaban
+        # descuadradas): en las series lleva el botón de autocompletar y en
+        # las películas queda vacía. El ancho de columna elegido a mano se
+        # guarda entre sesiones (on_widths_changed).
+        self._movies_table = TableView(body, columns=[
+            ColumnSpec("fav", "", width=28),
+            ColumnSpec("lock", "", width=28),
+            ColumnSpec("auto", "", width=32),
+            ColumnSpec("name", "Título", expand=True, resizable=True, sortable=True),
+            ColumnSpec("year", "Año", width=70, sortable=True),
+            ColumnSpec("list", "Lista", width=110, sortable=True),
+            ColumnSpec("vote", "Nota", width=60, sortable=True),
+            ColumnSpec("watch", "Disponible en", width=140),
+            ColumnSpec("server", "En servidor", width=100),
+            ColumnSpec("search", "", width=36),
+            ColumnSpec("copy", "", width=36),
+            ColumnSpec("download", "", width=36),
+            ColumnSpec("dismiss", "", width=36),
+        ], header_right_pad=24)   # ver TableView.__init__ -- hueco de la barra de scroll del body (22px + 2 de padx)
+        self._movies_table.on_header_click = self._on_movies_header_click
+        self._movies_sort_key, self._movies_sort_asc = self._saved_table_sort(
+            "peliculas", "title", True)   # arranca igual que el comportamiento previo (por título)
+        self._movies_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
+        self._movies_table.set_sort_indicator(
+            self._movies_column_for_sort_key(self._movies_sort_key), self._movies_sort_asc)
+        self._movies_table.on_column_resize = self._on_movies_column_resize
+        self._movies_table.on_widths_changed = lambda w: self._save_table_col_widths("peliculas", w)
+        self._movies_table.enable_dynamic_page_size(lambda _size: self._movies_render_page())
+
+        # Separador arrastrable entre la tabla y el panel lateral -- mismo
+        # patrón visual y de comportamiento que _missing_ep_sash (ver
+        # _movies_sash_press/_motion/_release más abajo).
+        self._movies_sash = tk.Frame(body, width=4, bg="#505060",
+                                     cursor="sb_h_double_arrow")
+        self._movies_sash.grid(row=0, column=1, sticky="ns", pady=8)
+        self._movies_sash.bind("<ButtonPress-1>", self._movies_sash_press)
+        self._movies_sash.bind("<B1-Motion>", self._movies_sash_motion)
+        self._movies_sash.bind("<ButtonRelease-1>", self._movies_sash_release)
+        self._movies_sash_state = None
+        self._movies_resize_debounce_id = None
+        self._movies_panel_width = 240   # igual que el width= inicial de _build_movies_side_panel
+
+        self._movies_side_panel = self._build_movies_side_panel(body)
+        self._movies_side_panel.grid(row=0, column=2, sticky="nsew")
+
+        # Paginado (ver TableView.page_size, calculado dinámicamente) -- con
+        # varios cientos de películas cacheadas, dibujar la tabla entera de
+        # golpe agota el límite de objetos GUI de Windows (ver el comentario
+        # largo junto a nav_fr en _build_missing_episodes_tab). Debajo de la
+        # tabla (no encima) y centrada.
+        nav_fr = ctk.CTkFrame(parent, fg_color="transparent")
+        nav_fr.grid(row=3, column=0, pady=(6, 0))
+        self._movies_prev_btn = ctk.CTkButton(
+            nav_fr, text="< Anterior", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._movies_change_page(-1))
+        self._movies_prev_btn.pack(side="left")
+        self._movies_page_lbl = ctk.CTkLabel(nav_fr, text="", text_color=PENDING_COLOR)
+        self._movies_page_lbl.pack(side="left", padx=12)
+        self._movies_next_btn = ctk.CTkButton(
+            nav_fr, text="Siguiente >", width=100, fg_color="transparent", border_width=1,
+            command=lambda: self._movies_change_page(1))
+        self._movies_next_btn.pack(side="left")
+
+        self._movies_results = self._rows_from_movies_cache()
+        self._refresh_movies_genre_filter_options()
+        self._movies_cancel_event = None
+        self._movies_scanning = False
+        self._movies_row_widgets = {}
+        self._movies_page = 0
+        self._movies_selected_tmdb_id = None   # obra pulsada, ver _show_movie_poster
+        self._movies_poster_token = None
+        self._movies_render_token = 0
+        self._update_movies_status_text()
+        # Diferido, no al construir la app: esta pestaña se construye al
+        # arrancar aunque esté oculta (se empieza en Archivos) -- ver el
+        # mismo comentario en _build_missing_episodes_tab.
+        self.after(50, self._render_movies_table)
+
+    def _on_movies_column_resize(self):
+        """Tras arrastrar el separador de "Película" (ver TableView.
+        on_column_resize), no hay nada extra que reajustar: las filas no son
+        desplegables (la ficha va al panel lateral) y el resto se
+        redimensiona solo."""
+        pass
+
+    _MOVIES_PANEL_MIN_W = 180
+    _MOVIES_PANEL_MAX_W = 500
+    _MOVIES_RESIZE_DEBOUNCE_MS = 150
+
+    def _movies_sash_press(self, event):
+        self._movies_sash_state = {"x0": event.x_root, "w0": self._movies_panel_width}
+
+    def _movies_sash_motion(self, event):
+        if not self._movies_sash_state:
+            return
+        # El panel está a la derecha del separador: arrastrar hacia la
+        # izquierda (x decrece) lo ensancha, hacia la derecha lo estrecha
+        # (mismo criterio que _missing_ep_sash_motion).
+        delta = self._movies_sash_state["x0"] - event.x_root
+        new_w = max(self._MOVIES_PANEL_MIN_W,
+                    min(self._MOVIES_PANEL_MAX_W, self._movies_sash_state["w0"] + delta))
+        if new_w == self._movies_panel_width:
+            return   # mismo ancho (redondeo) -- no repetir trabajo de layout
+        self._movies_panel_width = new_w
+        # Durante el arrastre en vivo solo se mueve el borde del panel -- el
+        # reajuste de los cuadros de texto de dentro (caro) se aplaza con
+        # antirrebote (ver _commit_movies_panel_width).
+        self._movies_side_panel.configure(width=new_w)
+        if self._movies_resize_debounce_id is not None:
+            self.after_cancel(self._movies_resize_debounce_id)
+        self._movies_resize_debounce_id = self.after(
+            self._MOVIES_RESIZE_DEBOUNCE_MS, self._commit_movies_panel_width)
+
+    def _movies_sash_release(self, event):
+        self._movies_sash_state = None
+        if self._movies_resize_debounce_id is not None:
+            self.after_cancel(self._movies_resize_debounce_id)
+            self._movies_resize_debounce_id = None
+        self._commit_movies_panel_width()
+
+    def _commit_movies_panel_width(self):
+        """Aplica self._movies_panel_width de verdad a los widgets de dentro
+        del panel (el póster se queda a tamaño fijo). Es la parte cara -- se
+        llama con antirrebote durante el arrastre, no en cada evento de
+        movimiento."""
+        self._movies_resize_debounce_id = None
+        w = self._movies_panel_width
+        self._movies_side_panel.configure(width=w)
+        content_w = max(100, w - 40)   # descontar el padding interno del panel
+        self._movies_detail_title.configure(width=content_w)
+        self._movies_detail_meta.configure(width=content_w)
+        self._movies_detail_cert.configure(width=content_w)
+        self._movies_detail_overview.configure(width=content_w)
+        self._autosize_textbox(self._movies_detail_title)
+        self._autosize_textbox(self._movies_detail_meta)
+        self._autosize_textbox(self._movies_detail_cert)
+        self._autosize_textbox(self._movies_detail_overview)
+
+    def _build_movies_side_panel(self, parent):
+        """Ficha de la película pulsada -- póster + título + metadatos +
+        sinopsis, mismo estilo que el panel lateral de Episodios que faltan
+        pero de solo lectura (aquí no se identifica nada, solo se consulta)."""
+        panel = ctk.CTkFrame(parent, width=240)
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(panel, fg_color="transparent", label_text="")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=6)
+        scroll.columnconfigure(0, weight=1)
+
+        self._movies_poster_label = ctk.CTkLabel(
+            scroll, text="Pulsa una obra\npara ver su ficha",
+            width=180, height=220, text_color=PENDING_COLOR)
+        self._movies_poster_label.pack(pady=(4, 2))
+        self._movies_detail_title = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="transparent",
+            activate_scrollbars=False)
+        self._movies_detail_title.configure(state="disabled")
+        self._movies_detail_title.pack(pady=(4, 0), fill="x")
+        self._movies_detail_meta = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._movies_detail_meta.configure(state="disabled")
+        self._movies_detail_meta.pack(pady=(0, 0), fill="x")
+        self._movies_detail_cert = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._movies_detail_cert.configure(state="disabled")
+        self._movies_detail_cert.pack(pady=(0, 0), fill="x")
+        self._movies_detail_overview = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._movies_detail_overview.configure(state="disabled")
+        self._movies_detail_overview.pack(pady=4, fill="x")
+
+        return panel
+
+    def _rows_from_movies_cache(self) -> list:
+        """Al abrir la vista, mostrar lo que ya se sabía del último escaneo
+        (persistido en missing_movies_cache.json) en vez de una tabla vacía
+        hasta que el usuario pulse "🔍 Recomendar" a mano -- mismo patrón que
+        _load_missing_episodes_from_cache. Devuelve filas con el MISMO
+        formato que build_movie_rows (tmdb_id, media_type, title, year,
+        release_date, overview, poster_url, genre_ids, vote_average,
+        popularity, list, in_server, más "genres" para el detalle). Las
+        claves de la caché son "{media_type}:{tmdb_id}" (las de versiones
+        antiguas, numéricas, ya las migra normalize_cache al cargar)."""
+        from core.missing_movies_cache import load_cache, parse_cache_key
+        cache = load_cache()
+        results = []
+        for key, entry in cache.items():
+            parsed = parse_cache_key(key)
+            if parsed is None:
+                continue   # "_meta" y cualquier otra clave no válida
+            media_type, tmdb_id = parsed
+            results.append({
+                "tmdb_id": tmdb_id, "media_type": media_type,
+                "title": entry.get("title", ""),
+                "year": entry.get("year", ""), "release_date": entry.get("release_date", ""),
+                "overview": entry.get("overview", ""), "poster_url": entry.get("poster_url"),
+                "genre_ids": list(entry.get("genre_ids", []) or []),
+                "genres": entry.get("genres", []) or [],
+                "vote_average": entry.get("vote_average", 0),
+                "popularity": entry.get("popularity", 0),
+                "list": entry.get("list", ""), "in_server": entry.get("in_server", False),
+                "watch": dict(entry.get("watch", {}) or {}),
+                "certification": entry.get("certification", ""),
+                "original_language": entry.get("original_language", ""),
+                "origin_country": list(entry.get("origin_country", []) or []),
+            })
+        return results
+
+    def _start_movies_scan(self, force_full: bool = False):
+        if not self.config_data.get("jellyfin_enabled") and not self.config_data.get("plex_enabled"):
+            self._set_status("Activa Plex o Jellyfin en Ajustes para recomendar películas", WARNING_COLOR)
+            return
+        if self._movies_scanning:
+            return
+        if self._upload_running:
+            # No competir con una subida en curso -- mismo criterio que
+            # _start_missing_episodes_scan.
+            self._set_status("Espera a que termine la subida en curso antes de recomendar películas", WARNING_COLOR)
+            return
+        self._movies_scanning = True
+        self._movies_cancel_event = threading.Event()
+        self._set_movies_scanning_ui(True)
+        self._movies_progress.set(0)
+
+        # En un reescaneo completo, la tabla vieja se queda mostrando datos
+        # ya obsoletos durante todo el escaneo (que puede tardar) -- mejor
+        # vaciarla al empezar y que las películas vayan apareciendo según se
+        # detectan. En un "Recomendar" normal no aplica: la tabla muestra lo
+        # que ya se sabía, y un escaneo nuevo la reemplaza al terminar.
+        if force_full:
+            self._movies_results = []
+            self._refresh_movies_genre_filter_options()
+            self._render_movies_table()
+
+        def worker():
+            # Sin este try/except, cualquier fallo dentro de
+            # _scan_missing_movies (un hueco de red, un dato inesperado de
+            # TMDB/Jellyfin/Plex...) mataba el hilo en silencio ANTES de
+            # llegar a _finish_movies_scan -- los botones se quedaban
+            # deshabilitados y la barra de progreso llena para siempre (mismo
+            # problema que ya se arregló en _start_missing_episodes_scan).
+            try:
+                results = self._scan_missing_movies(
+                    progress_cb=lambda c, t, n: self.after(
+                        0, lambda c=c, t=t, n=n: self._update_movies_progress(c, t, n)),
+                    cancel_event=self._movies_cancel_event, force_full=force_full)
+            except Exception:
+                _log.exception("Recomendador de películas: fallo inesperado durante el escaneo")
+                self.after(0, lambda: self._set_status(
+                    "El escaneo terminó con un error -- revisa app.log", ERROR_COLOR))
+                self.after(0, lambda: self._finish_movies_scan(self._movies_results))
+                return
+            self.after(0, lambda: self._finish_movies_scan(results))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_missing_movies(self, progress_cb=None, cancel_event=None, force_full=False) -> list:
+        """Pide las listas de TMDB (películas: tendencias, populares,
+        próximos estrenos, en emisión; series: tendencias, populares, en
+        emisión), las cruza con lo que YA está en Jellyfin/Plex (por
+        tmdb_id, cruzando películas con películas y series con series) y
+        consulta a TMDB la disponibilidad fuera del cine de cada película
+        candidata (watch providers, para el filtro "Solo disponibles en
+        plataformas") -- devuelve la lista de filas de recomendación (ver
+        core.missing_movies.build_movie_rows), guardando el resultado en
+        missing_movies_cache.json para que la pestaña muestre las
+        recomendaciones aunque se abra sin conexión.
+
+        force_full fuerza a re-consultar también la disponibilidad de las
+        películas que ya la tenían en la caché (el botón "Reescaneo
+        completo"); sin él, solo se consulta la de las películas nuevas o
+        sin datos guardados (la parte lenta es una llamada TMDB por
+        película, y las listas no cambian cada día). Las series NO
+        consultan watch providers (el filtro de plataformas es solo de
+        películas)."""
+        from core.missing_movies import build_movie_rows
+        from core.missing_movies_cache import (load_cache, save_cache, cache_key)
+        from core.media_server_refresh import (get_jellyfin_movies, get_plex_movies,
+                                               get_jellyfin_series, get_plex_series)
+
+        def _report(cur, total, name):
+            if progress_cb:
+                progress_cb(cur, total, name)
+
+        # tmdb_ids de lo que YA está en el servidor (solo los que traigan el
+        # ID emparejado; los demás no se pueden cruzar). Las películas y las
+        # series viven en espacios de IDs separados en TMDB, así que el cruce
+        # es por tipo: una película y una serie pueden compartir el mismo
+        # número de tmdb_id sin ser la misma obra.
+        server_movie_ids = set()
+        server_series_ids = set()
+        if self.config_data.get("jellyfin_enabled"):
+            for m in (get_jellyfin_movies(
+                    self.config_data.get("jellyfin_host", ""),
+                    self.config_data.get("jellyfin_api_key", "")) or []):
+                if m.get("tmdb_id"):
+                    server_movie_ids.add(m["tmdb_id"])
+            for s in (get_jellyfin_series(
+                    self.config_data.get("jellyfin_host", ""),
+                    self.config_data.get("jellyfin_api_key", "")) or []):
+                if s.get("tmdb_id"):
+                    server_series_ids.add(s["tmdb_id"])
+        if self.config_data.get("plex_enabled"):
+            for m in (get_plex_movies(
+                    self.config_data.get("plex_host", ""),
+                    self.config_data.get("plex_token", "")) or []):
+                if m.get("tmdb_id"):
+                    server_movie_ids.add(m["tmdb_id"])
+            for s in (get_plex_series(
+                    self.config_data.get("plex_host", ""),
+                    self.config_data.get("plex_token", "")) or []):
+                if s.get("tmdb_id"):
+                    server_series_ids.add(s["tmdb_id"])
+
+        # Cliente TMDB propio del escaneo (no self.tmdb) para usar la API key
+        # ACTUAL de la configuración, por si cambió sin reiniciar.
+        client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+        # Listas por separado: las series usan las mismas claves internas que
+        # las películas ("trending"/"popular" + "on_the_air"), así que si se
+        # guardaran en el mismo dict las series sobrescribirían las películas
+        # (y las series de trending/popular saldrían DOS veces, una en cada
+        # cruce). build_movie_rows recibe cada tipo por separado.
+        movie_lists = {}
+        series_lists = {}
+        # 10 páginas fijas por lista (~20 películas por página de TMDB) --
+        # se eliminó el selector "Páginas por lista" y este valor quedó fijo.
+        pages = 10
+        steps = [
+            ("trending", "Tendencias TMDB", client.get_trending_movies),
+            ("popular", "Populares", client.get_popular_movies),
+            ("upcoming", "Próximos estrenos", client.get_upcoming_movies),
+            ("now_playing", "En emisión", client.get_now_playing_movies),
+        ]
+        for list_key, label, fetch in steps:
+            if cancel_event and cancel_event.is_set():
+                break   # cancelado -- devolver lo recopilado hasta ahora
+            _report(0, 1, label)
+            movies = []
+            for page in range(1, pages + 1):
+                if cancel_event and cancel_event.is_set():
+                    break
+                try:
+                    page_movies = fetch(page=page)
+                except Exception:
+                    _log.warning("Recomendado: fallo al pedir la lista '%s' (pág %d) de TMDB -- se sigue con el resto",
+                                 label, page)
+                    page_movies = []
+                movies.extend(page_movies)
+                # TMDB devuelve 20 por página; si la página sale incompleta
+                # es la última de la lista, no tiene sentido seguir pidiendo.
+                if len(page_movies) < 20:
+                    break
+            movie_lists[list_key] = movies
+
+        # Listas de series: las 3 que tienen sentido para recomendar cosas
+        # nuevas (tendencias, populares, en emisión). Ni "próximos estrenos"
+        # (de películas) ni "mejor valoradas" -- son series en curso o
+        # recientes, que es lo que tiene sentido recomendar.
+        series_steps = [
+            ("trending", "Tendencias TMDB (series)", client.get_trending_tv),
+            ("popular", "Populares (series)", client.get_popular_tv),
+            ("on_the_air", "En emisión (series)", client.get_on_the_air_tv),
+        ]
+        for list_key, label, fetch in series_steps:
+            if cancel_event and cancel_event.is_set():
+                break
+            _report(0, 1, label)
+            shows = []
+            for page in range(1, pages + 1):
+                if cancel_event and cancel_event.is_set():
+                    break
+                try:
+                    page_shows = fetch(page=page)
+                except Exception:
+                    _log.warning("Recomendado: fallo al pedir la lista de series '%s' (pág %d) de TMDB -- se sigue con el resto",
+                                 label, page)
+                    page_shows = []
+                shows.extend(page_shows)
+                if len(page_shows) < 20:
+                    break
+            series_lists[list_key] = shows
+
+        # Filas de películas y de series -- build_movie_rows deduce el tipo de
+        # cada resultado (media_type); el cruce contra el servidor se hace por
+        # tipo (los tmdb_ids de películas y series no comparten espacio).
+        movie_rows = build_movie_rows(movie_lists, server_movie_ids)
+        series_rows = build_movie_rows(series_lists, server_series_ids)
+        rows = movie_rows + series_rows
+
+        # Nombres de género para el detalle -- una sola llamada por tipo, no
+        # una por película/serie.
+        genres_by_id = {}
+        for media_type in ("movie", "tv"):
+            try:
+                for gid, gname in {g.get("id"): g.get("name", "") for g in client.get_genres(media_type)}.items():
+                    genres_by_id[gid] = gname
+            except Exception:
+                _log.warning("Recomendado: no se pudieron pedir los géneros de %s de TMDB", media_type)
+
+        # Disponibilidad fuera del cine (watch providers) para el filtro
+        # "Solo disponibles en plataformas" -- SOLO películas (las series no
+        # pasan por ese filtro). Incremental por caché, igual que el resto de
+        # la app: las películas que ya tienen "watch" en
+        # missing_movies_cache.json se reutilizan tal cual (una llamada
+        # TMDB por película, y las listas no cambian cada día); solo se
+        # consultan las nuevas/sin datos. force_full las re-consulta todas.
+        # La barra de progreso cubre solo esta parte (la lenta); las listas
+        # y los géneros son pocas llamadas y ya se reportaron con total=1.
+        cache = dict(load_cache())
+        watch_by_id = {}
+        titles_by_id = {r["tmdb_id"]: r["title"] for r in movie_rows}
+        missing_watch = []
+        for r in movie_rows:
+            cached_watch = (cache.get(cache_key("movie", r["tmdb_id"])) or {}).get("watch")
+            if cached_watch and not force_full:
+                watch_by_id[r["tmdb_id"]] = cached_watch
+            else:
+                missing_watch.append(r["tmdb_id"])
+        total_watch = len(missing_watch)
+        for i, tid in enumerate(missing_watch, start=1):
+            if cancel_event and cancel_event.is_set():
+                break   # cancelado -- devolver lo consultado hasta ahora
+            _report(i, total_watch, f"Disponibilidad de '{titles_by_id.get(tid, tid)}'...")
+            try:
+                watch_by_id[tid] = client.get_movie_watch_providers(tid)
+            except Exception:
+                _log.warning("Recomendado: fallo al pedir la disponibilidad de tmdb_id=%s -- se sigue con el resto", tid)
+                watch_by_id[tid] = {}
+
+        rows = build_movie_rows(movie_lists, server_movie_ids, watch_by_id=watch_by_id) + series_rows
+        # "genres" (nombres en el idioma configurado) se resuelven AQUÍ, una
+        # sola vez por tipo, y viajan en las filas igual que en la caché --
+        # el filtro por género de la barra de filtros los lee de ahí (ver
+        # _movies_visible_rows), sin consultas extra por fila.
+        for r in rows:
+            r["genres"] = [genres_by_id.get(gid, "") for gid in r["genre_ids"]]
+
+        cache = dict(load_cache())
+        for r in rows:
+            key = cache_key(r["media_type"], r["tmdb_id"])
+            cached_entry = cache.get(key) or {}
+            cache[key] = {
+                "media_type": r["media_type"],
+                "title": r["title"], "year": r["year"], "release_date": r["release_date"],
+                "overview": r["overview"], "poster_url": r["poster_url"],
+                "genres": [genres_by_id.get(gid, "") for gid in r["genre_ids"]],
+                "genre_ids": r["genre_ids"], "vote_average": r["vote_average"],
+                "popularity": r["popularity"], "list": r["list"],
+                # in_server: si el cruce local ya lo detecta, True; si no,
+                # se conserva lo que ya hubiera (la app lo subió hace un
+                # momento, o otro cliente del mismo servidor lo marcó vía
+                # FTP) -- una obra subida no debe reaparecer en la lista
+                # solo porque este Jellyfin/Plex todavía no la ha reindexado.
+                "in_server": r["in_server"] or cached_entry.get("in_server", False),
+                "watch": r["watch"],
+                # Origen (original_language / origin_country) para el
+                # interruptor "Ocultar asiáticas" -- viene en las filas de
+                # build_movie_rows; la caché vieja sin estos campos no pasa
+                # el filtro (sin dato no se descarta).
+                "original_language": r.get("original_language", ""),
+                "origin_country": list(r.get("origin_country", []) or []),
+                # La clasificación por edad se consulta on-demand al abrir la
+                # ficha (_load_movie_certification) y se conserva aquí; un
+                # reescaneo no debe borrarla aunque esta pasada no la pida.
+                "certification": cached_entry.get("certification", ""),
+            }
+        cache["_meta"] = {"last_scan_ts": _time.time()}
+        save_cache(cache)
+        return rows
+
+    def _finish_movies_scan(self, results: list):
+        self._movies_scanning = False
+        self._movies_results = results
+        self._refresh_movies_genre_filter_options()
+        self._set_movies_scanning_ui(False)
+        self._update_movies_status_text()
+        self._render_movies_table()
+        # El escaneo acaba de recalcular el flag "in_server" de cada
+        # película (nuevas ya en el servidor, reescaneos...) -- compartirlo
+        # por FTP para que el resto de clientes también las vean marcadas.
+        self._push_missing_movies_to_ftp()
+
+    def _cancel_movies_scan(self):
+        if self._movies_cancel_event:
+            self._movies_cancel_event.set()
+
+    def _set_movies_scanning_ui(self, scanning: bool):
+        state = "disabled" if scanning else "normal"
+        self._movies_scan_btn.configure(state=state)
+        self._movies_full_btn.configure(state=state)
+        if scanning:
+            self._movies_cancel_btn.pack(side="left", padx=(0, 4), pady=8)
+            self._movies_status_lbl.grid_remove()
+            self._movies_progress.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        else:
+            self._movies_cancel_btn.pack_forget()
+            self._movies_progress.grid_remove()
+            self._movies_status_lbl.grid(row=1, column=0, sticky="w", pady=(0, 6))
+
+    def _update_movies_progress(self, current: int, total: int, show_name: str):
+        if total > 0:
+            self._movies_progress.set(current / total)
+        self._movies_status_lbl.configure(text=f"Comprobando ({current}/{total}): {show_name}")
+
+    def _update_movies_status_text(self):
+        from core.missing_movies_cache import load_cache
+        last_ts = (load_cache().get("_meta") or {}).get("last_scan_ts")
+        when = ""
+        if last_ts:
+            mins = int((_time.time() - last_ts) / 60)
+            if mins < 1:
+                when = "hace un momento"
+            elif mins < 60:
+                when = f"hace {mins} min"
+            else:
+                when = f"hace {mins // 60} h"
+        if not self._movies_results:
+            text = "Sin comprobar todavía" if not when else f"Sin recomendaciones aún -- último escaneo {when}"
+        else:
+            n_movies = sum(1 for r in self._movies_results if r.get("media_type") != "tv")
+            n_series = len(self._movies_results) - n_movies
+            parts = []
+            if n_movies:
+                parts.append(f"{n_movies} película{'s' if n_movies != 1 else ''}")
+            if n_series:
+                parts.append(f"{n_series} serie{'s' if n_series != 1 else ''}")
+            text = " · ".join(parts) + " recomendada(s)"
+            if when:
+                text += f" -- último escaneo {when}"
+        self._movies_status_lbl.configure(text=text)
+
+    def _render_movies_table(self, reset_page: bool = True):
+        """Punto de entrada tras cambiar filtros, terminar un escaneo, o
+        cualquier otro cambio que pueda alterar QUÉ filas hay que ver -- por
+        defecto vuelve a la primera página; para redibujar la página actual
+        sin resetearla (p.ej. tras quitar una recomendación) pasar
+        reset_page=False (ver _missing_episodes_table para el mismo motivo)."""
+        if reset_page:
+            self._movies_page = 0
+        self._movies_render_page(scroll_top=reset_page)
+
+    def _movies_change_page(self, delta: int):
+        rows = self._movies_visible_rows()
+        n_pages = max(1, -(-len(rows) // self._movies_table.page_size))
+        new_page = max(0, min(n_pages - 1, self._movies_page + delta))
+        if new_page == self._movies_page:
+            return
+        self._movies_page = new_page
+        self._movies_render_page()
+
+    def _movies_visible_rows(self) -> list:
+        """Filas de la tabla tras aplicar los filtros activos (tipo
+        película/serie, búsqueda por texto en el título, "Ocultar ya en el
+        servidor" y "Solo disponibles en plataformas") y el orden de columna
+        elegido (_movies_sort_key/_movies_sort_asc) -- mismo papel que
+        _missing_ep_visible_rows, sin grupos fijados arriba. El filtro de
+        plataformas (watch providers) solo aplica a las películas: las
+        series no consultan esa disponibilidad y siempre pasan el filtro."""
+        from core.missing_movies import (filter_by_text, apply_in_server_filter,
+                                         apply_watch_availability_filter,
+                                         apply_genre_filter, apply_origin_filter,
+                                         sort_movie_rows)
+        rows = self._movies_results
+        # "Todo"/"Películas"/"Series" -- recorta por media_type antes del
+        # resto de filtros. Se lee el estado REAL del SegmentedButton (el
+        # StringVar separado _movies_type_filter_var solo lo escribe el
+        # callback _on_movies_type_filter_changed; leer el botón es la fuente
+        # de verdad visual y no puede desincronizarse).
+        tipo = self._movies_type_filter_btn.get()
+        tipo = {"Todo": "all", "Películas": "movies", "Series": "series"}.get(tipo, "all")
+        if tipo == "movies":
+            rows = [r for r in rows if r.get("media_type") != "tv"]
+        elif tipo == "series":
+            rows = [r for r in rows if r.get("media_type") == "tv"]
+        # "Últimos X años" (_movies_year_filter_combo): recorta por año de
+        # estreno contando hacia atrás desde el año actual (1 = los últimos
+        # ~12 meses, es decir el año actual y el anterior). "Todos" (o valor
+        # inválido) no filtra. El combo es editable: el parsing tolera un
+        # número con o sin la palabra "años" ("20", "20 años", "20años") --
+        # se extrae el primer número que haya. El año de la fila viene de
+        # release_date (r["year"], string "YYYY"); las filas sin año (vacío)
+        # no se pueden comparar, se mantienen.
+        year_sel = self._movies_year_filter_combo.get().strip() if self._movies_year_filter_combo else "1"
+        if year_sel and year_sel.lower() != "todos":
+            m_year = re.search(r"\d+", year_sel)
+            if m_year:
+                try:
+                    min_year = _time.localtime().tm_year - int(m_year.group())
+                except (TypeError, ValueError):
+                    min_year = None
+            else:
+                min_year = None
+            if min_year is not None:
+                def _row_year(r):
+                    try:
+                        return int(r.get("year") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                rows = [r for r in rows if not _row_year(r) or _row_year(r) >= min_year]
+        # "Género" (_movies_genre_filter_combo): recorta por género TMDB --
+        # el valor del combo ("Todos"/"Anime"/nombre del género) va directo
+        # al helper apply_genre_filter; las filas traen "genres" (nombres)
+        # desde el escaneo o la caché. "Anime" es un alias de "Animación"
+        # (ver row_matches_genre).
+        if self._movies_genre_filter_combo is not None:
+            genre_sel = self._movies_genre_filter_combo.get()
+            if genre_sel not in ("", "Todos"):
+                rows = apply_genre_filter(rows, genre_sel)
+        rows = filter_by_text(rows, self._movies_search_entry.get().strip().lower())
+        if self._movies_hide_in_server_var.get():
+            rows = apply_in_server_filter(rows, True)
+        if self._movies_watch_only_var.get():
+            movies = apply_watch_availability_filter([r for r in rows if r.get("media_type") != "tv"], True)
+            series = [r for r in rows if r.get("media_type") == "tv"]
+            rows = movies + series
+        # "Ocultar asiáticas": descarta el contenido de Asia oriental y del
+        # sur (China/Japón/Corea/India/Tailandia...) según el
+        # original_language/origin_country de cada fila. Sin dato de origen
+        # la obra se mantiene (apply_origin_filter nunca descarta lo que no
+        # sabe asiático).
+        if self._movies_hide_asian_var.get():
+            rows = apply_origin_filter(rows, True)
+        return sort_movie_rows(rows, self._movies_sort_key, self._movies_sort_asc)
+
+    @staticmethod
+    def _movies_sort_key_for_column(column_key: str) -> str:
+        """Clave de sort_movie_rows() para una columna ordenable de la tabla
+        de Películas -- "name" ordena por título y "vote" por nota; el resto
+        (year/list) pasan tal cual."""
+        return {"name": "title", "vote": "vote_average"}.get(column_key, column_key)
+
+    @staticmethod
+    def _movies_column_for_sort_key(sort_key: str):
+        """Columna que debe mostrar el indicador de orden para una clave de
+        sort_movie_rows() -- inversa de _movies_sort_key_for_column (el
+        indicador de TableView se marca por columna, ver set_sort_indicator)."""
+        return {"title": "name", "vote_average": "vote"}.get(sort_key, sort_key)
+
+    def _on_movies_header_click(self, key: str):
+        sort_key = self._movies_sort_key_for_column(key)
+        self._movies_sort_key, self._movies_sort_asc = self._next_sort_state(
+            self._movies_sort_key, self._movies_sort_asc, sort_key)
+        self._movies_table.set_sort_indicator(
+            self._movies_column_for_sort_key(self._movies_sort_key), self._movies_sort_asc)
+        self._save_table_sort("peliculas", self._movies_sort_key, self._movies_sort_asc)
+        self._render_movies_table(reset_page=False)
+
+    _MOVIES_SEARCH_DEBOUNCE_MS = 200   # ver _on_movies_search_key
+
+    def _on_movies_search_key(self, event):
+        """<KeyRelease> del cuadro de búsqueda -- con antirrebote en vez de
+        redibujar en cada tecla: _render_movies_table() recalcula y
+        reconstruye la página entera de la tabla (filtra+ordena TODAS las
+        películas cacheadas), caro para repetirlo en cada pulsación."""
+        if self._movies_search_debounce_id is not None:
+            self.after_cancel(self._movies_search_debounce_id)
+        self._movies_search_debounce_id = self.after(
+            self._MOVIES_SEARCH_DEBOUNCE_MS, self._render_movies_search_debounced)
+
+    def _render_movies_search_debounced(self):
+        self._movies_search_debounce_id = None
+        self._render_movies_table()
+
+    def _movies_render_page(self, scroll_top: bool = True):
+        """Dibuja solo self._movies_page de las filas que pasan los filtros
+        activos -- ver TableView.page_size y _missing_ep_render_page (mismo
+        comentario sobre por qué la página es acotada y los lotes via after).
+
+        scroll_top=False (ver _render_movies_table con reset_page=False): un
+        refresco en segundo plano no cambia el conjunto de filas ni cuántas
+        hay, así que no hace falta subir el scroll."""
+        # Solo se destruyen las filas (y el mensaje vacío, si estaba) -- la
+        # cabecera vive en TableView.header_frame, aparte del cuerpo con
+        # scroll (ver gui/table_view.py), así que nunca se ve tocada por esto.
+        for widgets in self._movies_row_widgets.values():
+            widgets["row_fr"].destroy()
+        if self._movies_empty_msg is not None:
+            self._movies_empty_msg.destroy()
+            self._movies_empty_msg = None
+        # tmdb_id -> {"row_fr", "r", "fav_btn", "lock_btn"} -- suficiente para
+        # refrescar favorito/protegido sin reconstruir la tabla entera (ver
+        # _toggle_movie_favorite/_toggle_movie_reservation).
+        self._movies_row_widgets = {}
+
+        sorted_rows = self._movies_visible_rows()
+
+        if not sorted_rows:
+            if self._movies_results:
+                msg = "Sin resultados que coincidan con el filtro."
+            else:
+                msg = "Pulsa \"🔍 Recomendar\" para buscar películas y series."
+            self._movies_empty_msg = ctk.CTkLabel(self._movies_table.body, text=msg, text_color=PENDING_COLOR)
+            self._movies_empty_msg.pack(pady=30)
+            self._movies_page_lbl.configure(text="")
+            self._movies_prev_btn.configure(state="disabled")
+            self._movies_next_btn.configure(state="disabled")
+            return
+
+        total = len(sorted_rows)
+        page_size = self._movies_table.page_size
+        n_pages = max(1, -(-total // page_size))
+        self._movies_page = max(0, min(n_pages - 1, self._movies_page))
+        start = self._movies_page * page_size
+        page_rows = sorted_rows[start:start + page_size]
+
+        self._movies_page_lbl.configure(text=f"Página {self._movies_page + 1} de {n_pages}")
+        self._movies_prev_btn.configure(state="normal" if self._movies_page > 0 else "disabled")
+        self._movies_next_btn.configure(state="normal" if self._movies_page < n_pages - 1 else "disabled")
+
+        # Volver arriba del todo -- ver el comentario largo de
+        # _missing_ep_render_page (solo si scroll_top=True).
+        if scroll_top:
+            self._movies_table.scroll_to_top()
+
+        # En lotes vía after() dentro de la propia página (no la lista
+        # entera): self._movies_render_token invalida cualquier lote
+        # pendiente de una llamada anterior si esta función se vuelve a
+        # llamar antes de terminar (p.ej. el usuario cambia de página o de
+        # filtro a media carga).
+        self._movies_render_token = getattr(self, "_movies_render_token", 0) + 1
+        token = self._movies_render_token
+        _BATCH = 20
+
+        def _render_batch(start=0):
+            if token != self._movies_render_token:
+                return   # una llamada más reciente ya se está pintando
+            for r in page_rows[start:start + _BATCH]:
+                try:
+                    self._build_movie_row(r)
+                except Exception:
+                    _log.exception("Películas: no se pudo construir la fila de '%s' (tmdb_id=%s)",
+                                   r.get("title"), r.get("tmdb_id"))
+            if start + _BATCH < len(page_rows):
+                self.after(1, lambda: _render_batch(start + _BATCH))
+            else:
+                # Solo al terminar el ÚLTIMO lote -- medir con la página a
+                # medio construir daría un alto medio por fila incorrecto
+                # (ver TableView.note_rows_rendered).
+                self._movies_table.note_rows_rendered(len(page_rows))
+
+        _render_batch()
+
+    def _build_movie_row(self, r: dict):
+        """Construye y empaqueta la fila de una película o serie en la tabla
+        "Recomendado" -- mismo patrón que _build_missing_ep_row: CTkLabel +
+        bind en las celdas clicables (nombre, favorito, protegido) y
+        CTkButton de icono con color en las acciones (buscar / copiar /
+        descargar / autocompletar / quitar recomendación). La ficha NO se
+        despliega en la fila: pulsar el nombre la carga en el panel lateral.
+
+        Para una SERIE (r["media_type"] == "tv") el botón ⬇ descarga solo el
+        piloto (1x01) y aparece un botón ⚡ de autocompletado que completa la
+        serie entera (mismo mecanismo persistente que "Episodios que
+        faltan", ver _toggle_missing_ep_auto_complete). Las series no
+        consultan watch providers, así que la columna "Disponible en"
+        muestra "—"."""
+        from core.missing_movies import MOVIE_LIST_LABELS
+        from core.missing_movies_cache import cache_key
+        tmdb_id = r["tmdb_id"]
+        media_type = r.get("media_type", "movie")
+        is_tv = media_type == "tv"
+        sel_key = cache_key(media_type, tmdb_id)
+        is_selected = sel_key == getattr(self, "_movies_selected_tmdb_id", None)
+
+        cw = self._movies_table.col_width
+        row_fr = ctk.CTkFrame(self._movies_table.body,
+                              fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
+        row_fr.pack(fill="x", pady=3, padx=2)
+
+        header_row = ctk.CTkFrame(row_fr, fg_color="transparent")
+        header_row.pack(fill="x")
+
+        _cell = lambda key, pady=6, **kw: self._movies_table.cell(header_row, key, pady=pady, **kw)
+
+        # Favorito (★/☆) y protegido (🔒/🔓): CTkLabel + bind, no
+        # CTkButton -- mismo motivo de rendimiento que en Episodios que
+        # faltan (varios cientos de obras cacheadas de golpe al
+        # arrancar). Funcionan sobre el media_type de la fila con el tmdb_id,
+        # igual que en Archivos/Liberar espacio.
+        c = _cell("fav")
+        is_fav = self._is_favorite(media_type, tmdb_id)
+        fav_btn = ctk.CTkLabel(
+            c, text="★" if is_fav else "☆", cursor="hand2",
+            text_color=ACCENT if is_fav else PENDING_COLOR)
+        fav_btn.pack(fill="both", expand=True)
+        fav_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["title"], mt=media_type:
+                     self._toggle_movie_favorite(tid, name, mt))
+
+        c = _cell("lock")
+        is_res = self._is_reserved(media_type, tmdb_id)
+        lock_btn = ctk.CTkLabel(
+            c, text="🔒" if is_res else "🔓", cursor="hand2",
+            text_color=ACCENT if is_res else PENDING_COLOR)
+        lock_btn.pack(fill="both", expand=True)
+        lock_btn.bind("<Button-1>", lambda ev, tid=tmdb_id, name=r["title"], mt=media_type:
+                      self._toggle_movie_reservation(tid, name, mt))
+
+        # Autocompletar la serie (⚡) -- SOLO series, pero la celda se pinta
+        # SIEMPRE (vacía en las películas) para que las columnas de todas
+        # las filas cuadren con la cabecera: antes solo se pintaba en las
+        # series y las filas de película quedaban descuadradas hacia la
+        # izquierda. Va junto a favorito/proteger, antes del título. Activa
+        # el mismo mecanismo persistente que el botón ⚡ de "Episodios que
+        # faltan" (ver _toggle_missing_ep_auto_complete): la app busca y
+        # descarga sola el piloto y el resto de capítulos que falten (para
+        # una serie recomendada que no está en el servidor, todos los
+        # emitidos), y los nuevos que vayan saliendo. Mismo aspecto:
+        # CTkLabel + bind, acento cuando está activo, gris en reposo.
+        c = _cell("auto")
+        if is_tv:
+            auto_active = self._is_missing_ep_auto_enabled(tmdb_id)
+            auto_btn = ctk.CTkLabel(
+                c, text="⚡", cursor="hand2",
+                text_color=ACCENT if auto_active else PENDING_COLOR)
+            auto_btn.pack(fill="both", expand=True)
+            auto_btn.bind("<Button-1>", lambda ev, tid=tmdb_id:
+                          self._toggle_missing_ep_auto_complete(tid))
+            attach_tooltip(auto_btn, lambda tid=tmdb_id: self._auto_btn_tooltip(tid))
+            self._missing_ep_auto_widgets[tmdb_id] = auto_btn
+        else:
+            ctk.CTkLabel(c, text="", font=self._movies_icon_font).pack(fill="both", expand=True)
+            self._missing_ep_auto_widgets.pop(tmdb_id, None)
+
+        # CTkLabel + bind (no CTkButton): esta fila se construye para las
+        # ~varios cientos de obras cacheadas de golpe al arrancar (ver
+        # "self.after(50, self._render_movies_table)") -- mismo motivo de
+        # rendimiento que en Episodios que faltan. El clic en el nombre solo
+        # selecciona la obra (ficha en el panel lateral), sin desplegar
+        # la fila.
+        c = _cell("name")
+        name_lbl = ctk.CTkLabel(c, text=f"📺 {r['title']}" if is_tv else f"🎬 {r['title']}",
+                                font=self._movies_name_font,
+                                anchor="w", cursor="hand2")
+        name_lbl.pack(fill="both", expand=True)
+        name_lbl.bind("<Button-1>", lambda e, row=r: self._show_movie_poster(row))
+
+        c = _cell("year")
+        year_lbl = ctk.CTkLabel(c, text=r.get("year", "") or "—",
+                                font=self._movies_summary_font, text_color=PENDING_COLOR)
+        year_lbl.pack(fill="both", expand=True)
+
+        c = _cell("list")
+        list_lbl = ctk.CTkLabel(c, text=MOVIE_LIST_LABELS.get(r.get("list"), r.get("list", "")),
+                                font=self._movies_summary_font, text_color=PENDING_COLOR)
+        list_lbl.pack(fill="both", expand=True)
+
+        c = _cell("vote")
+        vote_lbl = ctk.CTkLabel(c, text=f"{(r.get('vote_average') or 0):.1f}",
+                                font=self._movies_summary_font, text_color=PENDING_COLOR)
+        vote_lbl.pack(fill="both", expand=True)
+
+        # Disponibilidad fuera del cine (watch providers de TMDB) -- solo
+        # aplica a películas (las series no la consultan, siempre quedan en
+        # "watch": {}): para no marcar falsamente una serie como "Solo en
+        # cines", la columna muestra "—".
+        if is_tv:
+            c = _cell("watch")
+            watch_lbl = ctk.CTkLabel(c, text="—", font=self._movies_summary_font,
+                                     text_color=PENDING_COLOR)
+            watch_lbl.pack(fill="both", expand=True)
+        else:
+            from core.missing_movies import format_watch_display
+            c = _cell("watch")
+            watch_text = format_watch_display(r)
+            watch_lbl = ctk.CTkLabel(
+                c, text=watch_text, font=self._movies_summary_font,
+                text_color=SUCCESS_COLOR if watch_text != "Solo en cines" else ERROR_COLOR)
+            watch_lbl.pack(fill="both", expand=True)
+
+        in_server = bool(r.get("in_server"))
+        c = _cell("server")
+        server_lbl = ctk.CTkLabel(
+            c, text="✓ En servidor" if in_server else "No",
+            font=self._movies_summary_font,
+            text_color=SUCCESS_COLOR if in_server else PENDING_COLOR)
+        server_lbl.pack(fill="both", expand=True)
+
+        # 🔍 Buscar en aMule (abre la pestaña Descargas) -- mismo patrón que
+        # el botón de Episodios que faltan (ver _search_missing_ep_on_amule).
+        # La consulta es SOLO el título, sin el año entre paréntesis: aMule
+        # devuelve error si la consulta lleva paréntesis (visto de verdad
+        # con "Michael (2026)"). El año se pasa aparte (expected_year) para
+        # que al elegir el mejor candidato se compruebe que el release
+        # declara ese año (ver core/download_quality.py::score_download).
+        movie_query = r["title"]
+        try:
+            movie_year = int(r.get("year") or 0) or None
+        except (TypeError, ValueError):
+            movie_year = None
+        c = _cell("search")
+        search_btn = ctk.CTkButton(
+            c, text="🔍", height=24, font=self._movies_icon_font,
+            fg_color=ICON_AMULE, hover_color="#693a99",
+            command=lambda mq=movie_query, title=r["title"]:
+            self._search_missing_ep_on_amule(mq, title))
+        attach_tooltip(search_btn, lambda: "Buscar en aMule (abre la pestaña Descargas)")
+        search_btn.pack(fill="both", expand=True)
+
+        c = _cell("copy")
+        copy_btn = ctk.CTkButton(
+            c, text="📋", height=24, font=self._movies_icon_font,
+            fg_color=ICON_COPY, hover_color="#35508F",
+            command=lambda row=r: self._copy_to_clipboard(f"{row['title']} ({row['year']})"))
+        attach_tooltip(copy_btn, lambda: "Copiar nombre de la obra al portapapeles")
+        copy_btn.pack(fill="both", expand=True)
+
+        # Descargar: solo tiene sentido cuando la obra NO está ya en el
+        # servidor -- con in_server el botón queda deshabilitado. Mismo
+        # comportamiento y aspecto que el botón ⬇ de Episodios que faltan:
+        # reposo azul (ICON_DL_IDLE), ámbar mientras busca (ICON_DL_BUSY),
+        # verde si la descarga se lanzó o rojo si no hubo candidato útil
+        # (ver _auto_download_episode_on_amule).
+        #
+        # Para una película descarga la película (is_movie=True,
+        # expected_year para que el release declare el año). Para una SERIE
+        # descarga solo el PILOTO (1x01): la serie se completa aparte con el
+        # botón ⚡ de autocompletado.
+        c = _cell("download")
+        dl_btn = ctk.CTkButton(
+            c, text="⬇", height=24, font=self._movies_icon_font,
+            fg_color=("gray80", "#3a3a3a") if in_server else ICON_DL_IDLE,
+            hover_color=("gray80", "#3a3a3a") if in_server else ICON_DL_BUSY,
+            state="disabled" if in_server else "normal")
+        if is_tv:
+            pilot_query = f"{r['title']} 1x01"
+            dl_btn.configure(command=lambda mq=pilot_query, b=dl_btn:
+                             self._auto_download_episode_on_amule(mq, b, expected_year=None, is_movie=False))
+        else:
+            dl_btn.configure(command=lambda mq=movie_query, y=movie_year, b=dl_btn:
+                             self._auto_download_episode_on_amule(mq, b, expected_year=y, is_movie=True))
+        if is_tv:
+            dl_hint = ("Buscar en aMule y descargar automáticamente el mejor candidato para el "
+                       "PILOTO (1x01) de esta serie (en segundo plano, sin abrir la pestaña "
+                       "Descargas).\n"
+                       "Para completar la serie entera usa el botón ⚡ de autocompletar.")
+        else:
+            dl_hint = ("Buscar en aMule y descargar automáticamente el mejor candidato para esta "
+                       "película (en segundo plano, sin abrir la pestaña Descargas).")
+        attach_tooltip(dl_btn, lambda: (
+            dl_hint + "\n"
+            "Color: azul=reposo, ámbar=en curso, verde=lanzado, rojo=sin candidato/error"
+            if not in_server else "Ya está en el servidor"))
+
+        dl_btn.pack(fill="both", expand=True)
+
+        # padx trailing=12 (no 0): margen deliberado al final de la fila,
+        # nada que ver con los sashes -- se conserva a mano, col_padx() solo
+        # modela el margen IZQUIERDO de cada columna (mismo criterio que el
+        # botón 🗑 de Episodios que faltan).
+        c = _cell("dismiss", padx=(self._movies_table.col_padx("dismiss")[0], 12))
+        dismiss_btn = ctk.CTkButton(
+            c, text="🚫", height=24, font=self._movies_icon_font,
+            fg_color="transparent", border_width=1, text_color=PENDING_COLOR,
+            hover_color=("gray88", "#2b2b2b"),
+            command=lambda row=r: self._dismiss_missing_movie(row))
+        attach_tooltip(dismiss_btn, lambda: "Quitar recomendación")
+        dismiss_btn.pack(fill="both", expand=True)
+
+        self._movies_row_widgets[sel_key] = {
+            "row_fr": row_fr, "r": r,
+            "fav_btn": fav_btn, "lock_btn": lock_btn,
+        }
+
+    def _show_movie_poster(self, r: dict):
+        from core.missing_movies import MOVIE_LIST_LABELS
+        from core.missing_movies_cache import cache_key
+        sel_key = cache_key(r.get("media_type", "movie"), r["tmdb_id"])
+        self._movies_selected_tmdb_id = sel_key
+        for key, widgets in self._movies_row_widgets.items():
+            widgets["row_fr"].configure(
+                fg_color=SELECTED_ROW_COLOR if key == sel_key else ("gray95", "gray17"))
+        self._set_textbox_text(self._movies_detail_title, r.get("title", ""))
+        tipo = "📺 Serie" if r.get("media_type") == "tv" else "🎬 Película"
+        meta = " · ".join(x for x in [
+            tipo,
+            r.get("year") or "",
+            MOVIE_LIST_LABELS.get(r.get("list"), r.get("list", "")),
+            f"⭐ {(r.get('vote_average') or 0):.1f}",
+        ] if x)
+        genres = [g for g in (r.get("genres") or []) if g]
+        if genres:
+            meta = (meta + " · " if meta else "") + ", ".join(genres)
+        self._set_textbox_text(self._movies_detail_meta, meta)
+        if r.get("media_type") == "tv":
+            self._set_textbox_text(self._movies_detail_cert, "Serie")
+            self._movies_cert_token = object()
+        else:
+            self._set_textbox_text(self._movies_detail_cert,
+                                   r.get("certification") or "Clasificación: …")
+            self._load_movie_certification(r)
+        self._set_textbox_text(self._movies_detail_overview, r.get("overview") or "Sin sinopsis disponible")
+        self._movies_poster_label.configure(image=None, text="…")
+        token = object()
+        self._movies_poster_token = token
+        if r.get("poster_url"):
+            threading.Thread(target=self._load_movie_poster,
+                             args=(r["poster_url"], token), daemon=True).start()
+        else:
+            self._movies_poster_label.configure(image=None, text="Sin póster")
+
+    def _load_movie_poster(self, url: str, token):
+        try:
+            resp = requests.get(url, timeout=8)
+            img = Image.open(BytesIO(resp.content)).resize((180, 260), Image.LANCZOS)
+            ctk_img = ctk.CTkImage(img, size=(180, 260))
+            def _apply():
+                if self._movies_poster_token is token:
+                    self._movies_poster_label.configure(image=ctk_img, text="")
+                    self._movies_current_poster = ctk_img
+            self.after(0, _apply)
+        except Exception:
+            pass
+
+    def _load_movie_certification(self, r: dict):
+        """Clasificación por edad de la ficha (PG-13, 12, 18...), consultada
+        a TMDB on-demand con caché: si la fila ya la tiene (caché de un
+        escaneo anterior) se usa tal cual; si no, se pide en un hilo aparte,
+        se guarda en missing_movies_cache.json y se actualiza la ficha y la
+        fila (mismo patrón que el póster). Un fallo de red deja "Clasificación:
+        …" o el valor ya mostrado, sin molestar."""
+        if r.get("certification"):
+            self._set_textbox_text(self._movies_detail_cert,
+                                   f"Clasificación: {r['certification']}")
+            return
+        tmdb_id = r["tmdb_id"]
+        token = object()
+        self._movies_cert_token = token
+
+        def _worker():
+            from core.missing_movies_cache import load_cache, save_cache, cache_key
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            cert = ""
+            try:
+                cert = client.get_movie_certification(tmdb_id)
+            except Exception:
+                _log.warning("Recomendado: fallo al pedir la clasificación de tmdb_id=%s", tmdb_id)
+            def _apply():
+                if getattr(self, "_movies_cert_token", None) is not token:
+                    return
+                label = f"Clasificación: {cert}" if cert else "Clasificación: sin dato"
+                self._set_textbox_text(self._movies_detail_cert, label)
+                r["certification"] = cert
+                cache = dict(load_cache())
+                entry = cache.get(cache_key("movie", tmdb_id))
+                if entry is not None:
+                    entry["certification"] = cert
+                    save_cache(cache)
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _toggle_movie_favorite(self, tmdb_id: int, name: str, media_type: str = "movie"):
+        """Igual que _toggle_missing_ep_favorite, pero sobre el media_type de
+        la fila ("movie" o "tv"; las obras de esta pestaña se marcan/protegen
+        por su tmdb_id + tipo, igual que en Archivos/Liberar espacio)."""
+        from core.missing_movies_cache import cache_key
+        def _refresh():
+            key = cache_key(media_type, tmdb_id)
+            widgets = self._movies_row_widgets.get(key)
+            if not widgets:
+                return
+            is_fav = self._is_favorite(media_type, tmdb_id)
+            widgets["fav_btn"].configure(text="★" if is_fav else "☆",
+                                          text_color=ACCENT if is_fav else PENDING_COLOR)
+        self._toggle_favorite(media_type, tmdb_id, name, on_done=_refresh)
+
+    def _toggle_movie_reservation(self, tmdb_id: int, name: str, media_type: str = "movie"):
+        """Igual que _toggle_missing_ep_reservation: reserva/libera sitio en
+        la cuota configurada para esta obra, con _best_known_size_bytes
+        como tamaño (0 si no se conoce -- _toggle_reservation ya sabe tratar
+        eso como "no ocupa nada de cuota todavía")."""
+        from core.missing_movies_cache import cache_key
+        def _refresh():
+            key = cache_key(media_type, tmdb_id)
+            widgets = self._movies_row_widgets.get(key)
+            if not widgets:
+                return
+            is_res = self._is_reserved(media_type, tmdb_id)
+            widgets["lock_btn"].configure(text="🔒" if is_res else "🔓",
+                                          text_color=ACCENT if is_res else PENDING_COLOR)
+        size_bytes = self._best_known_size_bytes(media_type, tmdb_id, 0)
+        self._toggle_reservation(media_type, tmdb_id, name, size_bytes, on_done=_refresh)
+
+    def _dismiss_missing_movie(self, r: dict):
+        """Botón "🚫" de una fila: quita esta recomendación de la caché en
+        disco (para que no reaparezca al reiniciar) y de la tabla, sin
+        esperar a un nuevo escaneo."""
+        from core.missing_movies_cache import (load_cache, save_cache,
+                                               remove_movie_from_cache, cache_key)
+        media_type = r.get("media_type", "movie")
+        cache = load_cache()
+        if remove_movie_from_cache(cache, r["tmdb_id"], media_type):
+            save_cache(cache)
+        self._movies_results = [row for row in self._movies_results
+                                if not (row.get("tmdb_id") == r["tmdb_id"]
+                                        and row.get("media_type", "movie") == media_type)]
+        if cache_key(media_type, r["tmdb_id"]) == self._movies_selected_tmdb_id:
+            self._movies_selected_tmdb_id = None
+        self._refresh_movies_genre_filter_options()
+        self._render_movies_table(reset_page=False)
+        self._update_movies_status_text()
+        self._set_status(f"Recomendación quitada: {r['title']}", PENDING_COLOR)
+
     # ── Detector de episodios que faltan (Plex/Jellyfin + TMDB) ──
     # Pantalla completa (_build_missing_episodes_tab), tan importante como
     # la de Archivos -- no un diálogo aparte.
@@ -7995,11 +9587,15 @@ class App(_AppBase):
         self._missing_ep_side_panel.configure(width=w)
         content_w = max(100, w - 40)   # descontar el padding interno del panel
         self._missing_ep_detail_title.configure(width=content_w)
+        self._missing_ep_detail_meta.configure(width=content_w)
+        self._missing_ep_detail_cert.configure(width=content_w)
         self._missing_ep_detail_overview.configure(width=content_w)
         self._missing_ep_path_lbl.configure(wraplength=content_w)
         self._missing_ep_ai_verdict_lbl.configure(wraplength=content_w)
         self._missing_ep_ftp_tree_box.configure(width=content_w)
         self._autosize_textbox(self._missing_ep_detail_title)
+        self._autosize_textbox(self._missing_ep_detail_meta)
+        self._autosize_textbox(self._missing_ep_detail_cert)
         self._autosize_textbox(self._missing_ep_detail_overview)
 
     def _build_missing_ep_side_panel(self, parent):
@@ -8025,6 +9621,18 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._missing_ep_detail_title.configure(state="disabled")
         self._missing_ep_detail_title.pack(pady=(4, 0), fill="x")
+        self._missing_ep_detail_meta = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._missing_ep_detail_meta.configure(state="disabled")
+        self._missing_ep_detail_meta.pack(pady=(0, 0), fill="x")
+        self._missing_ep_detail_cert = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._missing_ep_detail_cert.configure(state="disabled")
+        self._missing_ep_detail_cert.pack(pady=(0, 0), fill="x")
         self._missing_ep_detail_overview = ctk.CTkTextbox(
             scroll, width=200, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -8207,6 +9815,43 @@ class App(_AppBase):
 
         self._render_missing_episodes_table(reset_page=False)
 
+    def _remove_uploaded_movie_from_movies_list(self, media_info) -> None:
+        """Tras subir una película (automático o manual), si esa película
+        concreta aparecía en la pestaña "Recomendado" como recomendada, se
+        marca como en servidor en la caché y se quita de la tabla -- mismo
+        criterio que _remove_uploaded_episode_from_missing_list para
+        capítulos: la propia app acaba de subirla, no hace falta volver a
+        preguntarle a Jellyfin/Plex y esperar a que reindexen la
+        biblioteca. Además comparte el flag "in_server" por FTP (ver
+        _push_missing_movies_to_ftp) para que el resto de clientes del
+        mismo servidor también la quiten de sus listas. Debe llamarse
+        desde el hilo de la GUI (los sitios en un hilo de subida ya lo
+        agendan con self.after)."""
+        if media_info is None or media_info.media_type != "movie":
+            return
+        tmdb_id = media_info.tmdb_id
+        if not tmdb_id:
+            return
+
+        from core.missing_movies_cache import (load_cache, save_cache,
+                                               mark_movie_in_server)
+        cache = load_cache()
+        changed = mark_movie_in_server(cache, tmdb_id)
+        if changed:
+            save_cache(cache)
+            self._push_missing_movies_to_ftp()
+
+        # Marcar la fila en memoria como en servidor -- con el filtro
+        # "Ocultar ya en el servidor" (activo por defecto) desaparece de la
+        # tabla; si el usuario lo apaga, la ve como "✓ En servidor" con el
+        # botón de descarga deshabilitado, no borrada de la lista.
+        for row in self._movies_results:
+            if row.get("media_type", "movie") == "movie" and row.get("tmdb_id") == tmdb_id:
+                row["in_server"] = True
+        if getattr(self, "_movies_visible", False):
+            self._render_movies_table(reset_page=False)
+            self._update_movies_status_text()
+
     def _remove_series_from_missing_episodes(self, tmdb_id: int):
         """Quita una serie ENTERA de "Episodios que faltan" -- mismo
         mecanismo que _remove_uploaded_from_missing_episodes (quitar de
@@ -8235,6 +9880,26 @@ class App(_AppBase):
         if remove_series_from_cache(cache, tmdb_id):
             save_cache(cache)
             self._push_missing_episodes_to_ftp()
+
+        # La serie ya no está en el servidor -- el autocompletado no tiene
+        # nada que completar, y seguir activo solo haría que el worker
+        # (cada 30 min) la tratara como "serie nueva" y se descargara
+        # entera otra vez si todavía está en Recomendado (ver
+        # _auto_complete_series_single_impl). Se desactiva igual que el
+        # interruptor "⚡" (ver _toggle_missing_ep_auto_complete).
+        key = str(tmdb_id)
+        auto_series = self._auto_complete_series()
+        if key in auto_series:
+            auto_series.discard(key)
+            self.config_data.set("missing_ep_auto_complete", sorted(auto_series))
+            self.config_data.save()
+            # Quitar la cuenta atrás del detalle de la serie si estaba puesta.
+            lbl = self._missing_ep_auto_countdown_lbls.pop(tmdb_id, None)
+            if lbl is not None:
+                try:
+                    lbl.destroy()
+                except Exception:
+                    pass
 
         self._render_missing_episodes_table(reset_page=False)
 
@@ -8374,6 +10039,103 @@ class App(_AppBase):
         self.config_data.set(config_key, var.get())
         self.config_data.save()
         then()
+
+    def _on_movies_type_filter_changed(self, value: str):
+        """Persiste el filtro de tipo de la pestaña "Recomendado"
+        (missing_movies_type_filter: "all"/"movies"/"series") y re-renderiza
+        la tabla. El CTkSegmentedButton muestra etiquetas legibles, así que
+        se traduce al valor interno antes de guardar.
+
+        El StringVar NO está vinculado al SegmentedButton (customtkinter no
+        sincroniza variable con los segmentos pulsados, solo con set()), así
+        que además hay que actualizarlo aquí a mano -- sin esto
+        _movies_visible_rows seguía leyendo "all" (el valor inicial) y el
+        filtro "recargaba" pero no filtraba nada."""
+        mapping = {"Todo": "all", "Películas": "movies", "Series": "series"}
+        key = mapping.get(value, "all")
+        self._movies_type_filter_var.set(key)
+        self.config_data.set("missing_movies_type_filter", key)
+        self.config_data.save()
+        self._render_movies_table()
+
+    def _on_movies_year_key(self, event):
+        """<KeyRelease> del combo de años -- con antirrebote como el cuadro
+        de búsqueda: _render_movies_table() recalcula y reconstruye la página
+        entera (filtra+ordena todas las películas cacheadas), caro para
+        repetirlo en cada pulsación."""
+        if self._movies_year_debounce_id is not None:
+            self.after_cancel(self._movies_year_debounce_id)
+        self._movies_year_debounce_id = self.after(
+            self._MOVIES_SEARCH_DEBOUNCE_MS, self._on_movies_year_filter_enter)
+
+    def _on_movies_year_filter_enter(self, event=None):
+        """Enter en el combo de años (o antirrebote del tecleo): aplica el
+        valor escrito y lo persiste igual que una selección del desplegable.
+        El parsing tolera "20", "20 años" y "20años" (ver
+        _movies_visible_rows); un valor no numérico se guarda pero no filtra."""
+        self._movies_year_debounce_id = None
+        self._on_movies_year_filter_changed(self._movies_year_filter_combo.get())
+
+    def _on_movies_year_filter_changed(self, value: str):
+        """Persiste el filtro de años de estreno de la pestaña "Recomendado"
+        (missing_movies_year_filter: "1"/"2"/... "20 años" o "Todos") y
+        re-renderiza la tabla -- se guarda al cambiar para que se recuerde
+        entre reinicios, como el resto de filtros de esta línea."""
+        self.config_data.set("missing_movies_year_filter", value)
+        self.config_data.save()
+        self._render_movies_table()
+
+    def _refresh_movies_genre_filter_options(self):
+        """(Re)puebla el selector "Género" de la barra de filtros con los
+        géneros presentes en las filas actuales (campo "genres" de cada fila,
+        nombres en el idioma configurado), más "Anime" (alias de Animación,
+        ver row_matches_genre) y "Todos". Se llama al construir la pestaña y
+        tras cada escaneo/recarga de caché, para que las opciones reflejen
+        los resultados reales (las filas traen "genres" desde el escaneo o la
+        caché; ver _load_movies_from_cache/_scan_missing_movies).
+
+        Mantiene la selección actual si el género sigue entre las opciones;
+        si no (p.ej. un escaneo nuevo sin ese género), vuelve a "Todos" y
+        guarda el reset -- no se puede filtrar por algo que ya no existe."""
+        if getattr(self, "_movies_filters_fr", None) is None:
+            return
+        genres = sorted({g for r in (getattr(self, "_movies_results", None) or [])
+                         for g in (r.get("genres") or []) if g})
+        options = ["Todos"] + (["Anime"] if "Animación" in genres else []) + genres
+        saved = self.config_data.get("missing_movies_genre_filter", "")
+        current = saved if saved in options else "Todos"
+        if current != saved:
+            self.config_data.set("missing_movies_genre_filter", current)
+            self.config_data.save()
+        if self._movies_genre_filter_combo is None:
+            # Creado la primera vez, empacado a la izquierda del de años
+            # (pack(side="right"): lo último empacado queda más a la izquierda
+            # del contenedor; ver cómo se empaqueta el resto de filtros).
+            self._movies_genre_filter_label = ctk.CTkLabel(
+                self._movies_filters_fr, text="Género:",
+                font=ctk.CTkFont(size=12))
+            self._movies_genre_filter_combo = ctk.CTkComboBox(
+                self._movies_filters_fr, values=options, width=110, state="readonly",
+                command=self._on_movies_genre_filter_changed)
+            # Empaquetar primero el combo y después la etiqueta para que en
+            # pantalla quede "Género: [selector]" (de izquierda a derecha),
+            # igual que el de "Años:" -- pack(side="right") apila de derecha
+            # a izquierda, y este bloque es el más a la izquierda de la barra.
+            self._movies_genre_filter_combo.pack(side="right", padx=(0, 4), pady=8)
+            self._movies_genre_filter_label.pack(side="right", padx=(8, 2), pady=8)
+        else:
+            self._movies_genre_filter_combo.configure(values=options)
+        self._movies_genre_filter_combo.set(current)
+
+    def _on_movies_genre_filter_changed(self, value: str):
+        """Persiste el filtro de género de la pestaña "Recomendado"
+        (missing_movies_genre_filter: nombre del género TMDB, "Anime" o
+        "Todos") y re-renderiza la tabla -- se guarda al cambiar para que se
+        recuerde entre reinicios, como el resto de filtros de esta línea."""
+        self.config_data.set("missing_movies_genre_filter",
+                             "Todos" if value == "Todos" else value)
+        self.config_data.save()
+        self._render_movies_table()
 
     def _on_toggle_hide_complete(self):
         """Al apagar "Ocultar completas" hay que traer de la caché las
@@ -9627,14 +11389,26 @@ class App(_AppBase):
         self._downloads_search_var.set(filename)
         self._downloads_do_search()
 
-    def _auto_download_episode_on_amule(self, query: str, button):
+    def _auto_download_episode_on_amule(self, query: str, button, expected_year: int = None,
+                                        is_movie: bool = False):
         """Botón "⬇" de una fila de episodio: busca en aMule, elige el mejor
         candidato (core/download_quality.best_result, el mismo criterio que
         se usa para destacar la fila recomendada de la pestaña Descargas) y
         lanza la descarga en segundo plano, SIN abrir la pestaña Descargas
         ni mostrar resultados. El único feedback es el color del propio
         botón: en reposo azul (ICON_DL_IDLE), ámbar mientras busca/descarga,
-        verde si la descarga se lanzó o rojo si no hubo candidato útil."""
+        verde si la descarga se lanzó o rojo si no hubo candidato útil.
+
+        *expected_year* (opcional, botón ⬇ de la pestaña Películas): año de
+        la película, que se pasa a best_result para exigir que el release
+        elegido lo declare en su nombre (la consulta de películas es SOLO el
+        título -- aMule rechaza consultas con paréntesis).
+
+        *is_movie* (botón ⬇ de la pestaña Películas): marca que se pide una
+        película, no un capítulo. best_result excluye entonces los resultados
+        con numeración de capítulo (SxxExx/NxNN): son de una serie, nunca la
+        película pedida. Real: el ⬇ de "Leo" bajó "Leo Talks 2x07", una
+        serie que el usuario no tiene."""
         def _worker():
             ec = None
             try:
@@ -9663,7 +11437,7 @@ class App(_AppBase):
                     last = None
                     for results in ec.iter_search(
                             query, search_type=st, poll_interval=2.0, max_duration=20.0):
-                        candidate = best_result(results, query) if results else None
+                        candidate = best_result(results, query, expected_year, is_movie) if results else None
                         if candidate is not None:
                             best = candidate
                             if last is not None and best is last:
@@ -9897,6 +11671,11 @@ class App(_AppBase):
             (r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
         if row:
             name = row.get("name", "")
+        if not name:
+            rec = next((r for r in self._movies_results
+                        if r.get("media_type") == "tv" and r.get("tmdb_id") == tmdb_id), None)
+            if rec:
+                name = rec.get("title", "")
             
         self._set_status(
             f"Autocompletado {'activado' if new_state else 'desactivado'} para "
@@ -9961,6 +11740,29 @@ class App(_AppBase):
         finally:
             busy.discard(tmdb_id)
 
+    def _tmdb_expected_episodes(self, tmdb_id: int) -> dict:
+        """Episodios YA EMITIDOS de todas las temporadas de una serie según
+        TMDB -- {temporada: [números]} sin incluir especiales (temporada 0).
+        Usado por el autocompletado de las series RECOMENDADAS que aún no
+        están en el servidor (ver _auto_complete_series_single_impl): como
+        no hay servidor con el que cruzar huecos, "faltan" todos los
+        emitidos. Misma lógica de temporadas que _rescan_single_series_worker
+        pero sin el cruce con lo que ya hay."""
+        details = self.tmdb.get_tv_details(tmdb_id)
+        expected = {}
+        for season in details.get("seasons", []):
+            n = season.get("season_number", 0)
+            if n <= 0:   # temporada 0 = especiales, no cuenta
+                continue
+            try:
+                eps = self.tmdb.get_season_episodes(tmdb_id, n)
+            except Exception:
+                continue
+            nums = [e["episode_number"] for e in eps if e.get("episode_number")]
+            if nums:
+                expected[n] = nums
+        return expected
+
     def _auto_complete_series_single_impl(self, tmdb_id: int):
         # Fila actual si ya está cachada; sin ella no se puede reescanear
         # esa serie sola (se necesita source/server_id).
@@ -9969,36 +11771,64 @@ class App(_AppBase):
             from core.missing_episodes_cache import load_cache
             cached = dict(load_cache()).get(str(tmdb_id))
             if not cached:
-                _log.info("Autocompletado: serie %s sin fila ni caché, se omite", tmdb_id)
-                return
-            row = {
-                "tmdb_id": tmdb_id,
-                "name": cached.get("name", ""),
-                "source": cached.get("source"),
-                "server_id": cached.get("server_id"),
-                "folder_name": cached.get("folder_name"),
-                "ignored": cached.get("ignored", False),
-                "ignored_seasons": set(cached.get("ignored_seasons") or []),
-                "ignored_episodes": {s: set(eps) for s, eps in (cached.get("ignored_episodes") or {}).items()},
-                "episode_titles": {},
-                "play_count": cached.get("play_count", 0),
-                "last_played_ts": cached.get("last_played_ts"),
-                "ai_verdict": cached.get("ai_verdict"),
-            }
-        if not row.get("source") or not row.get("server_id"):
-            return   # sin cómo reencender -- se deja para el reescaneo completo
+                row = None
+            else:
+                row = {
+                    "tmdb_id": tmdb_id,
+                    "name": cached.get("name", ""),
+                    "source": cached.get("source"),
+                    "server_id": cached.get("server_id"),
+                    "folder_name": cached.get("folder_name"),
+                    "ignored": cached.get("ignored", False),
+                    "ignored_seasons": set(cached.get("ignored_seasons") or []),
+                    "ignored_episodes": {s: set(eps) for s, eps in (cached.get("ignored_episodes") or {}).items()},
+                    "episode_titles": {},
+                    "play_count": cached.get("play_count", 0),
+                    "last_played_ts": cached.get("last_played_ts"),
+                    "ai_verdict": cached.get("ai_verdict"),
+                }
+        if row is not None and not (row.get("source") and row.get("server_id")):
+            # Fila de antes de que estos campos se guardaran en caché -- sin
+            # ellos no hay cómo reescanear contra el servidor; si además la
+            # serie está en la pestaña Recomendado (o es la fila misma), se
+            # intenta igualmente como serie nueva más abajo.
+            row = None
 
-        # Lista fresca de faltantes YA cruzada contra el FTP (los que ya
-        # están en el servidor salen de "missing" -- ver _rescan_single_series_worker).
-        try:
-            fresh_results, _removed = self._rescan_single_series_worker(row)
-        except Exception:
-            _log.exception("Autocompletado: reescaneo de '%s' (tmdb_id=%s) falló", row["name"], tmdb_id)
-            return
-        if not fresh_results:
-            _log.info("Autocompletado: '%s' ya no tiene huecos", row["name"])
-            return
-        fresh = fresh_results[0]
+        if row is not None:
+            # Lista fresca de faltantes YA cruzada contra el FTP (los que ya
+            # están en el servidor salen de "missing" -- ver _rescan_single_series_worker).
+            try:
+                fresh_results, _removed = self._rescan_single_series_worker(row)
+            except Exception:
+                _log.exception("Autocompletado: reescaneo de '%s' (tmdb_id=%s) falló", row["name"], tmdb_id)
+                return
+            if not fresh_results:
+                _log.info("Autocompletado: '%s' ya no tiene huecos", row["name"])
+                return
+            fresh = fresh_results[0]
+            series_name = fresh.get("name", row["name"])
+        else:
+            # Serie sin fila en el detector de huecos -- puede ser una serie
+            # RECOMENDADA de la pestaña "Recomendado" que no está en el
+            # servidor todavía. Para ella "lo que falta" es TODO lo emitido
+            # según TMDB (no hay servidor con el que cruzar): se construye el
+            # "fresh" directamente de TMDB y se sigue el mismo flujo de
+            # descarga (checked/backoff/upload_history).
+            rec = next((r for r in self._movies_results
+                        if r.get("media_type") == "tv" and r.get("tmdb_id") == tmdb_id), None)
+            if rec is None:
+                _log.info("Autocompletado: serie %s sin fila (ni en servidor ni recomendada), se omite", tmdb_id)
+                return
+            try:
+                expected = self._tmdb_expected_episodes(tmdb_id)
+            except Exception:
+                _log.exception("Autocompletado: no se pudieron pedir los episodios de la serie recomendada %s", tmdb_id)
+                return
+            if not expected:
+                _log.info("Autocompletado: '%s' sin episodios emitidos (o sin datos de TMDB)", rec.get("title"))
+                return
+            fresh = {"name": rec.get("title", ""), "missing": expected}
+            series_name = rec.get("title", "")
 
         checked = (self._auto_checked_map().get(str(tmdb_id)) or {})
         checked_seasons = {int(s): set(eps) for s, eps in checked.items()}
@@ -10037,7 +11867,6 @@ class App(_AppBase):
         # medios va desactualizado con respecto al FTP).
         history_remote_paths = {h.get("remote", "") for h in self._load_history()
                                 if h.get("status") == "ok"}
-        series_name = fresh.get("name", row["name"])
         to_download = []
         for season, episode in pending:
             if self._auto_episode_in_history(history_remote_paths, series_name, season, episode):
@@ -10077,10 +11906,21 @@ class App(_AppBase):
         """True si *upload_history* ya registra subido este capítulo (serie,
         temporada × ep) en alguna ruta remota -- advertencia local barata
         para no lanzar una descarga de algo que ya está en el servidor."""
+        # Normalización de los dos lados antes de comparar: el nombre de la
+        # serie tal cual lo da TMDB puede llevar puntuación que la ruta
+        # remota real no tiene ("Prodigiosa: Las aventuras de Ladybug" con
+        # dos puntos vs ".../Prodigiosa Las aventuras de Ladybug/..." sin
+        # ellos), y una comparación literal de subcadena fallaba SIEMPRE
+        # para esa serie -- el autocompletado re-descargaba capítulos ya
+        # subidos una y otra vez aunque el cruce FTP (que sí normaliza, ver
+        # series_similarity) los encontrara en el servidor.
+        norm_series = normalize_series_name(series_name) if series_name else ""
+        if not norm_series:
+            return False
         for remote in history_remote_paths:
             det = detect_episode(remote)
             if (det.get("season") == season and det.get("episode") == episode):
-                if series_name and series_name.lower() in (remote or "").lower():
+                if norm_series in normalize_series_name(remote):
                     return True
         return False
 
@@ -10159,10 +11999,17 @@ class App(_AppBase):
                                                    font=ctk.CTkFont(size=11), anchor="w")
         self._downloads_status_lbl.grid(row=1, column=0, sticky="ew", pady=(0, 2))
 
-        table_fr = ctk.CTkFrame(parent, fg_color="transparent")
-        table_fr.grid(row=2, column=0, sticky="nsew")
-        table_fr.grid_columnconfigure(0, weight=1)
-        table_fr.grid_rowconfigure(1, weight=1)
+        # Cuerpo: tabla a la izquierda, ficha del resultado a la derecha.
+        # Columna 0: tabla (se expande). Columna 1: separador arrastrable.
+        # Columna 2: panel lateral (ancho fijo, pero ajustable a mano) --
+        # mismo patrón de 3 columnas que Recomendado/Episodios que faltan
+        # (ver _downloads_sash_press/_motion/_release más abajo).
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)
+        body.grid_columnconfigure(2, weight=0)
+        body.grid_rowconfigure(0, weight=1)
 
         # TableView como el resto de tablas de la app (antes era una
         # cabecera + CTkScrollableFrame a mano, con los anchos escritos dos
@@ -10173,7 +12020,7 @@ class App(_AppBase):
         # (sortable) y ocultar/mostrar columnas con el menú contextual del
         # clic derecho (on_visibility_changed).
         sw0 = self._saved_col_widths("descargar")   # anchos guardados de una sesión anterior, si hay
-        self._downloads_table = TableView(table_fr, columns=[
+        self._downloads_table = TableView(body, columns=[
             # Nombre de ancho FIJO (antes expand=True): al ser expand, la
             # columna absorbía TODO el espacio sobrante (~770px en una
             # ventana de 1200) y los nombres de aMule (300-500px de media)
@@ -10201,7 +12048,7 @@ class App(_AppBase):
         # concreto (mismo procedimiento que Archivos/Episodios).
            on_visibility_changed=self._on_downloads_table_visibility_changed)
         self._downloads_table.row_height = 24
-        self._downloads_table.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        self._downloads_table.grid(row=0, column=0, sticky="nsew", pady=(4, 0), padx=(0, CONTAINER_GAP))
         self._downloads_table_body = self._downloads_table.body
         # Fuente compartida de las filas -- una sola instancia, la misma que
         # usa _fit_text para recortar (ver _downloads_rebuild_page).
@@ -10221,6 +12068,22 @@ class App(_AppBase):
             "descargar", None, True)   # ver _on_downloads_header_click -- sin ordenar hasta pulsar la cabecera
         self._downloads_table.set_sort_indicator(
             self._downloads_sort_key, self._downloads_sort_asc)
+
+        # Separador arrastrable entre la tabla y el panel lateral -- mismo
+        # patrón visual y de comportamiento que _movies_sash (ver
+        # _downloads_sash_press/_motion/_release más abajo).
+        self._downloads_sash = tk.Frame(body, width=4, bg="#505060",
+                                        cursor="sb_h_double_arrow")
+        self._downloads_sash.grid(row=0, column=1, sticky="ns", pady=8)
+        self._downloads_sash.bind("<ButtonPress-1>", self._downloads_sash_press)
+        self._downloads_sash.bind("<B1-Motion>", self._downloads_sash_motion)
+        self._downloads_sash.bind("<ButtonRelease-1>", self._downloads_sash_release)
+        self._downloads_sash_state = None
+        self._downloads_resize_debounce_id = None
+        self._downloads_panel_width = 240   # igual que el width= inicial de _build_downloads_side_panel
+
+        self._downloads_side_panel = self._build_downloads_side_panel(body)
+        self._downloads_side_panel.grid(row=0, column=2, sticky="nsew")
 
         pag = ctk.CTkFrame(parent, fg_color="transparent")
         pag.grid(row=3, column=0, sticky="ew", pady=(6, 0))
@@ -10246,6 +12109,8 @@ class App(_AppBase):
         # _downloads_perform_search) -- sin esto, lanzar una búsqueda
         # mientras otra sigue sondeando seguía actualizando la lista vieja.
         self._downloads_search_token = 0
+        self._downloads_row_widgets = {}   # id(res) → {"row_fr": ...} — resaltado de la fila pulsada
+        self._downloads_selected = None    # último AmuleSearchResult pulsado (ver _show_downloads_result)
 
     def _downloads_open_ec(self):
         """Abre UNA conexión EC nueva (no reutilizable: aMule solo soporta
@@ -10312,6 +12177,7 @@ class App(_AppBase):
         # conexión EC puede tardar en devolver el primer lote).
         self._downloads_results = []
         self._downloads_page = 0
+        self._downloads_selected = None   # la búsqueda nueva deselecciona el resultado previo
         self._downloads_rebuild_page()
         self._downloads_status_lbl.configure(
             text=f'Buscando "{query}" en {st}... (los resultados se actualizan solos, hasta 1 minuto)',
@@ -10502,6 +12368,7 @@ class App(_AppBase):
                                          reverse=not self._downloads_sort_asc)
 
     def _downloads_clear_rows(self):
+        self._downloads_row_widgets = {}
         for w in list(self._downloads_table_body.winfo_children()):
             w.destroy()
 
@@ -10534,6 +12401,12 @@ class App(_AppBase):
             row_bg = DOWNLOAD_BEST_ROW_COLOR if res is best_candidate else ("gray95", "gray17")
             row_fr = ctk.CTkFrame(self._downloads_table_body, fg_color=row_bg)
             row_fr.pack(fill="x", pady=2, padx=2)
+            # Resaltado de la fila pulsada (ver _show_downloads_result): si la
+            # búsqueda se repinta (nueva página/orden) se mantiene la fila del
+            # resultado que estaba seleccionado, si aún está en esta página.
+            self._downloads_row_widgets[id(res)] = {"row_fr": row_fr}
+            if self._downloads_selected is res:
+                row_fr.configure(fg_color=SELECTED_ROW_COLOR)
             # Celdas con recorte (ver TableView.cell): el nombre de un
             # resultado de búsqueda puede ser larguísimo, y antes empujaba
             # a Tamaño/Fuentes/Tipo y dejaba el botón "Descargar" fuera de
@@ -10567,10 +12440,11 @@ class App(_AppBase):
                 # en Archivos, que usa cw["name"]).
                 lbl = ctk.CTkLabel(c, text=_fit_text(res.name, self._downloads_table.col_width("name"),
                                                      self._downloads_font),
-                                   font=self._downloads_font, anchor="w")
+                                   font=self._downloads_font, anchor="w", cursor="hand2")
                 lbl.pack(fill="both", expand=True)
                 attach_tooltip(lbl, lambda n=res.name: n)
                 lbl.bind("<Configure>", lambda ev, t=res.name, l=lbl: _refit(t, l, "name"))
+                lbl.bind("<Button-1>", lambda e, r=res: self._show_downloads_result(r))
 
             if "size" not in hidden:
                 c = self._downloads_table.cell(row_fr, "size", pady=6)
@@ -10639,6 +12513,251 @@ class App(_AppBase):
         persiste el estado, igual que hacen los anchos de columna."""
         self._downloads_rebuild_page()
         self._save_hidden_columns("descargar", self._downloads_table.hidden_columns())
+
+    _DOWNLOADS_PANEL_MIN_W = 180
+    _DOWNLOADS_PANEL_MAX_W = 500
+    _DOWNLOADS_RESIZE_DEBOUNCE_MS = 150
+
+    def _downloads_sash_press(self, event):
+        self._downloads_sash_state = {"x0": event.x_root, "w0": self._downloads_panel_width}
+
+    def _downloads_sash_motion(self, event):
+        if not self._downloads_sash_state:
+            return
+        # El panel está a la derecha del separador: arrastrar hacia la
+        # izquierda (x decrece) lo ensancha, hacia la derecha lo estrecha
+        # (mismo criterio que _movies_sash_motion).
+        delta = self._downloads_sash_state["x0"] - event.x_root
+        new_w = max(self._DOWNLOADS_PANEL_MIN_W,
+                    min(self._DOWNLOADS_PANEL_MAX_W, self._downloads_sash_state["w0"] + delta))
+        if new_w == self._downloads_panel_width:
+            return   # mismo ancho (redondeo) -- no repetir trabajo de layout
+        self._downloads_panel_width = new_w
+        # Durante el arrastre en vivo solo se mueve el borde del panel -- el
+        # reajuste de los cuadros de texto de dentro (caro) se aplaza con
+        # antirrebote (ver _commit_downloads_panel_width).
+        self._downloads_side_panel.configure(width=new_w)
+        if self._downloads_resize_debounce_id is not None:
+            self.after_cancel(self._downloads_resize_debounce_id)
+        self._downloads_resize_debounce_id = self.after(
+            self._DOWNLOADS_RESIZE_DEBOUNCE_MS, self._commit_downloads_panel_width)
+
+    def _downloads_sash_release(self, event):
+        self._downloads_sash_state = None
+        if self._downloads_resize_debounce_id is not None:
+            self.after_cancel(self._downloads_resize_debounce_id)
+            self._downloads_resize_debounce_id = None
+        self._commit_downloads_panel_width()
+
+    def _commit_downloads_panel_width(self):
+        """Aplica self._downloads_panel_width de verdad a los widgets de
+        dentro del panel (el póster se queda a tamaño fijo, igual que en
+        Recomendado -- ver _commit_movies_panel_width). Es la parte cara --
+        se llama con antirrebote durante el arrastre, no en cada evento de
+        movimiento."""
+        self._downloads_resize_debounce_id = None
+        w = self._downloads_panel_width
+        self._downloads_side_panel.configure(width=w)
+        content_w = max(100, w - 40)   # descontar el padding interno del panel
+        self._downloads_detail_title.configure(width=content_w)
+        self._downloads_detail_meta.configure(width=content_w)
+        self._downloads_detail_cert.configure(width=content_w)
+        self._downloads_detail_local.configure(width=content_w)
+        self._downloads_detail_overview.configure(width=content_w)
+        self._autosize_textbox(self._downloads_detail_title)
+        self._autosize_textbox(self._downloads_detail_meta)
+        self._autosize_textbox(self._downloads_detail_cert)
+        self._autosize_textbox(self._downloads_detail_local)
+        self._autosize_textbox(self._downloads_detail_overview)
+
+    def _build_downloads_side_panel(self, parent):
+        """Ficha del resultado de búsqueda pulsado -- la parte local (nombre,
+        tamaño, fuentes, completo/parcial, lo que detecte el nombre) se
+        muestra al instante y la ficha de TMDB (póster, categoría,
+        clasificación, sinopsis) llega después en un hilo. Mismo estilo que
+        el panel lateral de Recomendado."""
+        panel = ctk.CTkFrame(parent, width=240)
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(panel, fg_color="transparent", label_text="")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=6)
+        scroll.columnconfigure(0, weight=1)
+
+        self._downloads_poster_label = ctk.CTkLabel(
+            scroll, text="Pulsa un resultado\npara ver su ficha",
+            width=180, height=220, text_color=PENDING_COLOR)
+        self._downloads_poster_label.pack(pady=(4, 2))
+        self._downloads_detail_title = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="transparent",
+            activate_scrollbars=False)
+        self._downloads_detail_title.configure(state="disabled")
+        self._downloads_detail_title.pack(pady=(4, 0), fill="x")
+        self._downloads_detail_meta = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._downloads_detail_meta.configure(state="disabled")
+        self._downloads_detail_meta.pack(pady=(0, 0), fill="x")
+        self._downloads_detail_cert = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._downloads_detail_cert.configure(state="disabled")
+        self._downloads_detail_cert.pack(pady=(0, 0), fill="x")
+        # Info local del archivo (tamaño, fuentes, estado, episodio detectado)
+        # -- va antes de la sinopsis porque es la parte que se muestra SIN
+        # red, al instante de pulsar.
+        self._downloads_detail_local = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._downloads_detail_local.configure(state="disabled")
+        self._downloads_detail_local.pack(pady=(0, 0), fill="x")
+        self._downloads_detail_overview = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._downloads_detail_overview.configure(state="disabled")
+        self._downloads_detail_overview.pack(pady=4, fill="x")
+
+        return panel
+
+    def _show_downloads_result(self, res):
+        """Ficha del resultado pulsado en Descargas: la info LOCAL se muestra
+        de inmediato (nombre, tamaño, fuentes, completo/parcial y lo que
+        detecte el nombre: temporada/episodio o película) y la ficha de TMDB
+        (póster, categoría, clasificación, sinopsis) se pide en un hilo y se
+        aplica cuando llega. Mismo patrón que _show_movie_poster."""
+        self._downloads_selected = res
+        for key, widgets in self._downloads_row_widgets.items():
+            widgets["row_fr"].configure(
+                fg_color=SELECTED_ROW_COLOR if key == id(res) else ("gray95", "gray17"))
+        self._downloads_poster_label.configure(image=None, text="…")
+        self._downloads_poster_token = object()
+        token = self._downloads_poster_token
+        self._set_textbox_text(self._downloads_detail_title, res.name)
+        det = detect_episode(res.name)
+        tipo = {"tv": "📺 Serie", "anime": "📺 Serie",
+                "movie": "🎬 Película", "libro": "📚 Libro"}.get(det.get("media_type"), "🎬 Película")
+        partes = [tipo]
+        if det.get("season"):
+            partes.append(f"T{det['season']}")
+        if det.get("episode"):
+            partes.append(f"E{det['episode']}")
+        self._set_textbox_text(self._downloads_detail_meta, " · ".join(partes))
+        self._set_textbox_text(self._downloads_detail_cert, "Clasificación: …")
+        local = "\n".join(x for x in [
+            f"Tamaño: {res.size_human}",
+            f"Fuentes: {res.sources}",
+            f"Estado: {'Completo' if res.complete else 'Parcial'}",
+            f"Tipo: {det.get('media_type', 'movie')}",
+        ] if x)
+        self._set_textbox_text(self._downloads_detail_local, local)
+        self._set_textbox_text(self._downloads_detail_overview, "Buscando ficha en TMDB...")
+
+        def worker():
+            title = det.get("title") or res.name
+            try:
+                results = self.tmdb.search_multi(title, prefer_type=det.get("media_type") or "movie")
+            except Exception as e:
+                _log.warning("Descargas: fallo al buscar %r en TMDB: %s", title, e)
+                results = []
+            if not results:
+                self.after(0, lambda: self._apply_downloads_no_result(token))
+                return
+            r = results[0]
+            media_type = r.get("media_type", "movie")
+            details = {}
+            try:
+                if media_type == "tv":
+                    details = self.tmdb.get_tv_details(r["id"])
+                else:
+                    details = self.tmdb.get_movie_details(r["id"])
+            except Exception:
+                details = {}
+            def _apply():
+                if self._downloads_poster_token is not token:
+                    return   # el usuario ya pulsó otro resultado mientras esto cargaba
+                year = (details.get("first_air_date") or details.get("release_date") or "")[:4]
+                vote = details.get("vote_average") or r.get("vote_average") or 0
+                genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
+                meta = " · ".join(x for x in [
+                    "📺 Serie" if media_type == "tv" else "🎬 Película",
+                    year,
+                    f"⭐ {vote:.1f}",
+                ] if x)
+                if genres:
+                    meta = (meta + " · " if meta else "") + ", ".join(genres)
+                self._set_textbox_text(self._downloads_detail_title,
+                                       details.get("name") or details.get("title") or r.get("name") or r.get("title") or title)
+                self._set_textbox_text(self._downloads_detail_meta, meta)
+                if media_type == "tv":
+                    self._set_textbox_text(self._downloads_detail_cert, "Serie")
+                else:
+                    self._set_textbox_text(self._downloads_detail_cert,
+                                           f"Clasificación: {r.get('certification') or '…'}")
+                    self._load_downloads_certification(r, token)
+                self._set_textbox_text(self._downloads_detail_overview,
+                                       details.get("overview") or r.get("overview") or "Sin sinopsis disponible")
+                poster_path = details.get("poster_path") or r.get("poster_path")
+                if poster_path:
+                    threading.Thread(target=self._load_downloads_poster,
+                                     args=(f"{TMDB_IMAGE}{poster_path}", token), daemon=True).start()
+                else:
+                    self._downloads_poster_label.configure(image=None, text="Sin póster")
+            self.after(0, _apply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_downloads_no_result(self, token):
+        if self._downloads_poster_token is not token:
+            return
+        self._downloads_poster_label.configure(image=None, text="Sin póster")
+        self._set_textbox_text(self._downloads_detail_overview, "Sin resultados en TMDB")
+
+    def _load_downloads_poster(self, url: str, token):
+        try:
+            resp = requests.get(url, timeout=8)
+            img = Image.open(BytesIO(resp.content)).resize((180, 260), Image.LANCZOS)
+            ctk_img = ctk.CTkImage(img, size=(180, 260))
+            def _apply():
+                if self._downloads_poster_token is token:
+                    self._downloads_poster_label.configure(image=ctk_img, text="")
+                    self._downloads_current_poster = ctk_img
+            self.after(0, _apply)
+        except Exception:
+            pass
+
+    def _load_downloads_certification(self, r: dict, token):
+        """Clasificación por edad (PG-13, 12, 18...) de la ficha de un
+        resultado de Descargas, consultada a TMDB on-demand -- mismo patrón
+        que _load_movie_certification de Recomendado. Un fallo de red deja
+        "Clasificación: …" sin molestar."""
+        if r.get("certification"):
+            self._set_textbox_text(self._downloads_detail_cert,
+                                   f"Clasificación: {r['certification']}")
+            return
+        cert_token = object()
+        self._downloads_cert_token = cert_token
+
+        def _worker():
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            cert = ""
+            try:
+                cert = client.get_movie_certification(r["id"])
+            except Exception:
+                _log.warning("Descargas: fallo al pedir la clasificación de tmdb_id=%s", r["id"])
+            def _apply():
+                if self._downloads_poster_token is not token or getattr(self, "_downloads_cert_token", None) is not cert_token:
+                    return
+                label = f"Clasificación: {cert}" if cert else "Clasificación: sin dato"
+                self._set_textbox_text(self._downloads_detail_cert, label)
+                r["certification"] = cert
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _downloads_update_pagination(self):
         total = len(self._downloads_results)
@@ -10784,6 +12903,8 @@ class App(_AppBase):
                 fg_color=SELECTED_ROW_COLOR if tid == r["tmdb_id"] else ("gray95", "gray17"))
         self._update_status_bar()
         self._set_textbox_text(self._missing_ep_detail_title, r["name"])
+        self._set_textbox_text(self._missing_ep_detail_meta, "")
+        self._set_textbox_text(self._missing_ep_detail_cert, "")
         self._set_textbox_text(self._missing_ep_detail_overview, "Cargando...")
         self._missing_ep_poster_label.configure(image=None, text="…")
         self._update_missing_ep_ai_verdict_label(r)
@@ -10812,12 +12933,27 @@ class App(_AppBase):
             overview = details.get("overview", "") or ""
             poster_path = details.get("poster_path")
             poster_url = f"{TMDB_IMAGE}{poster_path}" if poster_path else None
-            self.after(0, lambda: self._apply_missing_ep_detail(token, overview, poster_url))
+            self.after(0, lambda: self._apply_missing_ep_detail(token, overview, poster_url, details))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_missing_ep_detail(self, token, overview: str, poster_url):
+    def _apply_missing_ep_detail(self, token, overview: str, poster_url, details: dict):
         if self._missing_ep_poster_token is not token:
             return   # el usuario ya pulso otra serie mientras esta cargaba
+        # Categoría y clasificación de la serie (mismo criterio que el panel
+        # lateral de Recomendado): meta = 📺 Serie · año · ⭐ nota · géneros;
+        # cert = "Serie" (las series no consultan clasificación por edad).
+        year = (details.get("first_air_date") or "")[:4]
+        vote = details.get("vote_average") or 0
+        genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
+        meta = " · ".join(x for x in [
+            "📺 Serie",
+            year,
+            f"⭐ {vote:.1f}",
+        ] if x)
+        if genres:
+            meta = (meta + " · " if meta else "") + ", ".join(genres)
+        self._set_textbox_text(self._missing_ep_detail_meta, meta)
+        self._set_textbox_text(self._missing_ep_detail_cert, "Serie")
         self._set_textbox_text(self._missing_ep_detail_overview, overview or "Sin sinopsis disponible")
         if poster_url:
             threading.Thread(target=self._load_missing_ep_poster,
@@ -12441,21 +14577,59 @@ class App(_AppBase):
                 return result
             info = types.SimpleNamespace(title=result["name"], media_type="tv",
                                          folder_name=result.get("folder_name"))
-            category, folder_name = self._find_category_with_existing_folder(
-                own_ftp, info, force_refresh=True, known_year=self._missing_ep_known_year(result))
-            if not folder_name:
+            # Localizar TODAS las carpetas de la serie, no solo una: una
+            # misma serie puede estar repartida en varias carpetas del
+            # servidor (caso real: "Prodigiosa Las aventuras de Ladybug"
+            # con solo la T6 y "Miraculous las aventuras de Ladybug" con
+            # las T1-T5 -- el título en castellano y el original). El cruce
+            # completo ya las une (_match_ftp_present), pero este cruce
+            # individual usaba _find_category_with_existing_folder, que
+            # devuelve UNA sola carpeta, y los episodios de las demás
+            # salían como "te faltan" estando en el servidor -- el
+            # autocompletado los re-descargaba una y otra vez (caso real
+            # visto en los logs: Ladybug entera re-descargada en bucle).
+            # Se reutiliza el mismo emparejamiento de _match_ftp_present
+            # sobre los NOMBRES de carpeta (barato) y se listan solo las
+            # carpetas que casan.
+            cats = self.config_data.get("ftp_categories", {"tv": [], "movie": [], "libro": []}).get("tv", [])
+
+            def dir_lookup(root):
+                if root not in self._ftp_dir_cache:
+                    # Dos listados, no uno, misma unión que el cruce completo.
+                    first = set(own_ftp.list_dirs(root))
+                    second = set(own_ftp.list_dirs(root))
+                    if first != second:
+                        _log.warning("Listado de '%s' inconsistente entre dos intentos seguidos "
+                                    "(%d vs %d carpetas) -- usando la unión de ambos",
+                                    root, len(first), len(second))
+                    self._ftp_dir_cache[root] = list(first | second)
+                return self._ftp_dir_cache[root]
+
+            shallow_index = {}
+            for cat in cats:
+                root = cat.get("root", "")
+                if not root or root in shallow_index:
+                    continue
+                shallow_index[root] = {name: set() for name in dir_lookup(root)}
+
+            matched_folders, _best, _ratio = self._match_ftp_folders(
+                shallow_index, result["name"], result.get("folder_name"),
+                known_year=self._missing_ep_known_year(result))
+            if not matched_folders:
                 _log.info("Cruce FTP (individual): '%s' no se encontró en ninguna categoría del FTP",
                           result["name"])
                 return result
-            root = category.get("root", "")
-            # Dos listados, no uno, misma unión que el cruce completo (ver
-            # _build_ftp_episode_index) -- barato aquí porque es UNA sola
-            # carpeta, no cientos, así que vale la pena pagarlo siempre en
-            # vez de arriesgarse a un listado cortado que deje fuera un
-            # episodio suelto.
-            path = f"{root.rstrip('/')}/{folder_name}"
-            files = list(set(own_ftp.list_files_recursive(path, max_depth=2))
-                        | set(own_ftp.list_files_recursive(path, max_depth=2)))
+            files = set()
+            for root, folder_name in matched_folders:
+                # Dos listados por carpeta, no uno, misma unión que el cruce
+                # completo (ver _build_ftp_episode_index) -- barato aquí
+                # porque son UNA O DOS carpetas, no cientos, así que vale la
+                # pena pagarlo siempre en vez de arriesgarse a un listado
+                # cortado que deje fuera un episodio suelto.
+                path = f"{root.rstrip('/')}/{folder_name}"
+                files |= set(own_ftp.list_files_recursive(path, max_depth=2))
+                files |= set(own_ftp.list_files_recursive(path, max_depth=2))
+            files = list(files)
         except Exception as e:
             _log.warning("Cruce FTP (individual): fallo inesperado para '%s': %s", result["name"], e)
             return result
@@ -12471,8 +14645,9 @@ class App(_AppBase):
                 # "7x21-7x22") -- ver detect_episode.
                 for extra_ep in det.get("extra_episodes", []):
                     ftp_present.add((det["season"], extra_ep))
-        _log.info("Cruce FTP (individual): '%s' -> %d episodio(s) encontrados en '%s/%s' (hueco antes: %s)",
-                  result["name"], len(ftp_present), root, folder_name, result["missing"])
+        _log.info("Cruce FTP (individual): '%s' -> %d episodio(s) encontrados en %d carpeta(s) (%s) (hueco antes: %s)",
+                  result["name"], len(ftp_present), len(matched_folders),
+                  ", ".join(sorted(folder for _root, folder in matched_folders)), result["missing"])
 
         already_present = {(season, ep) for season, eps in new_expected.items()
                            for ep in eps if ep not in set(result["missing"].get(season, []))}
@@ -12486,6 +14661,58 @@ class App(_AppBase):
             present_counts[season] = present_counts.get(season, 0) + 1
         result["server_season_counts"] = present_counts
         return result
+
+    @staticmethod
+    def _match_ftp_folders(ftp_index: dict, show_name: str, known_folder_name: str = None,
+                           known_year: str = None):
+        """Devuelve (lista de (root, nombre_de_carpeta), mejor_candidato,
+        mejor_ratio) de TODAS las carpetas del índice FTP que corresponden
+        a *show_name* con la confianza de _match_ftp_present (nombre real
+        ya conocido si se pasa known_folder_name -- ver
+        get_jellyfin_series::folder_name, para series cuyo nombre mostrado
+        está traducido y no se parece en nada al de su carpeta real
+        ("Acusado" vs "Accused") --, si no, nombre exacto tras sanear,
+        desempate por año si la carpeta real lo lleva -- ver
+        core.series_match.best_match_with_year --, o ratio >=
+        _FTP_PRESENT_MIN_RATIO). Lista VACÍA si no hay ninguna
+        coincidencia de esa confianza. Separado de _match_ftp_present para
+        que el cruce individual (_cross_check_single_result_with_ftp)
+        pueda localizar TODAS las carpetas de una serie repartida en
+        varias del servidor (caso real de Ladybug) listando solo los
+        nombres de carpeta (barato) en vez de construir el índice completo
+        de episodios."""
+        sanitized_desired = _ftp_safe(show_name)
+        matched = []          # (root, nombre de carpeta)
+        best_candidate, best_ratio = None, 0.0
+
+        for root, folders in ftp_index.items():
+            year_candidate = None
+            if known_year:
+                from core.series_match import best_match_with_year
+                year_candidate, _yr_ratio = best_match_with_year(
+                    show_name, list(folders.keys()), known_year)
+
+            for folder_name in folders:
+                if known_folder_name and folder_name.lower() == known_folder_name.lower():
+                    matched.append((root, folder_name))   # el nombre REAL que dio el servidor de medios
+                    continue
+                if folder_name == sanitized_desired:
+                    matched.append((root, folder_name))   # nombre exacto tras sanear
+                    continue
+                if folder_name == year_candidate:
+                    matched.append((root, folder_name))   # desempatado por año (remake vs original)
+                    continue
+                ratio = series_similarity(show_name, folder_name)
+                if ratio >= _FTP_PRESENT_MIN_RATIO:
+                    matched.append((root, folder_name))
+                elif ratio > best_ratio:
+                    best_candidate, best_ratio = folder_name, ratio
+
+        if not matched and best_candidate:
+            _log.info("Cruce FTP: '%s' -- candidato más parecido '%s' con ratio %.2f "
+                      "(hace falta >= %.2f para darlo por la misma serie)",
+                      show_name, best_candidate, best_ratio, _FTP_PRESENT_MIN_RATIO)
+        return matched, best_candidate, best_ratio
 
     @staticmethod
     def _match_ftp_present(ftp_index: dict, show_name: str, known_folder_name: str = None,
@@ -12502,32 +14729,8 @@ class App(_AppBase):
         original y show_name no lo trae). Devuelve el set de episodios
         encontrados en esa carpeta, o None si no hay ninguna coincidencia
         de esa confianza."""
-        sanitized_desired = _ftp_safe(show_name)
-        matched = {}          # nombre de carpeta -> episodios encontrados en ella
-        best_candidate, best_ratio = None, 0.0
-
-        for folders in ftp_index.values():
-            year_candidate = None
-            if known_year:
-                from core.series_match import best_match_with_year
-                year_candidate, _yr_ratio = best_match_with_year(
-                    show_name, list(folders.keys()), known_year)
-
-            for folder_name, episodes in folders.items():
-                if known_folder_name and folder_name.lower() == known_folder_name.lower():
-                    matched[folder_name] = episodes   # el nombre REAL que dio el servidor de medios
-                    continue
-                if folder_name == sanitized_desired:
-                    matched[folder_name] = episodes   # nombre exacto tras sanear
-                    continue
-                if folder_name == year_candidate:
-                    matched[folder_name] = episodes   # desempatado por año (remake vs original)
-                    continue
-                ratio = series_similarity(show_name, folder_name)
-                if ratio >= _FTP_PRESENT_MIN_RATIO:
-                    matched[folder_name] = episodes
-                elif ratio > best_ratio:
-                    best_candidate, best_ratio = folder_name, ratio
+        matched, best_candidate, best_ratio = App._match_ftp_folders(
+            ftp_index, show_name, known_folder_name, known_year)
 
         if not matched:
             if best_candidate:
@@ -12545,11 +14748,12 @@ class App(_AppBase):
         # se miraban, así que los 129 episodios de la otra carpeta salían
         # como "te faltan" estando ahí al lado.
         present = set()
-        for episodes in matched.values():
-            present |= episodes
+        for root, folder_name in matched:
+            present |= ftp_index[root][folder_name]
         if len(matched) > 1:
             _log.info("Cruce FTP: '%s' -> %d carpeta(s) unidas (%s), %d episodio(s) en total",
-                      show_name, len(matched), ", ".join(sorted(matched)), len(present))
+                      show_name, len(matched),
+                      ", ".join(sorted(folder for _root, folder in matched)), len(present))
         return present
 
     def _set_missing_episode_ignored(self, tmdb_id, ignored: bool) -> None:
@@ -13826,7 +16030,7 @@ class App(_AppBase):
             return False
 
         destino = "en local y en el servidor" if remote_borrado else "en local"
-        self._set_status(f"Borrado {destino}: {entry.new_name or entry.name}", OK_COLOR)
+        self._set_status(f"Borrado {destino}: {entry.new_name or entry.name}", SUCCESS_COLOR)
         return True
 
     def _delete_remote_file(self, remote_path: str) -> tuple:
@@ -14535,6 +16739,79 @@ class App(_AppBase):
         idx  = vals.index(value) if value in vals else -1
         self._preview_result(idx)
 
+    def _detail_meta_for(self, info: MediaInfo, vote_average: float = 0) -> str:
+        """Línea de categoría del panel de detalle de Archivos -- tipo · año ·
+        nota · géneros, mismas piezas que la línea "meta" del panel lateral
+        de Recomendado. Los géneros se resuelven de genre_ids contra la caché
+        de géneros TMDB (_genres_cache, cargada en Ajustes); si la caché
+        todavía no está (p.ej. el usuario nunca abrió Ajustes) se muestra la
+        línea sin géneros, no se bloquea nada esperando."""
+        tipo = {"tv": "📺 Serie", "movie": "🎬 Película", "libro": "📚 Libro"}.get(
+            info.media_type, "🎬 Película")
+        meta = " · ".join(x for x in [
+            tipo,
+            info.year or "",
+            f"⭐ {vote_average:.1f}" if vote_average else "",
+        ] if x)
+        genres = self._genre_names_for(info.media_type, info.genre_ids)
+        if genres:
+            meta = (meta + " · " if meta else "") + ", ".join(genres)
+        return meta
+
+    def _genre_names_for(self, media_type: str, genre_ids: list) -> list:
+        """Nombres de géneros TMDB para *genre_ids*, resueltos contra
+        self._genres_cache ({"tv": [{"id","name"}...], "movie": [...]}).
+        Lista vacía si la caché no está cargada todavía o no hay ids."""
+        if not genre_ids:
+            return []
+        if media_type == "libro":
+            return []
+        cache = (self._genres_cache or {}).get("movie" if media_type != "tv" else "tv") or []
+        by_id = {g.get("id"): g.get("name", "") for g in cache}
+        return [by_id.get(gid, "") for gid in genre_ids if by_id.get(gid)]
+
+    def _update_detail_meta_cert(self, info: MediaInfo, vote_average: float = 0):
+        """Rellena las líneas de categoría (_detail_meta) y clasificación
+        (_detail_cert) del panel de detalle de Archivos -- mismas piezas que
+        el panel lateral de Recomendado. La clasificación por edad solo
+        aplica a películas (se consulta on-demand); las series muestran
+        "Serie"; los libros no tienen clasificación."""
+        self._set_textbox_text(self._detail_meta, self._detail_meta_for(info, vote_average))
+        if info.media_type == "tv":
+            self._set_textbox_text(self._detail_cert, "Serie")
+            self._detail_cert_token = object()
+        elif info.media_type == "movie":
+            self._set_textbox_text(self._detail_cert, "Clasificación: …")
+            self._load_detail_certification(info)
+        else:
+            self._set_textbox_text(self._detail_cert, "")
+            self._detail_cert_token = object()
+
+    def _load_detail_certification(self, info: MediaInfo):
+        """Clasificación por edad (PG-13, 12, 18...) de una película del
+        panel de detalle de Archivos, consultada a TMDB on-demand -- mismo
+        patrón que _load_movie_certification de Recomendado. Un fallo de
+        red deja "Clasificación: …" sin molestar."""
+        cert_token = object()
+        self._detail_cert_token = cert_token
+        tmdb_id = info.tmdb_id
+
+        def _worker():
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            cert = ""
+            try:
+                cert = client.get_movie_certification(tmdb_id)
+            except Exception:
+                _log.warning("Archivos: fallo al pedir la clasificación de tmdb_id=%s", tmdb_id)
+            def _apply():
+                if getattr(self, "_detail_cert_token", None) is not cert_token:
+                    return
+                label = f"Clasificación: {cert}" if cert else "Clasificación: sin dato"
+                self._set_textbox_text(self._detail_cert, label)
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _preview_result(self, idx: int):
         if idx < 0 or idx >= len(self._tmdb_results):
             return
@@ -14556,6 +16833,7 @@ class App(_AppBase):
         self._detail_episode.configure(text=ep_text)
         self._detail_year.configure(text=info.year or "")
         self._detail_confidence.configure(text="")
+        self._update_detail_meta_cert(info, float(result.get("vote_average") or 0))
         self._set_textbox_text(self._detail_error, "")
         self._apply_overview_and_poster(info)
         self._refresh_detail_ftp_extras(info)
@@ -14811,6 +17089,13 @@ class App(_AppBase):
             self._detail_episode.configure(text="Sin informacion de TMDB")
             self._detail_year.configure(text="")
             self._detail_confidence.configure(text="")
+            self._detail_meta.configure(state="normal")
+            self._detail_meta.delete("1.0", "end")
+            self._detail_meta.configure(state="disabled")
+            self._detail_cert.configure(state="normal")
+            self._detail_cert.delete("1.0", "end")
+            self._detail_cert.configure(state="disabled")
+            self._detail_cert_token = object()
             self._overview_token = None
             self._set_overview_text("")
             self._poster_token = None
@@ -14839,6 +17124,7 @@ class App(_AppBase):
                 text=f"Confianza: {conf}%", text_color=conf_color)
         else:
             self._detail_confidence.configure(text="")
+        self._update_detail_meta_cert(info)
         self._apply_overview_and_poster(info)
         self._refresh_detail_ftp_extras(info)
 
@@ -16005,11 +18291,33 @@ class App(_AppBase):
             self._tray.stop()
         if self._watcher:
             self._watcher.stop()
+        # Aborta cualquier subida en curso: las transferencias comprueban
+        # cancel_event en cada bloque, así que con esto los workers del pool
+        # de subida salen en segundos. Sin esta línea, si se cierra con una
+        # subida en marcha, el atexit de concurrent.futures se queda esperando
+        # al worker atascado en un read de socket (timeout de datos de hasta
+        # 120 s) y el proceso queda zombi reteniendo el candado de instancia
+        # única -- "no me deja volver a abrirla hasta que lo mato".
+        self._upload_cancel.set()
+        # Programador de sincronización: hilo daemon, se para igualmente
+        # para no dejar trabajo pendiente a medias.
+        stop_ev = getattr(self, "_watch_sync_scheduler_stop", None)
+        if stop_ev is not None:
+            stop_ev.set()
         with self._ftp_cmd_lock:
             self.ftp.disconnect()
+        self._save_window_state()
         self.config_data.save()
         self._save_session()
         self.destroy()
+        # Garantía final de salida. Todo lo que había que persistir ya está
+        # guardado (config + sesión). Si cualquier hilo no-daemon o el atexit
+        # de concurrent.futures se quedara esperando (p.ej. un worker de
+        # subida a mitad de un read de socket), el intérprete no terminaría y
+        # el proceso quedaría vivo reteniendo el candado de instancia única
+        # (core/single_instance), impidiendo volver a abrir la app hasta
+        # matarlo a mano -- ver el caso real del usuario.
+        os._exit(0)
 
 
     # ──────────────────────── Menú contextual de fila (reordenar / resetear) ──
@@ -17098,11 +19406,13 @@ class App(_AppBase):
         # TableView: mismo componente que Archivos/Episodios/Historial
         # (ver gui/table_view.py) -- cabecera fija con los mismos anchos
         # que leen las filas, así nunca se desalinean entre sí. La fila
-        # sigue en dos líneas (nombre arriba, tamaño/motivo debajo); la
+        # sigue en dos líneas (nombre con su año arriba, motivo debajo) y
+        # el tamaño va en su propia columna ordenable ("Tamaño"); la
         # columna "candidata" solo etiqueta ese bloque, no una línea.
         self._cleanup_table = TableView(results_wrap, columns=[
             ColumnSpec("icon", "", width=28),
             ColumnSpec("candidata", "Candidata", expand=True, sortable=True),
+            ColumnSpec("tamano", "Tamaño", width=80, sortable=True),
             ColumnSpec("tendencia", "Tendencia", width=70, sortable=True),
             ColumnSpec("logo", "", width=24),
             ColumnSpec("fav", "", width=32),
@@ -17171,6 +19481,9 @@ class App(_AppBase):
         self._cleanup_ftp_tree_expanded = False
         self._cleanup_ftp_tree_loaded_for = None   # ruta (o "loose:<ruta>") ya lista, ver _toggle_cleanup_ftp_tree
         self._cleanup_row_widgets = []   # [(item, row_frame), ...] -- para resaltar la fila seleccionada
+        self._cleanup_delete_buttons = {}   # {item.ftp_path: botón "Eliminar"} -- deshabilitar/etiquetar durante el borrado
+        self._cleanup_deleting_paths = set()   # ftp_paths con borrado EN CURSO (ver _confirm_and_delete_cleanup_item)
+        self._cleanup_status_before_delete = None   # texto previo de _cleanup_status_lbl, ver worker de borrado
         self._cleanup_page = 0
         # Compartidas entre todas las filas -- mismo motivo que en
         # _build_files_tab/_build_missing_episodes_tab: no crear un
@@ -17412,6 +19725,15 @@ class App(_AppBase):
             # compartir título EXACTO sin ser lo mismo (p.ej. "Fargo",
             # serie y película sin relación), y comparándolas todas
             # juntas se fusionaban por error.
+            # lax_fallback=True: la carpeta del servidor a veces solo trae
+            # el título corto ("Boruto") mientras Jellyfin/Plex tiene el
+            # largo ("Boruto: Naruto Next Generations") -- la pasada
+            # estricta no lo casa (0.33 < 0.75), igual que ocurría con el
+            # cruce FTP de "Episodios que faltan" (ver _find_episodes_in_ftp,
+            # que usa series_similarity laxa). El fallback casa SOLO los que
+            # se quedaron sin pareja y solo contra targets libres, sin
+            # reabrir el caso "Animal"/"Animal Crackers" (ver docstring de
+            # match_names_exclusively).
             candidate_names_by_bucket = {"tv": [], "movie": []}
             for _mt, _cat, _root, folder in folder_list:
                 candidate_names_by_bucket[_usage_bucket(_mt)].append(folder)
@@ -17424,7 +19746,8 @@ class App(_AppBase):
             for _bucket in ("tv", "movie"):
                 if usage_names_by_bucket[_bucket] and candidate_names_by_bucket[_bucket]:
                     name_to_usage_name_by_bucket[_bucket] = match_names_exclusively(
-                        candidate_names_by_bucket[_bucket], usage_names_by_bucket[_bucket], min_ratio=0.75)
+                        candidate_names_by_bucket[_bucket], usage_names_by_bucket[_bucket],
+                        min_ratio=0.75, lax_fallback=True)
                 else:
                     name_to_usage_name_by_bucket[_bucket] = {}
 
@@ -17458,6 +19781,7 @@ class App(_AppBase):
                     media_type="tv" if media_type == "tv" else "movie",
                     ftp_path=path,
                     category_name=cat.get("name", ""),
+                    year=(usage or {}).get("year", ""),
                     size_bytes=size,
                     fully_watched=bool((usage or {}).get("fully_watched")),
                     play_count=(usage or {}).get("play_count", 0) or 0,
@@ -17484,6 +19808,7 @@ class App(_AppBase):
                     media_type="tv" if media_type == "tv" else "movie",
                     ftp_path=f"{root}/{base_name}",
                     category_name=cat.get("name", ""),
+                    year=(usage or {}).get("year", ""),
                     size_bytes=size,
                     fully_watched=bool((usage or {}).get("fully_watched")),
                     play_count=(usage or {}).get("play_count", 0) or 0,
@@ -17536,6 +19861,10 @@ class App(_AppBase):
         siempre con lo que se ve."""
         if key == "tendencia":
             return lambda it: trending_score(it.play_count, it.last_played_ts, _time.time())
+        if key == "tamano":
+            return lambda it: it.size_bytes
+        if key == "year":
+            return lambda it: it.year or ""
         return lambda it: it.name.lower()
 
     def _on_cleanup_header_click(self, key: str):
@@ -17547,10 +19876,15 @@ class App(_AppBase):
                                           reverse=not self._cleanup_sort_asc)
         self._render_cleanup_page()
 
-    def _apply_cleanup_filters(self):
+    def _apply_cleanup_filters(self, preserve_page: bool = False):
         """Vuelve a filtrar la lista YA analizada (self._cleanup_raw_items)
         según los filtros marcados ahora mismo -- no repite el análisis
-        de red, solo recalcula sobre los datos ya obtenidos."""
+        de red, solo recalcula sobre los datos ya obtenidos.
+
+        preserve_page=True (usado por _apply_synced_cleanup_candidates tras
+        un borrado propio) mantiene la página actual en vez de volver a la
+        primera -- el usuario estaba mirando una página concreta y un
+        re-render remoto/borrado no debe sacarle de ella."""
         from core.cleanup_candidates import (
             CleanupFilters, filter_candidates,
             WATCHED_NEVER, WATCHED_NOT_REWATCHED, WATCHED_LOW_PLAYCOUNT, WATCHED_NO_DATA)
@@ -17652,7 +19986,7 @@ class App(_AppBase):
                     self._cleanup_duplicate_siblings[id(it)] = [
                         s for s in by_key[key] if s is not it]
 
-        self._render_cleanup_results()
+        self._render_cleanup_results(preserve_page=preserve_page)
 
     def _cleanup_item_reason_text(self, item) -> str:
         """Resumen legible de por qué este elemento aparece en la lista --
@@ -17681,12 +20015,14 @@ class App(_AppBase):
             parts.append("nunca vista")
         return ", ".join(parts) if parts else "sin datos de visionado"
 
-    def _render_cleanup_results(self):
+    def _render_cleanup_results(self, preserve_page: bool = False):
         """Punto de entrada tras aplicar filtros o terminar un análisis --
         el conjunto de candidatas cambió, así que vuelve a la primera
         página. Para redibujar la página actual sin resetearla (p.ej.
-        tras borrar una sola candidata) usar _render_cleanup_page()
-        directamente -- ver _finish_delete_cleanup_item."""
+        tras borrar una sola candidata, o cuando un re-render remoto llega
+        sobre una lista que ya se actualizó localmente) pasar
+        preserve_page=True -- ver _finish_delete_cleanup_item y
+        _apply_synced_cleanup_candidates."""
         items = self._cleanup_filtered_items
         if items:
             total_size = sum(it.size_bytes for it in items)
@@ -17694,7 +20030,8 @@ class App(_AppBase):
                 text=f"{len(items)} candidata(s) -- {_fmt_size(total_size)} liberables")
         else:
             self._cleanup_results_lbl.configure(text="")
-        self._cleanup_page = 0
+        if not preserve_page:
+            self._cleanup_page = 0
         self._render_cleanup_page()
 
     def _cleanup_change_page(self, delta: int):
@@ -17717,6 +20054,7 @@ class App(_AppBase):
         un techo pase lo que pase con el tamaño real de la lista."""
         self._cleanup_table.clear_rows()
         self._cleanup_row_widgets = []
+        self._cleanup_delete_buttons = {}
 
         items = self._cleanup_filtered_items
         if not items:
@@ -17786,16 +20124,23 @@ class App(_AppBase):
         ctk.CTkLabel(c, text=icon).pack(fill="both", expand=True)
 
         info_fr = _cell("candidata")
-        name_lbl = ctk.CTkLabel(info_fr, text=item.name, font=self._cleanup_name_font,
+        name_text = f"{item.name} ({item.year})" if item.year else item.name
+        name_lbl = ctk.CTkLabel(info_fr, text=name_text, font=self._cleanup_name_font,
                                 anchor="w", cursor="hand2")
         name_lbl.pack(fill="x")
         name_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
         reason = self._cleanup_item_reason_text(item)
-        reason_lbl = ctk.CTkLabel(info_fr, text=f"{_fmt_size(item.size_bytes)} -- {reason}",
+        reason_lbl = ctk.CTkLabel(info_fr, text=reason,
                                   font=self._cleanup_reason_font, text_color=PENDING_COLOR,
                                   anchor="w", cursor="hand2")
         reason_lbl.pack(fill="x")
         reason_lbl.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
+
+        c = _cell("tamano", padx=(4, 4))
+        size_lbl = ctk.CTkLabel(c, text=_fmt_size(item.size_bytes),
+                                font=self._cleanup_reason_font, text_color=PENDING_COLOR,
+                                anchor="w")
+        size_lbl.pack(fill="both", expand=True)
 
         score = trending_score(item.play_count, item.last_played_ts, _time.time())
         c = _cell("tendencia", padx=(4, 4))
@@ -17843,17 +20188,23 @@ class App(_AppBase):
         # Protegido (favorito o reservado) nunca se borra desde aquí, ni
         # aunque el filtro correspondiente lo esté mostrando -- deshabilitar
         # en vez de ocultar, para que quede claro POR QUÉ no se puede.
+        # En curso de borrado (item.ftp_path en _cleanup_deleting_paths) el
+        # botón pasa a "⏳ Eliminando…" deshabilitado -- el borrado de una
+        # serie son cientos de llamadas FTP y tarda minutos, y sin este
+        # estado la fila parecía muerta (ver _delete_cleanup_item_worker).
         is_protected = is_fav or is_res
+        deleting = item.ftp_path in self._cleanup_deleting_paths
         c = _cell("del", padx=(8, 8))
         del_btn = ctk.CTkButton(
-            c, text="🗑 Eliminar" if not is_protected else "🔒 Protegida",
+            c, text="⏳ Eliminando…" if deleting else ("🗑 Eliminar" if not is_protected else "🔒 Protegida"),
             fg_color="transparent", border_width=1,
-            border_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
-            text_color=ERROR_COLOR if not is_protected else PENDING_COLOR,
+            border_color=PENDING_COLOR if deleting else (ERROR_COLOR if not is_protected else PENDING_COLOR),
+            text_color=PENDING_COLOR if deleting else (ERROR_COLOR if not is_protected else PENDING_COLOR),
             hover_color=("gray85", "#3d1010") if not is_protected else ("gray90", "gray20"),
-            state="disabled" if is_protected else "normal",
+            state="disabled" if (is_protected or deleting) else "normal",
             command=lambda it=item: self._confirm_and_delete_cleanup_item(it))
         del_btn.pack(fill="both", expand=True)
+        self._cleanup_delete_buttons[item.ftp_path] = del_btn
 
     def _build_cleanup_side_panel(self, parent):
         """Ficha de TMDB de la candidata pulsada -- póster + sinopsis,
@@ -17878,6 +20229,18 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._cleanup_detail_title.configure(state="disabled")
         self._cleanup_detail_title.pack(pady=(4, 0), fill="x")
+        self._cleanup_detail_meta = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._cleanup_detail_meta.configure(state="disabled")
+        self._cleanup_detail_meta.pack(pady=(0, 0), fill="x")
+        self._cleanup_detail_cert = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._cleanup_detail_cert.configure(state="disabled")
+        self._cleanup_detail_cert.pack(pady=(0, 0), fill="x")
         self._cleanup_detail_overview = ctk.CTkTextbox(
             scroll, width=200, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -17914,7 +20277,10 @@ class App(_AppBase):
         for it, row in self._cleanup_row_widgets:
             row.configure(fg_color=SELECTED_ROW_COLOR if it is item else ("gray95", "gray17"))
         self._update_status_bar()
-        self._set_textbox_text(self._cleanup_detail_title, item.name)
+        self._set_textbox_text(self._cleanup_detail_title,
+                               f"{item.name} ({item.year})" if item.year else item.name)
+        self._set_textbox_text(self._cleanup_detail_meta, "")
+        self._set_textbox_text(self._cleanup_detail_cert, "")
         # La selección cambió -- colapsar el árbol de la candidata anterior
         # (si estaba desplegado) antes de fijar la ruta nueva.
         self._cleanup_ftp_tree_expanded = False
@@ -17945,17 +20311,62 @@ class App(_AppBase):
             overview = details.get("overview", "") or ""
             poster_path = details.get("poster_path")
             poster_url = f"{TMDB_IMAGE}{poster_path}" if poster_path else None
-            self.after(0, lambda: self._apply_cleanup_detail(token, overview, poster_url))
+            self.after(0, lambda: self._apply_cleanup_detail(token, overview, poster_url, details))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_cleanup_detail(self, token, overview: str, poster_url):
+    def _apply_cleanup_detail(self, token, overview: str, poster_url, details: dict):
         if self._cleanup_poster_token is not token:
             return   # el usuario ya pulsó otra candidata mientras esta cargaba
+        # Categoría y clasificación (mismo criterio que el panel lateral de
+        # Recomendado): meta = tipo · año · ⭐ nota · géneros; cert =
+        # "Clasificación: X" para películas, "Serie" para series.
+        item = self._cleanup_selected_item
+        media_type = item.media_type if item is not None else "movie"
+        year = (details.get("first_air_date") or details.get("release_date") or "")[:4] or (item.year if item else "")
+        vote = details.get("vote_average") or 0
+        genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
+        meta = " · ".join(x for x in [
+            "📺 Serie" if media_type == "tv" else "🎬 Película",
+            str(year) if year else "",
+            f"⭐ {vote:.1f}",
+        ] if x)
+        if genres:
+            meta = (meta + " · " if meta else "") + ", ".join(genres)
+        self._set_textbox_text(self._cleanup_detail_meta, meta)
+        if media_type == "tv":
+            self._set_textbox_text(self._cleanup_detail_cert, "Serie")
+        else:
+            self._set_textbox_text(self._cleanup_detail_cert, "Clasificación: …")
+            self._load_cleanup_certification(item.tmdb_id, token)
         self._set_textbox_text(self._cleanup_detail_overview, overview or "Sin sinopsis disponible")
         if poster_url:
             threading.Thread(target=self._load_cleanup_poster, args=(poster_url, token), daemon=True).start()
         else:
             self._cleanup_poster_label.configure(image=None, text="Sin póster")
+
+    def _load_cleanup_certification(self, tmdb_id: int, token):
+        """Clasificación por edad (PG-13, 12, 18...) de la ficha de una
+        candidata de película, consultada a TMDB on-demand -- mismo patrón
+        que _load_movie_certification de Recomendado. Un fallo de red deja
+        "Clasificación: …" sin molestar."""
+        cert_token = object()
+        self._cleanup_cert_token = cert_token
+
+        def _worker():
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            cert = ""
+            try:
+                cert = client.get_movie_certification(tmdb_id)
+            except Exception:
+                _log.warning("Liberar espacio: fallo al pedir la clasificación de tmdb_id=%s", tmdb_id)
+            def _apply():
+                if self._cleanup_poster_token is not token or getattr(self, "_cleanup_cert_token", None) is not cert_token:
+                    return
+                label = f"Clasificación: {cert}" if cert else "Clasificación: sin dato"
+                self._set_textbox_text(self._cleanup_detail_cert, label)
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _load_cleanup_poster(self, url: str, token):
         try:
@@ -18135,6 +20546,19 @@ class App(_AppBase):
         dlg = _ConfirmDeleteDialog(self, item.name, item.ftp_path, item.size_bytes, reason)
         if not dlg.result:
             return
+        # Marcar el borrado como en curso ANTES de lanzar el hilo: el
+        # botón de la fila pasa a "⏳ Eliminando…" y el texto de estado
+        # muestra qué se está borrando. Sin esto, el borrado de una serie
+        # (cientos de llamadas FTP, minutos) dejaba la fila intacta y la
+        # app parecía congelada. (Antes se reutilizaba la barra de
+        # progreso del análisis para el borrado -- se quitó: el botón de
+        # la fila ya dice "Eliminando…", no hace falta la barra.)
+        self._cleanup_deleting_paths.add(item.ftp_path)
+        del_btn = self._cleanup_delete_buttons.get(item.ftp_path)
+        if del_btn is not None:
+            del_btn.configure(text="⏳ Eliminando…", state="disabled")
+        self._cleanup_status_before_delete = self._cleanup_status_lbl.cget("text")
+        self._cleanup_status_lbl.configure(text=f"Eliminando {item.name}...")
         threading.Thread(target=self._delete_cleanup_item_worker, args=(item, reason), daemon=True).start()
 
     def _delete_cleanup_item_worker(self, item, reason: str):
@@ -18145,6 +20569,13 @@ class App(_AppBase):
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
             self.config_data.get("ftp_use_tls", False))
         if ok:
+            # El borrado de una serie son cientos de llamadas FTP -- el
+            # callback notifica la ruta que se está borrando para que la
+            # barra de estado muestre progreso en vivo (ver
+            # _update_cleanup_delete_progress) y no parezca congelada.
+            def progress_cb(path: str):
+                self.after(0, lambda p=path: self._update_cleanup_delete_progress(
+                    0, 0, f"Eliminando {item.name}: {p}"))
             if item.loose_file_paths:
                 # Archivos sueltos (sin carpeta propia) -- se borra cada
                 # archivo del grupo (vídeo + póster/backdrop/.../nfo) uno
@@ -18152,16 +20583,22 @@ class App(_AppBase):
                 # fallo, igual que delete_folder_recursive.
                 ok, msg = True, "Archivos eliminados"
                 for file_path in item.loose_file_paths:
-                    ok, msg = own_ftp.delete_file(file_path)
+                    ok, msg = own_ftp.delete_file(file_path, progress_cb=progress_cb)
                     if not ok:
                         break
             else:
-                ok, msg = own_ftp.delete_folder_recursive(item.ftp_path)
+                ok, msg = own_ftp.delete_folder_recursive(item.ftp_path, progress_cb=progress_cb)
             own_ftp.disconnect()
         self._save_deletion_history_entry(
             name=item.name, ftp_path=item.ftp_path, size_bytes=item.size_bytes,
             reason=reason, status="ok" if ok else "error", error_msg="" if ok else msg)
         self.after(0, lambda: self._finish_delete_cleanup_item(item, ok, msg))
+
+    def _update_cleanup_delete_progress(self, current: int, total: int, name: str):
+        """Texto de estado durante un borrado -- solo actualiza la
+        etiqueta con la ruta que se está borrando (el botón de la fila ya
+        muestra "⏳ Eliminando…", la barra de progreso no se usa aquí)."""
+        self._cleanup_status_lbl.configure(text=name)
 
     def _finish_delete_cleanup_item(self, item, ok: bool, msg: str):
         if ok:
@@ -18201,6 +20638,15 @@ class App(_AppBase):
                 self._remove_series_from_missing_episodes(item.tmdb_id)
         else:
             self._set_status(f"No se pudo eliminar {item.name}: {msg}", ERROR_COLOR)
+        # Cualquiera que sea el resultado, el borrado ha terminado: quitar
+        # el ítem del estado "en curso" y restaurar el texto de la etiqueta
+        # (la worker ya la dejó con "Eliminando…"; la barra de progreso no
+        # se usa en el borrado, solo el botón "⏳ Eliminando…").
+        self._cleanup_deleting_paths.discard(item.ftp_path)
+        restored_text = self._cleanup_status_before_delete
+        self._cleanup_status_before_delete = None
+        self._cleanup_status_lbl.configure(text=restored_text
+                                           or f"Último análisis: {self._fmt_cleanup_scan_age(0)} -- pulsa \"Analizar servidor\" para actualizar")
 
     # -------------------------------------------------------- Protegidos tab
 
@@ -18241,9 +20687,16 @@ class App(_AppBase):
         ctk.CTkSwitch(top_bar, text="Ver todo el servidor", variable=self._protected_show_all_var,
                       command=self._render_protected_table).pack(side="right")
 
+        # Cuerpo: tabla a la izquierda, ficha de lo reservado a la derecha.
+        # Columna 0: tabla (se expande). Columna 1: separador arrastrable.
+        # Columna 2: panel lateral (ancho fijo, pero ajustable a mano) --
+        # mismo patrón de 3 columnas que Recomendado (ver
+        # _protected_sash_press/_motion/_release más abajo).
         body = ctk.CTkFrame(parent, fg_color="transparent")
         body.grid(row=2, column=0, sticky="nsew")
         body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)
+        body.grid_columnconfigure(2, weight=0)
         body.grid_rowconfigure(0, weight=1)
 
         sw0 = self._saved_col_widths("protected")
@@ -18254,11 +20707,27 @@ class App(_AppBase):
             ColumnSpec("owner", "Reservado por", width=sw0.get("owner", 120), min_width=60),
             ColumnSpec("release", "", width=110),
         ])
-        self._protected_table.grid(row=0, column=0, sticky="nsew")
+        self._protected_table.grid(row=0, column=0, sticky="nsew", padx=(0, CONTAINER_GAP))
         self._protected_table.on_widths_changed = lambda w: self._save_table_col_widths("protected", w)
         self._protected_table.enable_dynamic_page_size(self._on_protected_page_size_changed)
 
         self._protected_name_font = ctk.CTkFont(size=12)
+
+        # Separador arrastrable entre la tabla y el panel lateral -- mismo
+        # patrón visual y de comportamiento que _movies_sash (ver
+        # _protected_sash_press/_motion/_release más abajo).
+        self._protected_sash = tk.Frame(body, width=4, bg="#505060",
+                                        cursor="sb_h_double_arrow")
+        self._protected_sash.grid(row=0, column=1, sticky="ns", pady=8)
+        self._protected_sash.bind("<ButtonPress-1>", self._protected_sash_press)
+        self._protected_sash.bind("<B1-Motion>", self._protected_sash_motion)
+        self._protected_sash.bind("<ButtonRelease-1>", self._protected_sash_release)
+        self._protected_sash_state = None
+        self._protected_resize_debounce_id = None
+        self._protected_panel_width = 240   # igual que el width= inicial de _build_protected_side_panel
+
+        self._protected_side_panel = self._build_protected_side_panel(body)
+        self._protected_side_panel.grid(row=0, column=2, sticky="nsew")
 
         # Paginado (ver TableView.page_size, calculado dinámicamente) -- esta era la única tabla de
         # listado de toda la app sin límite: con muchas reservas acumuladas
@@ -18279,6 +20748,8 @@ class App(_AppBase):
 
         self._protected_items = []   # página actual, ver _render_protected_table
         self._protected_page = 0
+        self._protected_row_widgets = {}   # clave de reserva → {"row_fr": ...} — resaltado de la fila pulsada
+        self._protected_selected = None    # clave de la reserva pulsada (ver _show_protected_ficha)
 
     def _render_protected_table(self):
         # Envoltorio fino solo para medir tiempos (ver app.log) -- mismo
@@ -18352,6 +20823,7 @@ class App(_AppBase):
         """Dibuja solo la página actual (self._protected_page) de
         self._protected_items -- ver TableView.page_size."""
         self._protected_table.clear_rows()
+        self._protected_row_widgets = {}
 
         user = self.config_data.get("app_user_name", "").strip()
         show_all = self._protected_show_all_var.get()
@@ -18382,10 +20854,235 @@ class App(_AppBase):
         self._protected_table.scroll_to_top()
         self._protected_table.note_rows_rendered(len(page_items))
 
+    _PROTECTED_PANEL_MIN_W = 180
+    _PROTECTED_PANEL_MAX_W = 500
+    _PROTECTED_RESIZE_DEBOUNCE_MS = 150
+
+    def _protected_sash_press(self, event):
+        self._protected_sash_state = {"x0": event.x_root, "w0": self._protected_panel_width}
+
+    def _protected_sash_motion(self, event):
+        if not self._protected_sash_state:
+            return
+        # El panel está a la derecha del separador: arrastrar hacia la
+        # izquierda (x decrece) lo ensancha, hacia la derecha lo estrecha
+        # (mismo criterio que _movies_sash_motion).
+        delta = self._protected_sash_state["x0"] - event.x_root
+        new_w = max(self._PROTECTED_PANEL_MIN_W,
+                    min(self._PROTECTED_PANEL_MAX_W, self._protected_sash_state["w0"] + delta))
+        if new_w == self._protected_panel_width:
+            return   # mismo ancho (redondeo) -- no repetir trabajo de layout
+        self._protected_panel_width = new_w
+        self._protected_side_panel.configure(width=new_w)
+        if self._protected_resize_debounce_id is not None:
+            self.after_cancel(self._protected_resize_debounce_id)
+        self._protected_resize_debounce_id = self.after(
+            self._PROTECTED_RESIZE_DEBOUNCE_MS, self._commit_protected_panel_width)
+
+    def _protected_sash_release(self, event):
+        self._protected_sash_state = None
+        if self._protected_resize_debounce_id is not None:
+            self.after_cancel(self._protected_resize_debounce_id)
+            self._protected_resize_debounce_id = None
+        self._commit_protected_panel_width()
+
+    def _commit_protected_panel_width(self):
+        """Aplica self._protected_panel_width de verdad a los widgets de
+        dentro del panel (el póster se queda a tamaño fijo, igual que en
+        Recomendado -- ver _commit_movies_panel_width). Es la parte cara --
+        se llama con antirrebote durante el arrastre, no en cada evento de
+        movimiento."""
+        self._protected_resize_debounce_id = None
+        w = self._protected_panel_width
+        self._protected_side_panel.configure(width=w)
+        content_w = max(100, w - 40)   # descontar el padding interno del panel
+        self._protected_detail_title.configure(width=content_w)
+        self._protected_detail_meta.configure(width=content_w)
+        self._protected_detail_cert.configure(width=content_w)
+        self._protected_detail_local.configure(width=content_w)
+        self._protected_detail_overview.configure(width=content_w)
+        self._autosize_textbox(self._protected_detail_title)
+        self._autosize_textbox(self._protected_detail_meta)
+        self._autosize_textbox(self._protected_detail_cert)
+        self._autosize_textbox(self._protected_detail_local)
+        self._autosize_textbox(self._protected_detail_overview)
+
+    def _build_protected_side_panel(self, parent):
+        """Ficha de la reserva pulsada -- los datos de la reserva (tamaño,
+        quién la reservó) se muestran al instante y la ficha de TMDB
+        (póster, categoría, clasificación, sinopsis) llega después en un
+        hilo. Mismo estilo que el panel lateral de Recomendado."""
+        panel = ctk.CTkFrame(parent, width=240)
+        panel.grid_propagate(False)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(0, weight=1)
+
+        scroll = ctk.CTkScrollableFrame(panel, fg_color="transparent", label_text="")
+        scroll.grid(row=0, column=0, sticky="nsew", padx=4, pady=6)
+        scroll.columnconfigure(0, weight=1)
+
+        self._protected_poster_label = ctk.CTkLabel(
+            scroll, text="Pulsa una reserva\npara ver su ficha",
+            width=180, height=220, text_color=PENDING_COLOR)
+        self._protected_poster_label.pack(pady=(4, 2))
+        self._protected_detail_title = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="transparent",
+            activate_scrollbars=False)
+        self._protected_detail_title.configure(state="disabled")
+        self._protected_detail_title.pack(pady=(4, 0), fill="x")
+        self._protected_detail_meta = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._protected_detail_meta.configure(state="disabled")
+        self._protected_detail_meta.pack(pady=(0, 0), fill="x")
+        self._protected_detail_cert = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._protected_detail_cert.configure(state="disabled")
+        self._protected_detail_cert.pack(pady=(0, 0), fill="x")
+        # Datos de la reserva (tamaño, quién la reservó) -- van antes de la
+        # sinopsis porque es la parte que se muestra SIN red, al instante.
+        self._protected_detail_local = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._protected_detail_local.configure(state="disabled")
+        self._protected_detail_local.pack(pady=(0, 0), fill="x")
+        self._protected_detail_overview = ctk.CTkTextbox(
+            scroll, width=200, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            activate_scrollbars=False)
+        self._protected_detail_overview.configure(state="disabled")
+        self._protected_detail_overview.pack(pady=4, fill="x")
+
+        return panel
+
+    def _show_protected_ficha(self, key: str, entry: dict):
+        """Ficha de la reserva pulsada en Protegidos: los datos de la reserva
+        (tamaño, quién la reservó, tipo) se muestran de inmediato y la ficha
+        de TMDB (póster, categoría, clasificación, sinopsis) se pide en un
+        hilo y se aplica cuando llega. Mismo patrón que _show_movie_poster."""
+        self._protected_selected = key
+        for k, widgets in self._protected_row_widgets.items():
+            widgets["row_fr"].configure(
+                fg_color=SELECTED_ROW_COLOR if k == key else ("gray95", "gray17"))
+        self._protected_poster_label.configure(image=None, text="…")
+        self._protected_poster_token = object()
+        token = self._protected_poster_token
+        media_type = entry.get("media_type", "movie")
+        self._set_textbox_text(self._protected_detail_title, entry.get("name", ""))
+        self._set_textbox_text(self._protected_detail_meta,
+                               "📺 Serie" if media_type == "tv" else "🎬 Película")
+        self._set_textbox_text(self._protected_detail_cert, "Clasificación: …")
+        local = "\n".join(x for x in [
+            f"Tamaño: {_fmt_size(entry.get('size_bytes', 0))}",
+            f"Reservado por: {entry.get('reserved_by', '')}",
+        ] if x)
+        self._set_textbox_text(self._protected_detail_local, local)
+        self._set_textbox_text(self._protected_detail_overview, "Buscando ficha en TMDB...")
+
+        tmdb_id = entry.get("tmdb_id")
+        if not tmdb_id:
+            self._apply_protected_no_result(token)
+            return
+
+        def worker():
+            details = {}
+            try:
+                if media_type == "tv":
+                    details = self.tmdb.get_tv_details(tmdb_id)
+                else:
+                    details = self.tmdb.get_movie_details(tmdb_id)
+            except Exception as e:
+                _log.warning("Protegidos: fallo al pedir la ficha de tmdb_id=%s: %s", tmdb_id, e)
+            def _apply():
+                if self._protected_poster_token is not token:
+                    return   # el usuario ya pulsó otra reserva mientras esto cargaba
+                year = (details.get("first_air_date") or details.get("release_date") or "")[:4]
+                vote = details.get("vote_average") or 0
+                genres = [g.get("name") for g in (details.get("genres") or []) if g.get("name")]
+                meta = " · ".join(x for x in [
+                    "📺 Serie" if media_type == "tv" else "🎬 Película",
+                    year,
+                    f"⭐ {vote:.1f}",
+                ] if x)
+                if genres:
+                    meta = (meta + " · " if meta else "") + ", ".join(genres)
+                self._set_textbox_text(self._protected_detail_title,
+                                       details.get("name") or details.get("title") or entry.get("name", ""))
+                self._set_textbox_text(self._protected_detail_meta, meta)
+                if media_type == "tv":
+                    self._set_textbox_text(self._protected_detail_cert, "Serie")
+                else:
+                    self._set_textbox_text(self._protected_detail_cert, "Clasificación: …")
+                    self._load_protected_certification(tmdb_id, token)
+                self._set_textbox_text(self._protected_detail_overview,
+                                       details.get("overview") or "Sin sinopsis disponible")
+                poster_path = details.get("poster_path")
+                if poster_path:
+                    threading.Thread(target=self._load_protected_poster,
+                                     args=(f"{TMDB_IMAGE}{poster_path}", token), daemon=True).start()
+                else:
+                    self._protected_poster_label.configure(image=None, text="Sin póster")
+            self.after(0, _apply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_protected_no_result(self, token):
+        if self._protected_poster_token is not token:
+            return
+        self._protected_poster_label.configure(image=None, text="Sin póster")
+        self._set_textbox_text(self._protected_detail_overview, "Sin ficha de TMDB para esta reserva")
+
+    def _load_protected_poster(self, url: str, token):
+        try:
+            resp = requests.get(url, timeout=8)
+            img = Image.open(BytesIO(resp.content)).resize((180, 260), Image.LANCZOS)
+            ctk_img = ctk.CTkImage(img, size=(180, 260))
+            def _apply():
+                if self._protected_poster_token is token:
+                    self._protected_poster_label.configure(image=ctk_img, text="")
+                    self._protected_current_poster = ctk_img
+            self.after(0, _apply)
+        except Exception:
+            pass
+
+    def _load_protected_certification(self, tmdb_id: int, token):
+        """Clasificación por edad (PG-13, 12, 18...) de la ficha de una
+        reserva de película, consultada a TMDB on-demand -- mismo patrón que
+        _load_movie_certification de Recomendado. Un fallo de red deja
+        "Clasificación: …" sin molestar."""
+        cert_token = object()
+        self._protected_cert_token = cert_token
+
+        def _worker():
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            cert = ""
+            try:
+                cert = client.get_movie_certification(tmdb_id)
+            except Exception:
+                _log.warning("Protegidos: fallo al pedir la clasificación de tmdb_id=%s", tmdb_id)
+            def _apply():
+                if self._protected_poster_token is not token or getattr(self, "_protected_cert_token", None) is not cert_token:
+                    return
+                label = f"Clasificación: {cert}" if cert else "Clasificación: sin dato"
+                self._set_textbox_text(self._protected_detail_cert, label)
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _build_protected_row(self, key: str, entry: dict, user: str):
         cw = self._protected_table.col_width
         row = ctk.CTkFrame(self._protected_table.body, fg_color=("gray95", "gray17"))
         row.pack(fill="x", pady=3, padx=2)
+        # Resaltado de la fila pulsada (ver _show_protected_ficha): si se
+        # repinta la página (cambio de tamaño/página) se mantiene el resaltado
+        # de la reserva que estaba seleccionada, si sigue en esta página.
+        self._protected_row_widgets[key] = {"row_fr": row}
+        if self._protected_selected == key:
+            row.configure(fg_color=SELECTED_ROW_COLOR)
 
         # Celdas con recorte, igual que el resto de tablas (ver TableView.cell).
         _cell = lambda key, pady=8, **kw: self._protected_table.cell(row, key, pady=pady, **kw)
@@ -18395,8 +21092,10 @@ class App(_AppBase):
         ctk.CTkLabel(c, text=icon).pack(fill="both", expand=True)
 
         c = _cell("name", padx=(4, 4))
-        ctk.CTkLabel(c, text=entry.get("name", ""), font=self._protected_name_font,
-                     anchor="w").pack(fill="both", expand=True)
+        name_lbl = ctk.CTkLabel(c, text=entry.get("name", ""), font=self._protected_name_font,
+                                anchor="w", cursor="hand2")
+        name_lbl.pack(fill="both", expand=True)
+        name_lbl.bind("<Button-1>", lambda e, k=key, en=entry: self._show_protected_ficha(k, en))
 
         c = _cell("size", padx=(0, 4))
         ctk.CTkLabel(c, text=_fmt_size(entry.get("size_bytes", 0)),

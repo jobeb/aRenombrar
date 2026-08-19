@@ -529,7 +529,7 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 120,
     concreto (case-insensitive) -- por si alguna vez interesa ver solo lo
     que ha visto una persona en particular.
 
-    Devuelve {jellyfin_id: {"name", "tmdb_id", "media_type",
+    Devuelve {jellyfin_id: {"name", "tmdb_id", "media_type", "year",
     "fully_watched", "play_count", "last_played", "date_added",
     "size_bytes"}, ...} o None si falla o no está configurado. size_bytes
     y date_added no dependen del usuario (son propiedades del archivo),
@@ -610,6 +610,7 @@ def get_jellyfin_usage_stats(host: str, api_key: str, timeout: int = 120,
             "name": item.get("Name", ""),
             "tmdb_id": tmdb_id,
             "media_type": media_type,
+            "year": str(item.get("ProductionYear") or ""),
             "fully_watched": False,
             "play_count": 0,
             "last_played": None,
@@ -736,9 +737,9 @@ def get_plex_usage_stats(host: str, token: str, timeout: int = 120) -> Optional[
     uso real (vista/no vista, veces reproducida, fecha del último
     visionado, fecha de añadido) por serie y película, para la
     herramienta de liberar espacio. Devuelve {rating_key: {"name",
-    "tmdb_id", "media_type", "fully_watched", "play_count", "last_played",
-    "date_added", "size_bytes"}, ...} o None si falla o no está
-    configurado. timeout=120 (antes 20s) por el mismo motivo medido en
+    "tmdb_id", "media_type", "year", "fully_watched", "play_count",
+    "last_played", "date_added", "size_bytes"}, ...} o None si falla o no
+    está configurado. timeout=120 (antes 20s) por el mismo motivo medido en
     get_jellyfin_usage_stats -- una biblioteca grande puede tardar más de
     20s en responder a un listado recursivo. Las películas traen su
     tamaño directamente en el mismo listado; para series hace falta una
@@ -798,6 +799,7 @@ def get_plex_usage_stats(host: str, token: str, timeout: int = 120) -> Optional[
                 "name": item.get("title", ""),
                 "tmdb_id": tmdb_id,
                 "media_type": media_type,
+                "year": str(item.get("year") or ""),
                 "fully_watched": fully_watched,
                 "play_count": item.get("viewCount", 0) or 0,
                 "last_played": item.get("lastViewedAt"),
@@ -1193,3 +1195,86 @@ def trigger_refresh(config, min_interval_seconds: int = 60) -> None:
 def _reset_debounce_for_tests() -> None:
     global _last_refresh_ts
     _last_refresh_ts = 0.0
+
+
+def get_jellyfin_movies(host: str, api_key: str, timeout: int = 15) -> Optional[list]:
+    """Lista todas las películas de la biblioteca de Jellyfin (mismo patrón
+    que get_jellyfin_series pero con IncludeItemTypes=Movie). Devuelve
+    [{"id": str, "name": str, "tmdb_id": int|None, "folder_name": str|None},
+    ...] o None si falla o no está configurado -- usado por la pestaña
+    "Películas" para no recomendar lo que ya está en el servidor."""
+    if not host or not api_key:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/Items",
+            headers={"X-Emby-Token": api_key},
+            params={"IncludeItemTypes": "Movie", "Recursive": "true",
+                    "Fields": "ProviderIds,Path"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        _log.warning("Jellyfin: fallo al listar películas: %s", e)
+        return None
+    movies = []
+    for item in data.get("Items", []) or []:
+        tmdb_raw = (item.get("ProviderIds") or {}).get("Tmdb")
+        try:
+            tmdb_id = int(tmdb_raw) if tmdb_raw else None
+        except (TypeError, ValueError):
+            tmdb_id = None
+        path = item.get("Path") or ""
+        folder_name = path.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if path else None
+        movies.append({"id": item.get("Id"), "name": item.get("Name", ""), "tmdb_id": tmdb_id,
+                       "folder_name": folder_name})
+    _log.info("Jellyfin: %d película(s) listadas (%d sin ID de TMDB emparejado)",
+              len(movies), sum(1 for m in movies if m["tmdb_id"] is None))
+    return movies
+
+
+def get_plex_movies(host: str, token: str, timeout: int = 15) -> Optional[list]:
+    """Lista todas las películas de todas las secciones de tipo "movie" de
+    Plex (mismo patrón que get_plex_series pero con sec.type == "movie" y
+    type=1). Devuelve [{"rating_key": str, "name": str, "tmdb_id": int|None},
+    ...] o None si falla o no está configurado."""
+    if not host or not token:
+        return None
+    base = host.rstrip("/")
+    try:
+        resp = requests.get(
+            f"{base}/library/sections",
+            params={"X-Plex-Token": token},
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        sections = resp.json().get("MediaContainer", {}).get("Directory", []) or []
+    except Exception as e:
+        _log.warning("Plex: fallo al listar secciones: %s", e)
+        return None
+
+    movies = []
+    for sec in sections:
+        if sec.get("type") != "movie":
+            continue
+        sec_id = sec.get("key")
+        try:
+            resp = requests.get(
+                f"{base}/library/sections/{sec_id}/all",
+                params={"X-Plex-Token": token, "type": "1", "includeGuids": "1"},
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("MediaContainer", {}).get("Metadata", []) or []
+        except Exception as e:
+            _log.warning("Plex: fallo al listar películas de la sección %s: %s", sec_id, e)
+            continue
+        for item in items:
+            tmdb_id = _plex_tmdb_id_from_guids(item.get("Guid", []))
+            movies.append({"rating_key": item.get("ratingKey"), "name": item.get("title", ""),
+                           "tmdb_id": tmdb_id})
+    return movies

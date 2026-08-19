@@ -57,6 +57,7 @@ def _make_ftp():
     ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/peliculas/X/"
     ftp.get_free_space.return_value = None
+    ftp.get_remote_size.return_value = None
     ftp.list_files.return_value = []
     ftp.upload_file.side_effect = lambda local_path, remote_path, **kw: (True, "ok")
     return ftp

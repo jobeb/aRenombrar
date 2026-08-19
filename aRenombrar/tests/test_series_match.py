@@ -181,6 +181,42 @@ def test_match_names_exclusively_more_candidates_than_targets():
     assert result.get("Serie X") == "Serie X"
 
 
+def test_match_names_exclusively_lax_fallback_matches_short_folder_to_long_title():
+    # Caso real (Boruto): la carpeta del servidor solo trae el título
+    # corto y Jellyfin/Plex el largo -- el modo estricto no lo casa
+    # (0.33 < 0.75), igual que el cruce FTP de "Episodios que faltan"
+    # (series_similarity laxa). lax_fallback recupera esa pareja.
+    candidates = ["Boruto"]
+    targets = ["Boruto: Naruto Next Generations"]
+    assert match_names_exclusively(candidates, targets, min_ratio=0.75) == {}
+    result = match_names_exclusively(candidates, targets, min_ratio=0.75, lax_fallback=True)
+    assert result == {"Boruto": "Boruto: Naruto Next Generations"}
+
+
+def test_match_names_exclusively_lax_fallback_does_not_steal_exact_target():
+    # Cuando el título completo TAMBIÉN existe como candidato, la pasada
+    # estricta se lo lleva a él y el fallback laxo NO debe quitárselo al
+    # candidato corto -- mismo espíritu que
+    # test_match_names_exclusively_is_strict_by_default ("Animal" no roba
+    # "Animal Crackers").
+    candidates = ["Boruto", "Boruto: Naruto Next Generations"]
+    targets = ["Boruto: Naruto Next Generations"]
+    result = match_names_exclusively(candidates, targets, min_ratio=0.75, lax_fallback=True)
+    assert result == {"Boruto: Naruto Next Generations": "Boruto: Naruto Next Generations"}
+
+
+def test_match_names_exclusively_lax_fallback_respects_exclusivity():
+    # El fallback laxo tampoco asigna el mismo target a dos candidatos:
+    # "Animal" y "Animal Crackers" compiten por el único target, y solo
+    # uno (el más parecido) se lo lleva.
+    candidates = ["Animal", "Animal Crackers"]
+    targets = ["Animal Crackers"]
+    result = match_names_exclusively(candidates, targets, min_ratio=0.75, lax_fallback=True)
+    assert len(result) == 1
+    assert result.get("Animal Crackers") == "Animal Crackers"
+    assert "Animal" not in result
+
+
 # ── best_match_with_year (caso real: Ranma ½ 1989 vs remake 2024) ──────────
 
 def test_best_match_with_year_finds_folder_whose_own_year_matches_known_year():

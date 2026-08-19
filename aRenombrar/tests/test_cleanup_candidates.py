@@ -202,6 +202,14 @@ def test_merge_usage_entries_fills_missing_tmdb_id_and_size_from_either_source()
     assert merged["size_bytes"] == 12345
 
 
+def test_merge_usage_entries_takes_year_from_either_source():
+    a = {"name": "X", "year": ""}
+    b = {"name": "X", "year": "2020"}
+    assert merge_usage_entries(a, b)["year"] == "2020"
+    assert merge_usage_entries(b, a)["year"] == "2020"
+    assert merge_usage_entries(a, {"name": "X"})["year"] == ""
+
+
 def test_merge_usage_entries_prefers_first_source_for_source_and_server_id():
     """El llamador (gui/app.py::_scan_cleanup_candidates) procesa Jellyfin
     antes que Plex -- por eso "a" gana aquí, respetando la preferencia

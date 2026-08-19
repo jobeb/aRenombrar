@@ -51,6 +51,7 @@ def _make_watcher(folder, free_space, upload_calls):
     ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/peliculas/Mi Pelicula/"
     ftp.get_free_space.return_value = free_space
+    ftp.get_remote_size.return_value = None   # no existe nada remoto con ese nombre
     ftp.list_files.return_value = []   # carpeta vacia -- sin duplicados
 
     def _fake_upload(local_path, remote_path, **kw):

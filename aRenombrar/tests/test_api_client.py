@@ -79,6 +79,17 @@ def test_detect_cleans_junk_tokens():
     assert r["media_type"] == "movie"
 
 
+def test_detect_strips_bare_hd_quality_tag():
+    # Caso real: "Shelter, El Protector HD.mkv" se buscaba en TMDB como
+    # "Shelter, El Protector Hd" porque "HD" a secas no estaba en los
+    # marcadores de ruido (solo HDTV/HDRip lo estaban) y no encontraba nada.
+    r = detect_episode("Shelter, El Protector HD.mkv")
+    assert r["title"] == "Shelter, El Protector"
+    assert r["media_type"] == "movie"
+    r2 = detect_episode("Shelter, El Protector HD 1080p x264.mkv")
+    assert r2["title"] == "Shelter, El Protector"
+
+
 def test_detect_strips_bdrip_and_uploader_credit():
     r = detect_episode(
         "The.Brutalist.(2024).(Spanish.English.Subs).BDRip.1080p.x264-AC3.by.xusman.(nocturniap2p).mkv")
@@ -239,6 +250,43 @@ def test_get_season_episodes_excludes_unaired_episodes(monkeypatch):
     monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
     episodes = client.get_season_episodes(1396, 1)
     assert episodes == [{"episode_number": 1, "name": "Ya emitido", "air_date": "2020-01-01"}]
+
+
+def test_get_movie_certification_uses_primary_region(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    payload = {"results": [
+        {"iso_3166_1": "US", "release_dates": [{"certification": "PG-13"}]},
+        {"iso_3166_1": "ES", "release_dates": [{"certification": "12"}]},
+    ]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    assert client.get_movie_certification(123) == "12"
+
+
+def test_get_movie_certification_falls_back_to_secondary_region(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    payload = {"results": [
+        {"iso_3166_1": "US", "release_dates": [{"certification": "PG-13"}]},
+        {"iso_3166_1": "ES", "release_dates": [{"certification": ""}]},
+    ]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    assert client.get_movie_certification(123) == "PG-13"
+
+
+def test_get_movie_certification_no_cert_returns_empty(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    payload = {"results": [
+        {"iso_3166_1": "US", "release_dates": [{"certification": ""}]},
+        {"iso_3166_1": "ES", "release_dates": [{"certification": ""}]},
+    ]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    assert client.get_movie_certification(123) == ""
+
+
+def test_get_movie_certification_no_release_dates_returns_empty(monkeypatch):
+    client = TMDBClient(api_key="dummy")
+    payload = {"results": [{"iso_3166_1": "ES", "release_dates": []}]}
+    monkeypatch.setattr(client.session, "get", lambda url, **kw: _FakeTmdbResponse(payload))
+    assert client.get_movie_certification(123) == ""
 
 
 # ── Límite de peticiones a TMDB (~40/10s por IP) ────────────────────────

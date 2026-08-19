@@ -54,6 +54,11 @@ DEFAULTS = {
     "ftp_movie_path_template": "",
     "appearance": "dark",
     "color_theme": "blue",
+    # Estado de la ventana principal al cerrar (se restaura al arrancar):
+    # "window_geometry" es "WxH+X+Y" y "window_maximized" indica si estaba
+    # maximizada -- ver _save_window_state/_apply_window_state en gui/app.py.
+    "window_geometry": "",
+    "window_maximized": False,
     "last_dir": "",
     "watch_folder": "",
     "poll_interval": 10,
@@ -212,6 +217,38 @@ DEFAULTS = {
     # missing_episodes_cache.json (ver App._load_complete_series_from_cache),
     # para poder usar la pestaña como catálogo completo del servidor.
     "missing_ep_hide_complete": True,
+    # "Ocultar ya en el servidor" de la pestaña "Películas": activado de
+    # fábrica (lo normal es recomendar solo lo que NO está en el servidor).
+    # Al apagarlo se añaden las películas que ya están en Plex/Jellyfin para
+    # ver el catálogo entero de las listas de TMDB (ver
+    # core/missing_movies.py::apply_in_server_filter).
+    "missing_movies_hide_in_server": True,
+    "missing_movies_watch_only": True,
+    # Filtro de tipo de la pestaña "Recomendado": "all" (todo junto),
+    # "movies" (solo películas) o "series" (solo series). Se elige con el
+    # selector Todo/Películas/Series de la barra de filtros.
+    "missing_movies_type_filter": "all",
+    # Filtro de años de estreno de la pestaña "Recomendado": "1"/"2"/"3"/
+    # "5"/"8"/"10" (últimos X años, contando hacia atrás desde el año actual)
+    # o "Todos". Se elige con el selector "Años" de la barra de filtros.
+    "missing_movies_year_filter": "1",
+    # Filtro de género de la pestaña "Recomendado": nombre del género TMDB
+    # ("Terror", "Comedia", "Animación"...), "Anime" (alias de Animación) o
+    # "" / "Todos" (sin filtrar). Se elige con el selector "Género" de la
+    # barra de filtros y se persiste al cambiar, como el resto.
+    "missing_movies_genre_filter": "",
+    # "Ocultar asiáticas" de la pestaña "Recomendado": activado de fábrica
+    # (el usuario no quiere nada de Asia oriental ni del sur -- China, Japón,
+    # Corea, India/Bollywood, Tailandia... -- que puebla de sobra las listas
+    # de tendencias/populares de TMDB). Se descarta lo que TMDB marca con
+    # original_language/origin_country asiático (ver apply_origin_filter en
+    # core/missing_movies.py); sin dato de origen nunca se descarta. Se
+    # persiste al cambiar (missing_movies_hide_asian), como el resto.
+    "missing_movies_hide_asian": True,
+    # El escaneo de Películas pide 10 páginas fijas de TMDB por cada lista
+    # (tendencias/populares/próximos/en emisión), ~20 películas por página.
+    # Se eliminó el selector "Páginas por lista": es un valor fijo en
+    # gui/app.py (_on_movies_scan).
     # Autocompletado por serie (pestaña "Episodios que faltan", botón "auto"
     # de cada fila): lista de tmdb_id (str) con el autocompletado ACTIVO --
     # la app busca en aMule y descarga los capítulos que faltan solos y de

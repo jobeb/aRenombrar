@@ -192,7 +192,7 @@ def best_match_with_year(desired: str, candidates, known_year, min_ratio: float 
 
 
 def match_names_exclusively(candidates: list, targets: list, min_ratio: float = 0.55,
-                            strict: bool = True) -> dict:
+                            strict: bool = True, lax_fallback: bool = False) -> dict:
     """Empareja cada nombre de *candidates* con como mucho un nombre de
     *targets*, garantizando que ningún target se asigne a más de un
     candidato -- a diferencia de llamar a best_match() de forma
@@ -208,24 +208,47 @@ def match_names_exclusively(candidates: list, targets: list, min_ratio: float = 
     entre sí, donde "Animal" y "Animal Crackers" deben seguir siendo dos
     cosas distintas, no la misma con o sin subtítulo.
 
+    *lax_fallback* relaja esa exigencia SOLO para los candidatos que se
+    quedaron sin pareja en la pasada estricta: se hace una segunda pasada
+    con strict=False (el modo laxo que usa el cruce FTP de "Episodios que
+    faltan", donde un prefijo corto SÍ casa con un título largo, p.ej.
+    carpeta "Boruto" contra "Boruto: Naruto Next Generations") contra los
+    targets que siguen sin asignar. La exclusividad se mantiene en ambas
+    pasadas -- ningún target se asigna dos veces, y el candidato que ya
+    consiguió pareja estricta no vuelve a competir. Así la carpeta corta
+    que era la ÚNICA forma del título en el servidor sigue quedándose con
+    los datos de visionado de Jellyfin/Plex, sin reabrir el caso
+    "Animal"/"Animal Crackers" cuando existe un match estricto mejor.
+
     Se calculan TODAS las parejas candidato-target con ratio >=
     min_ratio, se ordenan de más a menos parecidas, y se van asignando en
     ese orden -- el parecido más fuerte tiene prioridad, sin importar en
     qué orden se procesen los candidatos. Devuelve {candidato: target,
     ...} solo para los que consiguieron pareja."""
-    pairs = []
-    for c in candidates:
-        for t in targets:
-            ratio = series_similarity(c, t, strict=strict)
-            if ratio >= min_ratio:
-                pairs.append((ratio, c, t))
-    pairs.sort(key=lambda p: p[0], reverse=True)
+    def _assign(pairs):
+        assigned_targets = set()
+        result = {}
+        for ratio, c, t in sorted(pairs, key=lambda p: p[0], reverse=True):
+            if c in result or t in assigned_targets:
+                continue
+            result[c] = t
+            assigned_targets.add(t)
+        return result, assigned_targets
 
-    assigned_targets = set()
-    result = {}
-    for ratio, c, t in pairs:
-        if c in result or t in assigned_targets:
-            continue
-        result[c] = t
-        assigned_targets.add(t)
+    strict_pairs = [
+        (series_similarity(c, t, strict=strict), c, t)
+        for c in candidates for t in targets
+        if series_similarity(c, t, strict=strict) >= min_ratio]
+    result, assigned_targets = _assign(strict_pairs)
+
+    if lax_fallback:
+        remaining_candidates = [c for c in candidates if c not in result]
+        remaining_targets = [t for t in targets if t not in assigned_targets]
+        if remaining_candidates and remaining_targets:
+            lax_pairs = [
+                (series_similarity(c, t, strict=False), c, t)
+                for c in remaining_candidates for t in remaining_targets
+                if series_similarity(c, t, strict=False) >= min_ratio]
+            lax_result, _ = _assign(lax_pairs)
+            result.update(lax_result)
     return result

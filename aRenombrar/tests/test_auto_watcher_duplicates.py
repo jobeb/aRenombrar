@@ -62,6 +62,7 @@ def _make_watcher(existing_remote_files, upload_calls, media_type="movie",
     ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/destino/"
     ftp.get_free_space.return_value = None
+    ftp.get_remote_size.return_value = None
     ftp.list_files.return_value = existing_remote_files
 
     def _fake_upload(local_path, remote_path, **kw):
@@ -94,6 +95,38 @@ def test_movie_uploads_when_folder_empty(tmp_path):
     original.write_bytes(b"contenido")
     upload_calls = []
     watcher, ftp = _make_watcher([], upload_calls, media_type="movie")
+
+    watcher._process(original)
+
+    assert len(upload_calls) == 1
+
+
+def test_movie_skips_upload_when_same_remote_name_already_exists(tmp_path):
+    """Caso real: "La Odisea (2026)" descargada dos veces -- el nombre limpio
+    coincide y la 2ª subida machacaba en silencio la copia ya subida (find_duplicate
+    excluye a propósito el nombre exacto de la comparación). Con el archivo remoto
+    ya completo, se omite en vez de sobrescribir."""
+    original = tmp_path / "1.mi.pelicula.WEB-DL.2024.mkv"
+    original.write_bytes(b"contenido")
+    upload_calls = []
+    watcher, ftp = _make_watcher(["Mi Pelicula (2024).mkv"], upload_calls, media_type="movie")
+    # El archivo remoto con el MISMO nombre ya existe y está completo
+    ftp.get_remote_size.return_value = 9   # >= tamaño local ("contenido" = 9 bytes)
+
+    watcher._process(original)
+
+    assert upload_calls == [], "no debería sobrescribir un archivo remoto ya completo"
+    assert any(v.get("status") == "duplicado" for v in watcher._processed.values()), watcher._processed
+
+
+def test_movie_uploads_when_remote_partial_is_smaller(tmp_path):
+    """Un parcial remoto más pequeño que el local no cuenta como "ya existe":
+    se sube para completarlo (igual que la subida manual)."""
+    original = tmp_path / "1.mi.pelicula.WEB-DL.2024.mkv"
+    original.write_bytes(b"contenido")
+    upload_calls = []
+    watcher, ftp = _make_watcher([], upload_calls, media_type="movie")
+    ftp.get_remote_size.return_value = 3   # parcial menor que los 9 bytes locales
 
     watcher._process(original)
 

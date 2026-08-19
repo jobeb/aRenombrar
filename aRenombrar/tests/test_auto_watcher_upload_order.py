@@ -68,6 +68,7 @@ def _make_ftp(upload_order: list):
     ftp.connect.return_value = (True, "ok")
     ftp.build_remote_path.return_value = "/peliculas/X/"
     ftp.get_free_space.return_value = None
+    ftp.get_remote_size.return_value = None
     ftp.list_files.return_value = []
 
     def _fake_upload(local_path, remote_path, **kw):
