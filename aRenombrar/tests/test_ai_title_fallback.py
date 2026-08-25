@@ -2,6 +2,7 @@ import json
 import logging
 
 import core.ai_title_fallback as aif
+from core import applog
 
 
 class _FakeResponse:
@@ -23,11 +24,14 @@ def _groq_payload(content: str, total_tokens=42):
 
 
 def _isolated_logger(monkeypatch, tmp_path):
-    """Log rotativo aislado en tmp_path, sin handlers de sesiones anteriores."""
-    monkeypatch.setattr(aif, "app_data_dir", lambda: tmp_path)
-    logger = logging.getLogger("aRenombrar.ai_fallback")
-    logger.handlers.clear()
-    aif._log = aif._setup_logger()
+    """Log rotativo aislado en tmp_path, sin handlers de sesiones anteriores.
+    El módulo ya no monta su propio RotatingFileHandler: usa core/applog.py,
+    que comparte un handler por FICHERO para que la rotación funcione en
+    Windows (ver test_applog_rotation.py), así que se aísla ahí."""
+    monkeypatch.setattr(applog, "app_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(applog, "_handlers", {})
+    logging.getLogger("aRenombrar.ai_fallback").handlers.clear()
+    aif._log = applog.get_logger("aRenombrar.ai_fallback", "ai_fallback.log")
     return aif._log
 
 

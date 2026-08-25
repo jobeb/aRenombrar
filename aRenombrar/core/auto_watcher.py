@@ -195,6 +195,15 @@ class AutoWatcher:
         # _should_process (que borra la entrada para reprocesar) y _mark
         # (que la vuelve a escribir), ver _MAX_RETRY_ATTEMPTS.
         self._pending_attempts  = {}
+        # Claves cuyo "Saltado (...)" ya se escribió en el log durante esta
+        # sesión. Sin esto, _should_process escribía una línea por archivo ya
+        # procesado en CADA ciclo de escaneo (80 archivos cada 10 s = 480
+        # líneas/minuto): auto_watcher.log llegaba a los 2 MB de rotación en
+        # unos 10 minutos y se llevaba por delante todo el historial útil
+        # (subidas, errores, renombrados) justo cuando hacía falta para
+        # diagnosticar algo. El motivo del salto no cambia entre ciclos, así
+        # que con registrarlo una vez por archivo sobra.
+        self._logged_skips      = set()
         # Reutilización de carpetas de serie ya existentes en el FTP (evita
         # crear una carpeta duplicada por idioma/nombre corto distinto)
         self._series_folder_cache = {}
@@ -258,12 +267,23 @@ class AutoWatcher:
             for name in filenames:
                 yield Path(dirpath) / name
 
+    def _log_skip_once(self, key: str, reason: str, name: str):
+        """Escribe "Saltado (motivo): archivo" solo la primera vez que ese
+        archivo se salta por ese motivo (ver _logged_skips). Si el motivo
+        cambia (p. ej. "en proceso" -> "subido") vuelve a registrarse, que
+        eso sí es información nueva."""
+        mark = (key, reason)
+        if mark in self._logged_skips:
+            return
+        self._logged_skips.add(mark)
+        _log.debug("Saltado (%s): %s", reason, name)
+
     def _should_process(self, key: str, name: str) -> bool:
         """Comprueba _in_progress/_processed y decide si *key* debe
         procesarse ahora -- mismo criterio para vídeo/libro/cómic
         (_process) y para archivos comprimidos (_process_archive)."""
         if key in self._in_progress:
-            _log.debug("Saltado (en proceso): %s", name)
+            self._log_skip_once(key, "en proceso", name)
             return False
         if key in self._processed:
             status = self._processed[key].get("status", "")
@@ -288,7 +308,7 @@ class AutoWatcher:
                 # detectar/marcar el mismo resultado sin parar (visto de
                 # verdad con Dr. Stone 4x32, que "reaparecía" cada vez que
                 # se activaba el automático).
-                _log.debug("Saltado (%s): %s", status, name)
+                self._log_skip_once(key, status, name)
                 return False
             # Estado no exitoso (fallo del propio AutoWatcher) → reprocesar,
             # pero solo unas cuantas veces (ver _MAX_RETRY_ATTEMPTS): hay
@@ -296,7 +316,7 @@ class AutoWatcher:
             # en TMDB), y reintentarlos en cada ciclo era un bucle infinito.
             attempts = self._processed[key].get("attempts", 0)
             if attempts >= _MAX_RETRY_ATTEMPTS:
-                _log.debug("Saltado (%s, %d intentos agotados): %s", status, attempts, name)
+                self._log_skip_once(key, f"{status}, {attempts} intentos agotados", name)
                 return False
             _log.info("Reprocesando (estado anterior=%s, intento %d/%d): %s",
                       status, attempts + 1, _MAX_RETRY_ATTEMPTS, name)

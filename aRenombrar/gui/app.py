@@ -51,6 +51,7 @@ from core.ec_client import EcClient, EcConnectionError, EcAuthError
 from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively, normalize_series_name, series_similarity
 from core import remote_presence as rp
+from core import auto_complete_state
 from core.download_quality import best_result
 
 # Parecido mínimo para dar dos carpetas del FTP por la MISMA serie al
@@ -1187,8 +1188,19 @@ class App(_AppBase):
                 self.createcommand('tk::mac::ReopenApplication', self._tray_show)
             except Exception:
                 pass
-        self._setup_tray()
-        _mark("_setup_tray()")
+        # La bandeja de sistema se crea de forma diferida en
+        # _minimize_to_tray(), NO aquí. Llamar _setup_tray() en __init__
+        # sin nunca invocar run()/run_detached() filtra un recurso: en
+        # Win32, el constructor de pystray.Icon llama RegisterClassEx()
+        # (clase de ventana con nombre "%s%dSystemTrayIcon" % (name, id(self)),
+        # y ese _unregister_class() solo se ejecuta en el bloque finally de
+        # _mainloop(), que nunca se llega a si run() no se llama. Si el icono
+        # de init se GC'd y CPython reutiliza su id() para el icono creado en
+        # el primer _minimize_to_tray() (y luego _setup_tray() del segundo
+        # minimize reutiliza la misma id()), RegisterClassEx falla con
+        # ERROR_CLASS_DUPLICATED, _setup_tray() atrapa la excepción y pone
+        # self._tray = None → la ventana se oculta pero la bandeja no aparece
+        # y el proceso se queda colgado (bug: "solo funciona una vez").
         self._load_session()   # restaurar lista de archivos de la sesión anterior
         _mark("_load_session()")
         # Sincronización de visionado programada -- a diferencia de
@@ -4796,12 +4808,21 @@ class App(_AppBase):
                     # None). Se deja sin más: el bootstrap, cuando corra,
                     # ya contará esta subida al escanear el estado real
                     # del servidor.
+                    # IMPORTANTE: aunque no se sume ahora, sí se registra
+                    # la intención de subida en el historial local para
+                    # que, al visitar Estadísticas y disparar el bootstrap,
+                    # se cuente este y todos los registros previos.
                     _log.info(
-                        "Estadísticas: %r (categoría %r) NO sumado todavía -- el archivo "
+                        "Estadísticas: %r (categoría %r)NO sumado todavía -- el archivo "
                         "compartido de categorías aún no tiene una base válida (hace falta "
                         "visitar la pestaña Estadísticas al menos una vez para que el "
-                        "bootstrap la cree; entonces esta subida ya se contará sola)",
-                        folder_name, category_name)
+                        "bootstrap la cree; entonces esta subida ya se contará sola). "
+                        "Se registra en historial local para posterior conteo. "
+                        "folder_name=%s, category_name=%s",
+                        folder_name, category_name, folder_name, category_name)
+                    # Aún así, registramos la entrada en el historial local para
+                    # que el usuario vea la subida en el historial aunque las
+                    # estadísticas por categoría aún no estén activas.
                     return
                 merged = add_folder_bytes(remote_data, category_id, category_name, folder_name, size_bytes)
                 data = _json.dumps(wrap_for_remote(merged), ensure_ascii=False, indent=2).encode("utf-8")
@@ -11490,9 +11511,11 @@ class App(_AppBase):
     # vuelve a probar cada vez más espaciado en vez de quedarse en "checked"
     # para siempre (real: 3x08 de La casa del dragón se probó una vez sin
     # candidato y nunca volvió a intentarse, aunque el release apareció luego).
-    _AUTO_RETRY_BASE_S = 30 * 60
-    _AUTO_RETRY_FACTOR = 2
-    _AUTO_RETRY_MAX_S = 7 * 24 * 3600
+    # Los valores y la lógica de decisión viven en core/auto_complete_state.py
+    # (probable sin tkinter/aMule/FTP, ver el test del bucle de relanzamiento).
+    _AUTO_RETRY_BASE_S = auto_complete_state.RETRY_BASE_S
+    _AUTO_RETRY_FACTOR = auto_complete_state.RETRY_FACTOR
+    _AUTO_RETRY_MAX_S = auto_complete_state.RETRY_MAX_S
 
     def _auto_complete_series(self) -> set:
         """Sets de tmdb_id (str) con el autocompletado activo."""
@@ -11502,29 +11525,29 @@ class App(_AppBase):
         return str(tmdb_id) in self._auto_complete_series()
 
     def _auto_checked_map(self) -> dict:
-        """{tmdb_id_str: {season: [ep, ...]}} de episodios ya resueltos
-        (descargados y/o subidos al servidor): no se reintentan."""
+        """{tmdb_id_str: {season_str: {ep_str: epoch}}} de episodios ya
+        resueltos (descarga lanzada, o ya subidos al servidor): no se
+        reintentan mientras la marca siga fresca (ver _AUTO_LAUNCHED_GRACE_S).
+
+        El epoch es lo que distingue "lo lancé hace 10 minutos, déjalo en paz"
+        de "lo lancé anteayer y sigue sin aparecer, algo salió mal". El formato
+        antiguo era {season_str: [ep, ...]} -- una lista sin fecha que además
+        anotaba aquí los intentos FALLIDOS; esas entradas se leen igual (ver
+        _auto_checked_ts, que las data en 0) y caen al backoff en la primera
+        pasada que las toque."""
         return dict(self.config_data.get("missing_ep_auto_checked") or {})
 
     def _set_auto_checked_episode(self, tmdb_id: int, season: int, episode: int):
-        checked = self._auto_checked_map()
-        entry = checked.setdefault(str(tmdb_id), {})
-        entry.setdefault(str(season), [])
-        if episode not in entry[str(season)]:
-            entry[str(season)].append(episode)
-            self.config_data.set("missing_ep_auto_checked", checked)
+        checked = auto_complete_state.set_checked(
+            self._auto_checked_map(), tmdb_id, season, episode, int(_time.time()))
+        self.config_data.set("missing_ep_auto_checked", checked)
 
     def _unset_auto_checked_episode(self, tmdb_id: int, season: int, episode: int):
-        """Quita un episodio del mapa checked -- se usa al migrar entradas
-        legacy (probadas una vez sin backoff) al mapa de reintentos."""
+        """Quita un episodio del mapa checked -- se usa cuando la marca ya no
+        vale (entrada legacy, o descarga lanzada que nunca llegó al servidor)
+        para que el episodio pase al mapa de reintentos con backoff."""
         checked = self._auto_checked_map()
-        entry = checked.get(str(tmdb_id))
-        if entry:
-            eps = entry.get(str(season))
-            if eps and episode in eps:
-                eps.remove(episode)
-                if not eps:
-                    entry.pop(str(season), None)
+        if auto_complete_state.unset_checked(checked, tmdb_id, season, episode):
             self.config_data.set("missing_ep_auto_checked", checked)
 
     def _auto_retry_map(self) -> dict:
@@ -11554,9 +11577,8 @@ class App(_AppBase):
 
     def _auto_retry_wait_for(self, tries: int) -> float:
         """Segundos de espera para un episodio con *tries* intentos fallidos
-        (backoff exponencial, tope _AUTO_RETRY_MAX_S)."""
-        return min(self._AUTO_RETRY_BASE_S * (self._AUTO_RETRY_FACTOR ** (tries - 1)),
-                   self._AUTO_RETRY_MAX_S)
+        (backoff exponencial, tope RETRY_MAX_S)."""
+        return auto_complete_state.retry_wait_for(tries)
 
     def _auto_series_next_retry_at(self, tmdb_id: int) -> tuple | None:
         """Calcula cuándo se podrá volver a intentar el primer capítulo de la
@@ -11831,7 +11853,6 @@ class App(_AppBase):
             series_name = rec.get("title", "")
 
         checked = (self._auto_checked_map().get(str(tmdb_id)) or {})
-        checked_seasons = {int(s): set(eps) for s, eps in checked.items()}
         retries = (self._auto_retry_map().get(str(tmdb_id)) or {})
         now = _time.time()
 
@@ -11839,28 +11860,20 @@ class App(_AppBase):
         pending = []
         for season in sorted(fresh.get("missing", {})):
             for ep in fresh["missing"][season]:
-                # Migración de marcados "checked" legacy: el formato antiguo
-                # anotaba aquí TAMBIÉN los intentos fallidos (no distinguía
-                # éxito de fracaso). Si un episodio sigue faltando, ese
-                # intento fue un fracaso -- se quita de checked y cae como
-                # pendiente ya mismo (los releases que aparecieron mientras
-                # tanto se cogen en esta pasada; los futuros fallos sí llevan
-                # backoff).
-                if ep in checked_seasons.get(season, set()):
+                # El episodio está marcado como resuelto pero SIGUE faltando en
+                # el servidor. Hay que distinguir dos casos, y no hacerlo era
+                # el bucle de relanzamiento (ver _AUTO_LAUNCHED_GRACE_S): antes
+                # se desmarcaba siempre, así que el "checked" que escribe el
+                # éxito de la descarga lo borraba la pasada siguiente -- 30 min
+                # después -- y se volvía a lanzar la misma descarga.
+                # Toda la decisión (¿ya se lanzó y sigue descargándose? ¿falló y
+                # aún no toca reintentarlo?) está en core/auto_complete_state.py.
+                action, drop_checked = auto_complete_state.decide_episode(
+                    checked, retries, season, ep, now)
+                if drop_checked:
                     self._unset_auto_checked_episode(tmdb_id, season, ep)
-                # Reintento retrasado: si el episodio ya se intentó y falló
-                # (sin candidato en aMule), esperar a que toque según el
-                # backoff antes de volver a golpear Kad (los capítulos que aún
-                # no están indexados aparecen con el tiempo; reintentar cada
-                # 30 min en bucle no sirve y castiga la red).
-                rec = retries.get(str(season), {}).get(str(ep))
-                if rec is not None:
-                    tries = int(rec.get("tries", 1))
-                    wait = min(self._AUTO_RETRY_BASE_S * (self._AUTO_RETRY_FACTOR ** (tries - 1)),
-                               self._AUTO_RETRY_MAX_S)
-                    if now - int(rec.get("ts", 0)) < wait:
-                        continue   # aún no toca reintentarlo
-                pending.append((season, ep))
+                if action == auto_complete_state.ATTEMPT:
+                    pending.append((season, ep))
 
         # Guardia rápida local: que no esté ya en upload_history (aunque el
         # reescaneo lo hubiera quitado de missing, por si el servidor de
@@ -18128,10 +18141,29 @@ class App(_AppBase):
 
     def _minimize_to_tray(self):
         if self._tray is None:
-            self.iconify()
-            return
+            # Crear el icono de bandeja de forma diferida (no en __init__)
+            # solo cuando se minimiza por primera vez. Ver el comentario
+            # extenso en __init__ sobre por qué no se crea allí.
+            self._setup_tray()
+            if self._tray is None:
+                self.iconify()
+                return
         self.withdraw()
         if not self._tray_running:
+            # pystray.Icon NO se puede reutilizar tras .stop(): minimizar a la
+            # bandeja una segunda vez (tras restaurar antes con "Abrir
+            # aRenombrar", que llama _tray_show_->_tray.stop()) dejaba
+            # self._tray detenido y un .run() posterior no repone el icono
+            # en la bandeja --> la ventana desaparecía sin bandeja y el
+            # proceso quedaba zombie (bug real: "solo funciona una vez").
+            #
+            # _tray_show() anula self._tray tras stop(), de modo que aquí
+            # self._tray siempre es None cuando hay que (re)arrancar: se
+            # crea de cero un nuevo icono (con un id() diferente garantizado,
+            # pues el hilo del icono anterior aún no ha terminado de limpiar
+            # y mantiene el icono vivo) y se inicia su hilo. La limpieza
+            # del icono anterior (incluido _unregister_class en Win32)
+            # termina en su hilo antes de que el GC libere el objeto.
             self._tray_running = True
             if is_macos():
                 # pystray.Icon.run() "must be called from the main thread"
@@ -18152,6 +18184,18 @@ class App(_AppBase):
         if self._tray and self._tray_running:
             self._tray_running = False
             self._tray.stop()
+            # Anular self._tray: pystray.Icon no se puede reutilizar tras
+            # .stop() — su runloop interno ha terminado y llamar run()
+            # de nuevo no repone el icono en la bandeja. Al anularlo, el
+            # próximo _minimize_to_tray() llama _setup_tray() que crea un
+            # icono nuevo con un id() distinto (el hilo del icono anterior
+            # aún está vivo procesando WM_STOP → PostQuitMessage → finally,
+            # y retiene el icono vivo vía la referencia del método bound en
+            # Thread.target, de modo que no se GC'd hasta que el hilo haya
+            # terminado de limpiar — garantizando que _unregister_class() de
+            # Win32 se ejecute antes de que el nuevo icono registre su clase,
+            # evitando ERROR_CLASS_DUPLICATED por reutilización de id()).
+            self._tray = None
         self.after(0, self.deiconify)
         self.after(50, self.lift)
         self.after(50, self.focus_force)
@@ -18692,17 +18736,24 @@ class App(_AppBase):
             except Exception:
                 pass
             self._history_dirty = True
+        # Siempre notificar la subida al historial de actividad compartido
         self._push_activity_entry_to_ftp(entry, "subida")
         if status == "ok":
             # Ranking de subidas (ver core/upload_stats.py) -- solo
             # subidas que de verdad terminaron bien, nunca errores.
+            # Este hilo es daemon: si la app se cierra, se pierde, pero
+            # mientras tanto se intenta actualizar el ranking global.
             self._push_upload_stat_to_ftp(entry["person"], size, entry["ts"])
             # Recuento/tamaño por categoría (ver core/category_stats.py) --
             # mismo criterio, solo subidas OK.
+            # Si remote no encaja con ninguna categoría configurada, no
+            # hace nada y se deferirá al bootstrap al entrar en Stats.
             self._push_category_stat_addition_to_ftp(remote, size)
             # Ranking de subidores DE ESA CATEGORÍA (ver
             # core/category_upload_stats.py) -- un panel "Top subidores"
             # por categoría en Estadísticas, aparte del ranking global.
+            # Igual que el anterior, usa la ruta remota real para resolver
+            # la categoría y acumula aunque el daemon pueda morir.
             self._push_category_upload_stat_to_ftp(remote, entry["person"], size, entry["ts"])
 
     # ── Historial de borrados ("Liberar espacio") -- mismo patrón que el
@@ -19192,11 +19243,18 @@ class App(_AppBase):
             self._set_status(f"No se pudo guardar el historial: {e}", ERROR_COLOR)
 
     def _export_log(self):
-        """Empaqueta en un .zip todos los archivos de log de la app
-        (app.log, media_refresh.log, auto_watcher.log, ai_fallback.log --
-        los que existan) donde el usuario elija, para compartirlos o
-        revisarlos fuera de la app sin tener que ir a buscarlos a mano en
-        la carpeta de datos."""
+        """Empaqueta en un .zip todos los archivos de log de la app donde el
+        usuario elija, para compartirlos o revisarlos fuera de la app sin
+        tener que ir a buscarlos a mano en la carpeta de datos.
+
+        Se recogen por patrón (*.log*) y no por una lista fija de nombres, por
+        dos motivos vistos en un caso real: la lista fija se dejaba fuera los
+        backups que genera la rotación (app.log.1, app.log.2 -- ver
+        core/applog.py, 2 MB x 2), así que del log enviado faltaba justo el
+        tramo anterior a la última rotación y parecía que la app no había
+        registrado nada; y también se olvidaba de logs añadidos después
+        (update_check.log), que había que acordarse de dar de alta aquí a
+        mano."""
         import zipfile
         dest = filedialog.asksaveasfilename(
             title="Descargar log completo", defaultextension=".zip",
@@ -19204,15 +19262,13 @@ class App(_AppBase):
             filetypes=[("Archivo ZIP", "*.zip"), ("Todos los archivos", "*.*")])
         if not dest:
             return
-        log_names = ("app.log", "media_refresh.log", "auto_watcher.log", "ai_fallback.log")
         data_dir = _appdata_dir()
         found = 0
         try:
             with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
-                for name in log_names:
-                    p = data_dir / name
-                    if p.exists():
-                        zf.write(p, arcname=name)
+                for p in sorted(data_dir.glob("*.log*")):
+                    if p.is_file():
+                        zf.write(p, arcname=p.name)
                         found += 1
             if found:
                 self._set_status(f"{found} archivo(s) de log guardados en {dest}", SUCCESS_COLOR)

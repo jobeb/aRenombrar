@@ -6,6 +6,7 @@ aunque haya llegado con un nombre de archivo distinto (otra fuente, otra
 calidad, otro grupo de subida...).
 """
 
+import re
 from typing import Optional
 
 from core.api_client import detect_episode
@@ -14,6 +15,7 @@ from core.renamer import is_video_file
 from core.series_match import series_similarity
 
 _MOVIE_DUPLICATE_MIN_RATIO = 0.75
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 _log = get_logger("aRenombrar.duplicate_detect", "app.log")
 
 
@@ -48,13 +50,44 @@ def find_duplicate(existing_filenames: list, media_info, current_filename: str) 
     # Ahora se compara el título adivinado del archivo existente contra el
     # de destino, igual que se hace para reutilizar carpetas de serie.
     target_title = media_info.title or ""
+    target_year = str(media_info.year or "")
     for name in others:
         if not is_video_file(name):
             continue
         existing_title = detect_episode(name).get("title", "")
+
+        # Desempate por año ANTES de mirar el título: una película nueva que
+        # comparte el nombre base con otra más antigua NO es el mismo
+        # contenido ("Toy Story 5" (2026) vs "Toy Story" (1995), "Minions
+        # and Monsters" (2026) vs "Los Minions" (2015)). detect_episode le
+        # QUITA el año al título (core/api_client.py::detect_episode), así
+        # que series_similarity jamás lo ve y el impulso de prefijo da por
+        # duplicadas películas distintas con el mismo nombre base -- bug
+        # real visto en el modo automático: "Omitido: Ya existe otro
+        # archivo para este mismo contenido: Toy Story (1995).avi" al subir
+        # Toy Story 5. Aquí se mira el año en el nombre de archivo CRUDO y,
+        # si el archivo existente trae un año y no coincide con el real de
+        # la película (media_info.year, de TMDB), NO es duplicado.
+        existing_year = _year_in_name(name)
+        if existing_year and target_year and existing_year != target_year:
+            _log.info("Duplicado película: '%s' (año %s) descartado vs '%s' (año %s) '%s'",
+                      target_title, target_year, existing_title, existing_year, name)
+            continue
+
         ratio = series_similarity(target_title, existing_title)
         if ratio >= _MOVIE_DUPLICATE_MIN_RATIO:
             _log.info("Duplicado película: '%s' (destino) vs '%s' -> '%s' (existente), ratio=%.2f",
                       target_title, existing_title, name, ratio)
             return name
     return None
+
+
+def _year_in_name(name: str) -> str:
+    """Primer año (19xx/20xx) que aparece en un nombre de archivo crudo --
+    para desempatar por año en la detección de duplicados de películas (ver
+    find_duplicate): detect_episode limpia el año del título y
+    series_similarity no puede usarlo, así que aquí se mira el nombre tal
+    cual viene de la carpeta remota. Devuelve "" si no hay ninguno (un
+    archivo sin año no permite descartar por este criterio)."""
+    m = _YEAR_RE.search(name)
+    return m.group() if m else ""

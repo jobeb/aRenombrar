@@ -37,6 +37,7 @@ def _watcher_sees(p, key):
     w._processed = w._load_db()
     w._in_progress = set()
     w._pending_attempts = {}
+    w._logged_skips = set()
     return w._should_process(key, "loquesea.mkv")
 
 
@@ -108,6 +109,7 @@ def test_sobrevive_a_que_el_watcher_marque_despues_un_fallo(db):
     w._processed = {}
     w._in_progress = {key}
     w._pending_attempts = {}
+    w._logged_skips = set()
     w._mark(key, "sin_resultados")
 
     assert _read(db)[key]["status"] == "descartado"
@@ -124,6 +126,7 @@ def test_una_subida_correcta_si_puede_pisar_el_descarte(db):
     w._processed = {}
     w._in_progress = {key}
     w._pending_attempts = {}
+    w._logged_skips = set()
     w._mark(key, "subido", new_name="Peli (2024).mkv")
 
     assert _read(db)[key]["status"] == "subido"

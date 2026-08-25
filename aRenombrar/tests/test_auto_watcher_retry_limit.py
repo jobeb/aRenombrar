@@ -20,6 +20,7 @@ def watcher(tmp_path, monkeypatch):
     w._processed = {}
     w._in_progress = set()
     w._pending_attempts = {}
+    w._logged_skips = set()
     return w
 
 
@@ -97,6 +98,7 @@ def test_discard_marker_is_written_to_the_db(tmp_path, monkeypatch):
     w._processed = w._load_db()
     w._in_progress = set()
     w._pending_attempts = {}
+    w._logged_skips = set()
     assert w._should_process("/x/descartado.mp4", "descartado.mp4") is False
     # y no debe haber pisado el estado del que ya estaba subido
     assert w._processed["/x/ya subido.mp4"]["status"] == "subido"

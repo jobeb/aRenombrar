@@ -79,3 +79,46 @@ def test_movie_ignores_non_video_files_like_posters():
 
 def test_movie_no_duplicate_when_folder_empty():
     assert find_duplicate([], _movie_info(), current_filename="Pelicula (2024).mkv") is None
+
+
+def test_movie_same_title_different_year_is_not_duplicate():
+    # Bug real (modo automático): "Toy Story 5" (2026) se omitía porque se
+    # encontraba "Toy Story (1995).avi" en la carpeta -- mismo nombre base,
+    # distinta película. detect_episode le quita el año al título, así que
+    # el desempate por año tiene que mirar el nombre de archivo crudo.
+    info = MediaInfo(tmdb_id=1, media_type="movie", title="Toy Story 5",
+                      original_title="Toy Story 5", year="2026", genre_ids=[])
+    existing = ["Toy Story (1995).avi", "Toy Story 2 (1999).mkv"]
+    dup = find_duplicate(existing, info, current_filename="Toy Story 5 (2026).mkv")
+    assert dup is None
+
+
+def test_movie_same_base_title_other_franchise_is_not_duplicate():
+    # Bug real: "Minions and Monsters" (2026) se omitía por "Los Minions
+    # (2015).mkv" -- título base parecido, película distinta.
+    info = MediaInfo(tmdb_id=1, media_type="movie", title="Minions and Monsters",
+                      original_title="Minions and Monsters", year="2026", genre_ids=[])
+    existing = ["Los Minions (2015).mkv"]
+    dup = find_duplicate(existing, info, current_filename="Minions and Monsters (2026).mkv")
+    assert dup is None
+
+
+def test_movie_same_title_and_year_is_duplicate():
+    # El desempate por año no debe romper la detección legítima: mismo
+    # título base y mismo año = mismo contenido, aunque el nombre de
+    # archivo sea de otro release.
+    info = MediaInfo(tmdb_id=1, media_type="movie", title="Toy Story 5",
+                      original_title="Toy Story 5", year="2026", genre_ids=[])
+    existing = ["Toy Story.5.2026.2160p.WEB-DL.mkv"]
+    dup = find_duplicate(existing, info, current_filename="Toy Story 5 (2026).mkv")
+    assert dup == "Toy Story.5.2026.2160p.WEB-DL.mkv"
+
+
+def test_movie_without_year_in_existing_name_still_detected():
+    # Si el archivo existente no trae año, no se puede descartar por ese
+    # criterio y se mantiene la comparación por título.
+    info = MediaInfo(tmdb_id=1, media_type="movie", title="Pelicula",
+                      original_title="Pelicula", year="2024", genre_ids=[])
+    existing = ["Pelicula.OtraVersion.WEB-DL.mkv"]
+    dup = find_duplicate(existing, info, current_filename="Pelicula (2024).mkv")
+    assert dup == "Pelicula.OtraVersion.WEB-DL.mkv"

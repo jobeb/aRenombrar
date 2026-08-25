@@ -9,13 +9,11 @@ quede constancia de cuándo y cuántas veces se usa la IA.
 """
 
 import json
-import logging
-from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 import requests
 
-from core.appdirs import app_data_dir
+from core.applog import get_logger
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
@@ -34,25 +32,13 @@ SYSTEM_PROMPT = (
 )
 
 
-def _setup_logger() -> logging.Logger:
-    """Log rotativo dedicado (max 2 MB × 2 archivos), igual patrón que
-    auto_watcher.log — registra TODAS las consultas a Groq, con éxito o sin
-    él, para poder auditar cuándo y cuánto se usa la IA."""
-    log_path = app_data_dir() / "ai_fallback.log"
-    logger = logging.getLogger("aRenombrar.ai_fallback")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
-                             datefmt="%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024,
-                              backupCount=2, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
-
-
-_log = _setup_logger()
+# Log rotativo (2 MB × 2 archivos) — registra TODAS las consultas a Groq, con
+# éxito o sin él, para poder auditar cuándo y cuánto se usa la IA. Vía
+# core/applog.py y no con un RotatingFileHandler propio como antes: este mismo
+# fichero lo usan también eldoblaje.py y missing_episodes_ai.py, y un handler
+# por módulo impide que el fichero rote en Windows (os.rename sobre un fichero
+# que otro handler tiene abierto = WinError 32, ver core/applog.py).
+_log = get_logger("aRenombrar.ai_fallback", "ai_fallback.log")
 
 
 def guess_title_via_ai(stem: str, api_key: str, model: str = DEFAULT_MODEL,
