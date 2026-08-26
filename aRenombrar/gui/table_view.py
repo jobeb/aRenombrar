@@ -217,6 +217,90 @@ class TableView(ctk.CTkFrame):
 
         self._init_widths()
         self._build_header()
+        self._enable_keyboard_scroll()
+
+    # -------------------------------------------------- scroll por teclado --
+
+    # Tecla -> (cuánto, unidad) para canvas.yview_scroll. "units" son líneas
+    # sueltas (flechas) y "pages" pantallas enteras (AvPág/RePág); Inicio/Fin
+    # se tratan aparte porque son yview_moveto, no un desplazamiento relativo.
+    _SCROLL_KEYS = {
+        "Up":    (-3, "units"),
+        "Down":  (3, "units"),
+        "Prior": (-1, "pages"),
+        "Next":  (1, "pages"),
+    }
+
+    def _enable_keyboard_scroll(self):
+        """Flechas / AvPág / RePág / Inicio / Fin desplazan la tabla que
+        tenga el ratón encima, igual que ya hace la rueda.
+
+        Se decide por POSICIÓN DEL RATÓN y no por foco a propósito: las filas
+        son frames y etiquetas, que en Tk no reciben foco de teclado, así que
+        atarlo al foco significaría no funcionar nunca sin pedirle antes al
+        usuario que haga clic en un sitio concreto. customtkinter resuelve la
+        rueda del ratón exactamente igual (bind_all + comprobar qué widget hay
+        debajo, ver CTkScrollableFrame._mouse_wheel_all), así que esto no
+        introduce un patrón nuevo en el proyecto."""
+        if not self.scrollable:
+            return
+        # OJO: bind_all va sobre self.body, NO sobre self. CTkBaseClass lo
+        # prohíbe a propósito (lanza AttributeError), y TableView hereda de
+        # CTkFrame; self.body es un CTkScrollableFrame, que hereda de
+        # tkinter.Frame y por tanto conserva el bind_all normal -- es
+        # exactamente el objeto sobre el que el propio customtkinter engancha
+        # la rueda del ratón.
+        for seq in list(self._SCROLL_KEYS) + ["Home", "End"]:
+            self.body.bind_all(f"<{seq}>", self._on_scroll_key, add="+")
+
+    def _scroll_canvas(self):
+        """El canvas que de verdad hace scroll (el de self.body).
+
+        OJO con el nombre: NO puede llamarse _canvas. CTkFrame ya define un
+        atributo de instancia `_canvas` (el CTkCanvas con el que se dibuja su
+        propio fondo y borde), y como TableView hereda de CTkFrame, un método
+        con ese nombre queda tapado por él: `self._canvas()` reventaba con
+        "TypeError: 'CTkCanvas' object is not callable" en cada pulsación."""
+        return getattr(self.body, "_parent_canvas", None)
+
+    @staticmethod
+    def _is_inside(widget, container) -> bool:
+        """¿*widget* cuelga de *container*? (sube por la cadena de masters)"""
+        while widget is not None:
+            if widget == container:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_scroll_key(self, event):
+        canvas = self._scroll_canvas()
+        if canvas is None:
+            return
+        # Si se está escribiendo, las flechas mueven el cursor de texto: no
+        # se tocan aunque el ratón esté encima de la tabla (real: el buscador
+        # de Historial está justo sobre su propia lista).
+        try:
+            focused = self.focus_get()
+        except Exception:
+            focused = None
+        if isinstance(focused, (tk.Entry, tk.Text, ctk.CTkEntry, ctk.CTkTextbox)):
+            return
+        try:
+            under_mouse = self.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return
+        if under_mouse is None or not self._is_inside(under_mouse, canvas):
+            return
+        if canvas.yview() == (0.0, 1.0):
+            return   # todo cabe: no hay nada que desplazar
+        if event.keysym == "Home":
+            canvas.yview_moveto(0.0)
+        elif event.keysym == "End":
+            canvas.yview_moveto(1.0)
+        else:
+            amount, what = self._SCROLL_KEYS[event.keysym]
+            canvas.yview_scroll(amount, what)
+        return "break"
 
     # ------------------------------------------------------------ anchos --
 

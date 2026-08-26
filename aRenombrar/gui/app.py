@@ -47,7 +47,7 @@ from core.renamer import (build_new_name, rename_file, is_video_file, is_book_fi
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
 from core.amule_client import AmuleSearchResult
-from core.ec_client import EcClient, EcConnectionError, EcAuthError
+from core.ec_client import EcClient, EcConnectionError, EcAuthError, EcProtocolError
 from core.auto_watcher import AutoWatcher
 from core.series_match import best_match, match_names_exclusively, normalize_series_name, series_similarity
 from core import remote_presence as rp
@@ -1421,6 +1421,16 @@ class App(_AppBase):
         self._config_panel_frame.grid_rowconfigure(0, weight=1)
         self._config_visible = False
         self._config_panel_built = False
+        # La caché de géneros de TMDB la rellena _build_ftp_categories_section,
+        # que vive DENTRO del panel de Ajustes -- y ese panel se construye
+        # diferido (justo aquí arriba). Hasta que el usuario abriera Ajustes
+        # una vez, el atributo no existía siquiera, y _genre_names_for (que
+        # usa el panel de detalle de Archivos en CADA clic de fila) petaba con
+        # "'_tkinter.tkapp' object has no attribute '_genres_cache'": el
+        # detalle no se pintaba y el log se llenaba de trazas. Inicializarla
+        # aquí cumple lo que su docstring ya prometía -- "lista vacía si la
+        # caché no está cargada todavía".
+        self._genres_cache = {"tv": [], "movie": []}
         self._startup_mark("  _build_config_panel() [diferida]")
 
         # Diálogos reabribles que se construyen una sola vez y se reutilizan
@@ -1574,8 +1584,29 @@ class App(_AppBase):
         self._build_status_bar()
         self._startup_mark("  _build_status_bar()")
 
+        self._attach_pagination_tooltips()
+
         # Barra de aviso de cierre (oculta normalmente)
 
+
+    def _attach_pagination_tooltips(self):
+        """Tooltip a los "< Anterior"/"Siguiente >" de todas las tablas de una
+        pasada.
+
+        Son nueve pares idénticos repartidos por seis pestañas; ponerlos a mano
+        uno a uno era garantizar que al añadir la décima tabla se olvidara. Se
+        recorren por convención de nombre (_*_prev_btn / _*_next_btn), así que
+        una tabla nueva lo hereda sin tocar nada aquí."""
+        for nombre in dir(self):
+            if not (nombre.endswith("_prev_btn") or nombre.endswith("_next_btn")):
+                continue
+            widget = getattr(self, nombre, None)
+            if not isinstance(widget, ctk.CTkButton):
+                continue
+            anterior = nombre.endswith("_prev_btn")
+            attach_tooltip(widget, lambda ant=anterior: (
+                "Página anterior de la lista." if ant else "Página siguiente de la lista.") +
+                " La selección NO se pierde al cambiar de página: sigue afectando a todas.")
 
     def _build_header(self):
         header = ctk.CTkFrame(self, height=56, corner_radius=0)
@@ -1605,6 +1636,9 @@ class App(_AppBase):
             header, text="☰", height=30, width=40, font=ctk.CTkFont(size=15),
             fg_color="transparent", border_width=1,
             command=self._show_nav_overflow_menu)
+        attach_tooltip(self._nav_menu_btn, lambda: "Menú de navegación: las mismas pestañas de "
+                       "siempre, agrupadas aquí porque la ventana no da de ancho. Ensánchala y "
+                       "vuelven a salir arriba.")
         self._nav_menu_btn.grid(row=0, column=1, padx=(20, 16))
         self._nav_menu_btn.grid_remove()   # oculto salvo en modo compacto
 
@@ -1622,17 +1656,28 @@ class App(_AppBase):
             header, text="💾 Guardar configuración", width=170, height=30,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self._save_all_settings)
+        attach_tooltip(self._save_settings_btn, lambda: "Guardar los cambios de Ajustes. Hasta "
+                       "que pulses aquí no se aplica nada de lo que hayas tocado.")
         self._save_settings_btn.grid(row=0, column=5, padx=(0, 8))
         self._save_settings_btn.grid_remove()   # solo visible dentro de Ajustes
         self._auto_btn = ctk.CTkButton(
             header, text="⚡ Auto", width=90, height=30,
             fg_color="transparent", border_width=1,
             command=self._toggle_auto)
+        attach_tooltip(self._auto_btn, lambda: (
+            "Modo automático ACTIVO: vigila la carpeta configurada y, según los Ajustes, "
+            "identifica, renombra y sube lo que aparezca sin que tengas que hacer nada. "
+            "Pulsa para pararlo." if (self._watcher and self._watcher.running) else
+            "Modo automático parado. Al activarlo vigila la carpeta configurada en Ajustes e "
+            "identifica, renombra y sube solo lo que vaya apareciendo."))
         self._auto_btn.grid(row=0, column=6, padx=(0, 8))
         self._tray_btn = ctk.CTkButton(
             header, text="⊟", width=36, height=30,
             fg_color="transparent", border_width=1,
             command=self._minimize_to_tray)
+        attach_tooltip(self._tray_btn, lambda: "Minimizar al área de notificación. La app sigue "
+                       "funcionando (el modo automático incluido); se recupera con doble clic "
+                       "en su icono.")
         self._tray_btn.grid(row=0, column=7, padx=(0, 16))
 
         self.bind("<Configure>", self._on_root_resize, add="+")
@@ -2369,10 +2414,22 @@ class App(_AppBase):
 
         left_fr = ctk.CTkFrame(table_header, fg_color="transparent")
         left_fr.grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(left_fr, text="+ Archivos", command=self._add_files,
-                      fg_color=ACCENT, hover_color=ACCENT_HOVER, width=110).pack(side="left", padx=(12, 4), pady=8)
-        ctk.CTkButton(left_fr, text="+ Carpeta", command=self._add_folder,
-                      width=100).pack(side="left", padx=(0, 4), pady=8)
+        # Un tooltip POR BOTÓN, no sobre left_fr/right_fr: puesto en el frame
+        # se dispara igual estés sobre el botón que sea, así que "+ Archivos"
+        # y "+ Carpeta" enseñaban los dos el texto de la carpeta (y los tres
+        # de la derecha, el mismo de los tres, el primero que se registrara).
+        add_files_btn = ctk.CTkButton(left_fr, text="+ Archivos", command=self._add_files,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, width=110)
+        attach_tooltip(add_files_btn, lambda: "Añadir archivos sueltos a la lista. Los .zip, .7z, "
+                       ".rar y .tar se descomprimen solos, incluidos los anidados.")
+        add_files_btn.pack(side="left", padx=(12, 4), pady=8)
+        add_folder_btn = ctk.CTkButton(left_fr, text="+ Carpeta", command=self._add_folder,
+                      width=100)
+        attach_tooltip(add_folder_btn, lambda: "Añadir una carpeta entera, con sus subcarpetas. "
+                       "Los comprimidos que encuentre se descomprimen solos. Si detecta 2 o más "
+                       "libros/cómics pregunta si son de la misma colección, para identificarlos "
+                       "de una sola búsqueda en vez de uno a uno.")
+        add_folder_btn.pack(side="left", padx=(0, 4), pady=8)
         # Selecciona/deselecciona TODOS los archivos de la lista (todas las
         # páginas, no solo la visible -- self._multi_selected no depende de
         # qué página esté a la vista, ver _select_range/_current_selection)
@@ -2382,6 +2439,9 @@ class App(_AppBase):
             left_fr, text="Seleccionar todos", command=self._toggle_select_all,
             fg_color="transparent", border_width=1, width=140)
         self._select_all_btn.pack(side="left", padx=(0, 4), pady=8)
+        attach_tooltip(self._select_all_btn, lambda: "Selecciona todos los archivos de todas las páginas de la tabla, "
+                      "no solo las visibles. Permite aplicar el mismo resultado de búsqueda/o identificación a cientos de archivos de golpe "
+                      "para luego asignarlos todos de una vez con el botón 'Asignar a la selección'.")
 
         ctk.CTkLabel(table_header, text="Archivos", font=ctk.CTkFont(size=14, weight="bold")).grid(
             row=0, column=1, padx=16, pady=8)
@@ -2389,12 +2449,22 @@ class App(_AppBase):
         right_fr = ctk.CTkFrame(table_header, fg_color="transparent")
         right_fr.grid(row=0, column=2, sticky="e")
         # Derecha: Subir todo, Renombrar, Limpiar (pack right en orden inverso al visual)
-        ctk.CTkButton(right_fr, text="Subir todo", command=self._upload_all_ftp,
-                      width=100).pack(side="right", padx=(4, 12), pady=8)
-        ctk.CTkButton(right_fr, text="Renombrar", command=self._rename_all,
-                      width=100).pack(side="right", padx=4, pady=8)
-        ctk.CTkButton(right_fr, text="Limpiar", command=self._clear_files,
-                      fg_color="transparent", border_width=1, width=80).pack(side="right", padx=4, pady=8)
+        upload_all_btn = ctk.CTkButton(right_fr, text="Subir todo", command=self._upload_all_ftp,
+                      width=100)
+        attach_tooltip(upload_all_btn, lambda: "Subir al servidor todos los archivos de la lista, "
+                       "cada uno a la carpeta de su columna \"Destino\". Respeta el límite de "
+                       "subidas simultáneas y el renombrado configurados en Ajustes.")
+        upload_all_btn.pack(side="right", padx=(4, 12), pady=8)
+        rename_all_btn = ctk.CTkButton(right_fr, text="Renombrar", command=self._rename_all,
+                      width=100)
+        attach_tooltip(rename_all_btn, lambda: "Renombrar los archivos EN LOCAL con el nombre de "
+                       "la columna \"Nombre nuevo\". No sube nada.")
+        rename_all_btn.pack(side="right", padx=4, pady=8)
+        clear_files_btn = ctk.CTkButton(right_fr, text="Limpiar", command=self._clear_files,
+                      fg_color="transparent", border_width=1, width=80)
+        attach_tooltip(clear_files_btn, lambda: "Vaciar la lista. Los archivos siguen en tu disco "
+                       "y en el historial: solo desaparecen de esta tabla.")
+        clear_files_btn.pack(side="right", padx=4, pady=8)
 
         # Fuentes compartidas por las columnas truncadas — se reutilizan tanto para
         # dibujar el texto como para medirlo en _fit_text, así ambos ancho coinciden.
@@ -2773,6 +2843,7 @@ class App(_AppBase):
         self._detail_episode.configure(wraplength=content_w)
         self._detail_meta.configure(width=content_w)
         self._detail_cert.configure(width=content_w)
+        self._detail_cast.configure(width=content_w)
         self._detail_overview.configure(width=content_w)
         self._detail_error.configure(width=content_w)
         self._detail_ftp_path_lbl.configure(wraplength=content_w)
@@ -2782,6 +2853,7 @@ class App(_AppBase):
         self._autosize_textbox(self._detail_title)
         self._autosize_textbox(self._detail_meta)
         self._autosize_textbox(self._detail_cert)
+        self._autosize_textbox(self._detail_cast)
         self._autosize_textbox(self._detail_overview)
         self._autosize_textbox(self._detail_error)
 
@@ -2875,8 +2947,11 @@ class App(_AppBase):
         self._result_combo.bind("<Down>", lambda e: self._cycle_search_result(1))
         self._result_combo.bind("<Up>", lambda e: self._cycle_search_result(-1))
         self._search_debounce_id = None
-        ctk.CTkButton(search_top, text="Buscar", width=60,
-                      command=lambda: self._manual_search(use_ai_fallback=True)).grid(row=2, column=1, padx=(4, 0))
+        search_btn = ctk.CTkButton(search_top, text="Buscar", width=60,
+                      command=lambda: self._manual_search(use_ai_fallback=True))
+        attach_tooltip(search_btn, lambda: "Buscar el título escrito arriba en el proveedor "
+                       "elegido. Si no encuentra nada, prueba con la IA para limpiar el nombre.")
+        search_btn.grid(row=2, column=1, padx=(4, 0))
         # Texto dinámico: "Asignar" con un solo archivo (ancla), "Asignar a
         # la selección (N)" con varios marcados vía Ctrl/Shift+clic -- ver
         # _update_assign_button_label/_current_selection. "Asignar y
@@ -2886,10 +2961,15 @@ class App(_AppBase):
         # luego ir a subir el archivo aparte.
         self._assign_btn = ctk.CTkButton(search_top, text="Asignar", width=95,
                       command=self._assign_selected_result)
+        attach_tooltip(self._assign_btn, lambda: "Aplicar el resultado que se ve arriba al "
+                       "archivo (o a todos los marcados con Ctrl/Mayús+clic). Cada uno conserva "
+                       "su propio número de episodio.")
         self._assign_btn.grid(row=3, column=0, sticky="ew", pady=(4, 0), padx=(0, 4))
         self._assign_and_upload_btn = ctk.CTkButton(
             search_top, text="Asignar y subir", width=95,
             command=lambda: self._assign_selected_result(also_upload=True))
+        attach_tooltip(self._assign_and_upload_btn, lambda: "Lo mismo que \"Asignar\" y además "
+                       "manda el archivo a la cola de subida, sin tener que ir a subirlo aparte.")
         self._assign_and_upload_btn.grid(row=3, column=1, sticky="ew", pady=(4, 0))
         # Solo para cómics (ver _reset_search_panel, que la muestra/oculta
         # al cambiar de selección) -- ComicVine falla casi siempre con el
@@ -2899,6 +2979,9 @@ class App(_AppBase):
             search_top, text="🪄 IA: título original", width=200,
             fg_color="transparent", border_width=1,
             command=self._manual_ai_translate_comic)
+        attach_tooltip(self._ai_translate_comic_btn, lambda: "Pedir a la IA el título ORIGINAL "
+                       "(normalmente en inglés) y repetir la búsqueda con él: el catálogo de "
+                       "ComicVine casi no tiene títulos en castellano.")
         self._ai_translate_comic_btn.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self._ai_translate_comic_btn.grid_remove()
         self._tmdb_results = []
@@ -2980,6 +3063,15 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._detail_cert.configure(state="disabled")
         self._detail_cert.pack(pady=(0, 0), fill="x")
+        # Reparto -- se pide a TMDB on-demand al seleccionar (ver
+        # _load_detail_cast), como la clasificación por edad: no viene en el
+        # resultado de búsqueda, hace falta una llamada a /credits.
+        self._detail_cast = ctk.CTkTextbox(
+            scroll, width=215, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            text_color=PENDING_COLOR, activate_scrollbars=False)
+        self._detail_cast.configure(state="disabled")
+        self._detail_cast.pack(pady=(0, 0), fill="x")
         self._detail_overview = ctk.CTkTextbox(
             scroll, width=215, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -5500,6 +5592,13 @@ class App(_AppBase):
             # "Destino" de la tabla) -- prevalece sobre todo lo demás, ni
             # siquiera se consulta la categoría por género.
             remote_dir = entry.remote_dir_override
+            # Sin categoría no hay raíz de la que sacar el espacio libre: se
+            # usa la propia carpeta fijada. Sin esto, la comprobación de
+            # espacio de más abajo reventaba con UnboundLocalError ('root' se
+            # asignaba SOLO en la rama del else), así que TODA subida con
+            # destino puesto a mano fallaba con un error sin explicación --
+            # visto en el log de un usuario al que no le subía nada.
+            root = remote_dir
         else:
             category = self._category_for(info)
             if info.media_type == "tv":
@@ -5857,7 +5956,12 @@ class App(_AppBase):
                 return dest_path
             except Exception as e:
                 _log.error("No se pudo mover: %s", e)
-                self.after(0, lambda: self._set_status(f"No se pudo mover archivo: {e}", WARNING_COLOR))
+                # El mensaje se congela AHORA (msg=...): Python borra el nombre
+                # 'e' al salir del except, y este lambda lo lee más tarde desde
+                # el hilo de Tk -- tal cual estaba, avisar del fallo fallaba a
+                # su vez con NameError y el usuario no veía nada.
+                self.after(0, lambda msg=str(e): self._set_status(
+                    f"No se pudo mover archivo: {msg}", WARNING_COLOR))
                 return path
         elif action == "Eliminar original":
             try:
@@ -5867,7 +5971,9 @@ class App(_AppBase):
                 return None
             except Exception as e:
                 _log.error("No se pudo eliminar: %s", e)
-                self.after(0, lambda: self._set_status(f"No se pudo eliminar archivo: {e}", WARNING_COLOR))
+                # Mismo motivo que en "Mover a procesados" de aquí arriba.
+                self.after(0, lambda msg=str(e): self._set_status(
+                    f"No se pudo eliminar archivo: {msg}", WARNING_COLOR))
                 return path
         return path
 
@@ -6289,8 +6395,10 @@ class App(_AppBase):
                                                  placeholder_text="Selecciona la carpeta que quieres vigilar...")
         self._watch_folder_entry.insert(0, self.config_data.get("watch_folder", ""))
         self._watch_folder_entry.grid(row=2, column=1, padx=(0, 4), pady=8, sticky="ew")
-        ctk.CTkButton(auto_fr, text="📂 Examinar", width=100,
-                      command=self._browse_watch_folder).grid(row=2, column=2, padx=(0, 16), pady=8)
+        browse_btn = ctk.CTkButton(auto_fr, text="📂 Examinar", width=100,
+                      command=self._browse_watch_folder)
+        attach_tooltip(browse_btn, lambda: "Elegir la carpeta que vigilará el modo automático.")
+        browse_btn.grid(row=2, column=2, padx=(0, 16), pady=8)
 
         # Intervalo + acción
         ctk.CTkLabel(auto_fr, text="Intervalo de escaneo (seg):").grid(
@@ -6513,7 +6621,10 @@ class App(_AppBase):
 
         bf = ctk.CTkFrame(conn, fg_color="transparent")
         bf.grid(row=11, column=0, columnspan=2, pady=10)
-        ctk.CTkButton(bf, text="Probar conexión", command=self._test_ftp).pack(side="left", padx=4)
+        test_ftp_btn = ctk.CTkButton(bf, text="Probar conexión", command=self._test_ftp)
+        attach_tooltip(test_ftp_btn, lambda: "Conectar al FTP con los datos de arriba para "
+                       "comprobar que funcionan. No guarda nada ni sube nada.")
+        test_ftp_btn.pack(side="left", padx=4)
         self._ftp_status = ctk.CTkLabel(conn, text="", text_color=PENDING_COLOR)
         self._ftp_status.grid(row=12, column=0, columnspan=2, pady=4)
 
@@ -6530,12 +6641,20 @@ class App(_AppBase):
         al guardar Ajustes normales."""
         btns = ctk.CTkFrame(parent, fg_color="transparent")
         btns.pack(pady=(8, 0))
-        ctk.CTkButton(btns, text="📤 Publicar como configuración del servidor", width=280,
+        publish_btn = ctk.CTkButton(btns, text="📤 Publicar como configuración del servidor", width=280,
                       fg_color="transparent", border_width=1,
-                      command=self._publish_server_config).pack(side="left", padx=4)
-        ctk.CTkButton(btns, text="📥 Descartar cambios y recuperar del servidor", width=280,
+                      command=self._publish_server_config)
+        attach_tooltip(publish_btn, lambda: "OJO: sobrescribe la configuración compartida PARA "
+                       "TODOS los usuarios con la de este equipo. Es manual a propósito, para que "
+                       "no ocurra sin querer al guardar Ajustes.")
+        publish_btn.pack(side="left", padx=4)
+        discard_btn = ctk.CTkButton(btns, text="📥 Descartar cambios y recuperar del servidor", width=280,
                       fg_color="transparent", border_width=1,
-                      command=self._discard_local_server_config).pack(side="left", padx=4)
+                      command=self._discard_local_server_config)
+        attach_tooltip(discard_btn, lambda: "Tirar los cambios locales de configuración de "
+                       "servidor y volver a la que hay publicada. No afecta a tus ajustes de "
+                       "cliente (FTP, carpeta vigilada, tu nombre).")
+        discard_btn.pack(side="left", padx=4)
         ctk.CTkLabel(parent, text="Sube TMDB/IA, plantillas, categorías FTP, Plex/Jellyfin, enlaces "
                                   "y la cuota de reservas de este equipo (con sus claves y tokens) "
                                   "para que los adopten los otros clientes de este mismo servidor, o "
@@ -6798,6 +6917,9 @@ class App(_AppBase):
             run_fr, text="🔄 Sincronizar visionado ahora", width=240,
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self._run_watch_sync)
+        attach_tooltip(self._watch_sync_run_button, lambda: "Pasar ahora el estado de \"visto\" "
+                       "entre Plex y Jellyfin para los usuarios emparejados. Antes de aplicar "
+                       "nada enseña una vista previa para confirmar.")
         self._watch_sync_run_button.pack(pady=(0, 6))
         self._watch_sync_status_label = ctk.CTkLabel(run_fr, text="", text_color=PENDING_COLOR)
         self._watch_sync_status_label.pack()
@@ -7159,9 +7281,13 @@ class App(_AppBase):
                         anchor="w").pack(side="left")
             ctk.CTkLabel(row, text=m["jellyfin_user_name"], width=table.col_width("jellyfin"),
                         anchor="w").pack(side="left")
-            ctk.CTkButton(row, text="✕", width=table.col_width("del"), height=22,
+            del_map_btn = ctk.CTkButton(row, text="✕", width=table.col_width("del"), height=22,
                          fg_color="transparent", border_width=1, text_color=ERROR_COLOR,
-                         command=lambda idx=i: self._remove_watch_sync_mapping(idx)).pack(side="left")
+                         command=lambda idx=i: self._remove_watch_sync_mapping(idx))
+            attach_tooltip(del_map_btn, lambda: "Quitar este emparejamiento de usuarios. "
+                           "No borra nada en Plex ni en Jellyfin: solo deja de sincronizar "
+                           "el visionado entre esas dos cuentas.")
+            del_map_btn.pack(side="left")
 
     def _watch_sync_collect_actions(self, mappings, status_cb=None):
         """Lee el estado de visionado de ambas plataformas para
@@ -7588,7 +7714,10 @@ class App(_AppBase):
         self._api_status.grid(row=3, column=0, columnspan=2, pady=4)
         bf2 = ctk.CTkFrame(tmdb, fg_color="transparent")
         bf2.grid(row=4, column=0, columnspan=2, pady=8)
-        ctk.CTkButton(bf2, text="Validar API Key", command=self._validate_api_key).pack(side="left", padx=4)
+        val_tmdb_btn = ctk.CTkButton(bf2, text="Validar API Key", command=self._validate_api_key)
+        attach_tooltip(val_tmdb_btn, lambda: "Comprobar contra TMDB que la clave es válida, "
+                       "sin gastar una búsqueda de verdad.")
+        val_tmdb_btn.pack(side="left", padx=4)
         ctk.CTkLabel(tmdb, text="themoviedb.org → Configuración → API",
                      text_color=PENDING_COLOR, font=self._cfg_font_desc).grid(
             row=5, column=0, columnspan=2, pady=8)
@@ -7617,9 +7746,15 @@ class App(_AppBase):
         self._ai_key_entry.grid(row=8, column=1, padx=10, pady=6, sticky="ew")
         bf3 = ctk.CTkFrame(tmdb, fg_color="transparent")
         bf3.grid(row=9, column=0, columnspan=2, pady=8)
-        ctk.CTkButton(bf3, text="Validar API Key (Groq)", command=self._validate_ai_key).pack(side="left", padx=4)
-        ctk.CTkButton(bf3, text="Términos aprendidos", fg_color="transparent", border_width=1,
-                      command=self._open_learned_terms_dialog).pack(side="left", padx=4)
+        val_groq_btn = ctk.CTkButton(bf3, text="Validar API Key (Groq)", command=self._validate_ai_key)
+        attach_tooltip(val_groq_btn, lambda: "Comprobar que la clave de Groq es válida. Solo "
+                       "pide el listado de modelos: no consume cuota de consultas.")
+        val_groq_btn.pack(side="left", padx=4)
+        learned_btn = ctk.CTkButton(bf3, text="Términos aprendidos", fg_color="transparent",
+                      border_width=1, command=self._open_learned_terms_dialog)
+        attach_tooltip(learned_btn, lambda: "Ver y borrar la basura que la IA ha aprendido a "
+                       "quitar de los nombres de archivo (grupos de subida, etiquetas de calidad...).")
+        learned_btn.pack(side="left", padx=4)
         self._ai_key_status = ctk.CTkLabel(tmdb, text="", text_color=PENDING_COLOR)
         self._ai_key_status.grid(row=10, column=0, columnspan=2, pady=4)
         ctk.CTkLabel(tmdb, text="Solo se consulta cuando TMDB/ComicVine falla — cada consulta\nqueda registrada en ai_fallback.log",
@@ -7640,7 +7775,9 @@ class App(_AppBase):
         self._comicvine_key_status.grid(row=14, column=0, columnspan=2, pady=4)
         bf4 = ctk.CTkFrame(tmdb, fg_color="transparent")
         bf4.grid(row=15, column=0, columnspan=2, pady=8)
-        ctk.CTkButton(bf4, text="Validar API Key", command=self._validate_comicvine_key).pack(side="left", padx=4)
+        val_cv_btn = ctk.CTkButton(bf4, text="Validar API Key", command=self._validate_comicvine_key)
+        attach_tooltip(val_cv_btn, lambda: "Comprobar contra ComicVine que la clave es válida.")
+        val_cv_btn.pack(side="left", padx=4)
         ctk.CTkLabel(tmdb, text="comicvine.gamespot.com/api → solicitar key",
                      text_color=PENDING_COLOR, font=self._cfg_font_desc).grid(
             row=16, column=0, columnspan=2, pady=(0, 8))
@@ -7669,7 +7806,10 @@ class App(_AppBase):
         self._google_books_key_status.grid(row=19, column=0, columnspan=2, pady=4)
         bf5 = ctk.CTkFrame(tmdb, fg_color="transparent")
         bf5.grid(row=20, column=0, columnspan=2, pady=8)
-        ctk.CTkButton(bf5, text="Validar API Key", command=self._validate_google_books_key).pack(side="left", padx=4)
+        val_gb_btn = ctk.CTkButton(bf5, text="Validar API Key", command=self._validate_google_books_key)
+        attach_tooltip(val_gb_btn, lambda: "Comprobar que la clave de Google Books es válida. "
+                       "Solo se usa cuando OpenLibrary falla o no encuentra el libro.")
+        val_gb_btn.pack(side="left", padx=4)
         ctk.CTkLabel(tmdb,
                      text="console.cloud.google.com → crear proyecto → activar \"Books API\" → credenciales\n"
                           "OpenLibrary (sin key, sin ajustes) se prueba primero -- esta key solo se usa\n"
@@ -7689,9 +7829,12 @@ class App(_AppBase):
         hdr_tpl.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(12, 4))
         ctk.CTkLabel(hdr_tpl, text="Plantillas de nombre",
                      font=self._cfg_font_title).pack(side="left", padx=12)
-        ctk.CTkButton(hdr_tpl, text="? Guía", width=70, height=26,
+        guide_btn = ctk.CTkButton(hdr_tpl, text="? Guía", width=70, height=26,
                       fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                      command=self._show_template_guide).pack(side="right", padx=12)
+                      command=self._show_template_guide)
+        attach_tooltip(guide_btn, lambda: "Ver qué variables admiten las plantillas de nombre "
+                       "({serie}, {temporada}, {episodio}, {año}, {ext}...) y ejemplos de cada una.")
+        guide_btn.pack(side="right", padx=12)
         PRESETS = {
             "tv_template": [
                 "{serie} {temporada}x{episodio:02d} {titulo}{ext}",
@@ -7815,9 +7958,11 @@ class App(_AppBase):
             for link in self.config_data.get(config_key, []):
                 self._add_custom_link_row(level, link.get("name", ""), link.get("url_template", ""),
                                           link.get("background", False))
-            ctk.CTkButton(links_sec, text="+ Añadir enlace", width=140,
-                          command=lambda lvl=level: self._add_custom_link_row(lvl, "", "")).pack(
-                pady=(4, 12), padx=12, anchor="w")
+            add_link_btn = ctk.CTkButton(links_sec, text="+ Añadir enlace", width=140,
+                          command=lambda lvl=level: self._add_custom_link_row(lvl, "", ""))
+            attach_tooltip(add_link_btn, lambda: "Añadir un enlace propio que aparecerá en la "
+                           "ficha de cada título, para abrirlo donde tú quieras.")
+            add_link_btn.pack(pady=(4, 12), padx=12, anchor="w")
 
     _CUSTOM_LINKS_DESC_RESIZE_DEBOUNCE_MS = 150
 
@@ -7852,10 +7997,12 @@ class App(_AppBase):
         bg_var = ctk.BooleanVar(value=background)
         ctk.CTkCheckBox(row, text="Segundo plano", variable=bg_var, width=20).pack(
             side="left", padx=(4, 4))
-        ctk.CTkButton(row, text="✕", width=28, fg_color="transparent", border_width=1,
+        del_link_btn = ctk.CTkButton(row, text="✕", width=28, fg_color="transparent", border_width=1,
                       border_color=ERROR_COLOR, text_color=ERROR_COLOR,
                       hover_color=("gray85", "#3d1010"),
-                      command=lambda: self._remove_custom_link_row(level, row)).pack(side="left")
+                      command=lambda: self._remove_custom_link_row(level, row))
+        attach_tooltip(del_link_btn, lambda: "Quitar este enlace personalizado de la lista.")
+        del_link_btn.pack(side="left")
         self._custom_links_widgets[level].append(
             {"row": row, "name": name_entry, "url": url_entry, "background": bg_var})
 
@@ -7939,8 +8086,10 @@ class App(_AppBase):
         self._plex_token_entry = ctk.CTkEntry(plex, show="*")
         self._plex_token_entry.insert(0, self.config_data.get("plex_token", ""))
         self._plex_token_entry.grid(row=3, column=1, padx=6, pady=4, sticky="ew")
-        ctk.CTkButton(plex, text="Validar", width=80, command=self._validate_plex).grid(
-            row=4, column=0, columnspan=2, pady=8)
+        val_plex_btn = ctk.CTkButton(plex, text="Validar", width=80, command=self._validate_plex)
+        attach_tooltip(val_plex_btn, lambda: "Conectar con Plex para comprobar que la dirección "
+                       "y el token funcionan.")
+        val_plex_btn.grid(row=4, column=0, columnspan=2, pady=8)
         self._plex_status = ctk.CTkLabel(plex, text="", text_color=PENDING_COLOR)
         self._plex_status.grid(row=5, column=0, columnspan=2)
 
@@ -8036,10 +8185,16 @@ class App(_AppBase):
         self._movies_scan_btn = ctk.CTkButton(
             left_fr, text="🔍 Recomendar", width=120,
             command=lambda: self._start_movies_scan(force_full=False))
+        attach_tooltip(self._movies_scan_btn, lambda: "Buscar películas populares que NO estén ya "
+                       "en el servidor y listarlas como recomendaciones. Aprovecha la caché "
+                       "compartida, así que suele ser rápido.")
         self._movies_scan_btn.pack(side="left", padx=(12, 4), pady=8)
         self._movies_full_btn = ctk.CTkButton(
             left_fr, text="Reescaneo completo", width=140, fg_color="transparent", border_width=1,
             command=lambda: self._start_movies_scan(force_full=True))
+        attach_tooltip(self._movies_full_btn, lambda: "Rehacer el escaneo desde cero, ignorando "
+                       "la caché compartida. Tarda bastante más: úsalo si sospechas que la lista "
+                       "está desfasada.")
         self._movies_full_btn.pack(side="left", padx=(0, 4), pady=8)
         self._movies_cancel_btn = ctk.CTkButton(
             left_fr, text="Cancelar", width=90, fg_color=ERROR_COLOR, hover_color="#96281b",
@@ -8361,6 +8516,8 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._movies_detail_cert.configure(state="disabled")
         self._movies_detail_cert.pack(pady=(0, 0), fill="x")
+        self._movies_detail_cast = self._make_cast_textbox(scroll, width=200)
+        self._movies_detail_cast.pack(pady=(0, 0), fill="x")
         self._movies_detail_overview = ctk.CTkTextbox(
             scroll, width=200, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -9186,6 +9343,8 @@ class App(_AppBase):
             self._set_textbox_text(self._movies_detail_cert,
                                    r.get("certification") or "Clasificación: …")
             self._load_movie_certification(r)
+        self._load_cast_into(self._movies_detail_cast, r.get("media_type", "movie"),
+                             r.get("tmdb_id"), "_movies_cast_token")
         self._set_textbox_text(self._movies_detail_overview, r.get("overview") or "Sin sinopsis disponible")
         self._movies_poster_label.configure(image=None, text="…")
         token = object()
@@ -9318,10 +9477,16 @@ class App(_AppBase):
         self._missing_ep_scan_btn = ctk.CTkButton(
             left_fr, text="🔍 Comprobar", width=120,
             command=lambda: self._start_missing_episodes_scan(force_full=False))
+        attach_tooltip(self._missing_ep_scan_btn, lambda: "Cruzar las series del servidor con "
+                       "TMDB y listar los episodios que faltan. Aprovecha la caché compartida, "
+                       "así que suele ser rápido.")
         self._missing_ep_scan_btn.pack(side="left", padx=(12, 4), pady=8)
         self._missing_ep_full_btn = ctk.CTkButton(
             left_fr, text="Reescaneo completo", width=140, fg_color="transparent", border_width=1,
             command=lambda: self._start_missing_episodes_scan(force_full=True))
+        attach_tooltip(self._missing_ep_full_btn, lambda: "Rehacer el escaneo desde cero, "
+                       "ignorando la caché compartida. Tarda bastante más: úsalo si sospechas "
+                       "que los huecos que ves no son los de verdad.")
         self._missing_ep_full_btn.pack(side="left", padx=(0, 4), pady=8)
         self._missing_ep_cancel_btn = ctk.CTkButton(
             left_fr, text="Cancelar", width=90, fg_color=ERROR_COLOR, hover_color="#96281b",
@@ -9654,6 +9819,8 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._missing_ep_detail_cert.configure(state="disabled")
         self._missing_ep_detail_cert.pack(pady=(0, 0), fill="x")
+        self._missing_ep_detail_cast = self._make_cast_textbox(scroll, width=200)
+        self._missing_ep_detail_cast.pack(pady=(0, 0), fill="x")
         self._missing_ep_detail_overview = ctk.CTkTextbox(
             scroll, width=200, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -9690,6 +9857,9 @@ class App(_AppBase):
         self._missing_ep_ai_ask_btn = ctk.CTkButton(
             scroll, text="🤖 Preguntar a la IA", width=200, state="disabled",
             command=self._ask_ai_about_current_missing_ep_show)
+        attach_tooltip(self._missing_ep_ai_ask_btn, lambda: "Preguntar a la IA por ESTA serie: "
+                       "sirve para distinguir un hueco de verdad de una numeración distinta "
+                       "(temporadas partidas, numeración absoluta...). Consume tu cuota de Groq.")
         self._missing_ep_ai_ask_btn.pack(pady=(0, 4), fill="x")
         # Si la IA detecta algún conflicto (hueco real vs. numeración
         # distinta), la explicación aparece aquí, justo debajo de la
@@ -10960,17 +11130,23 @@ class App(_AppBase):
                       fg_color="transparent", border_width=1,
                       hover_color=("gray88", "#2b2b2b"),
                       command=lambda row=r: self._rescan_single_missing_ep_series(row))
+        attach_tooltip(rescan_btn, lambda: "Volver a comprobar esta serie contra el servidor: "
+                       "recalcula qué episodios faltan de verdad ahora mismo, sin esperar "
+                       "al siguiente escaneo completo.")
         rescan_btn.pack(fill="both", expand=True)
 
         # padx trailing=12 (no 0): margen deliberado al final de la fila,
         # nada que ver con los sashes -- se conserva a mano, col_padx()
         # solo modela el margen IZQUIERDO de cada columna.
         c = _cell("delete", padx=(self._missing_ep_table.col_padx("delete")[0], 12))
-        ctk.CTkButton(c, text="🗑", height=24, font=self._missing_ep_icon_font,
+        del_series_btn = ctk.CTkButton(c, text="🗑", height=24, font=self._missing_ep_icon_font,
                       fg_color="transparent", border_width=1,
                       text_color=ERROR_COLOR, hover_color=("gray85", "#3d1010"),
-                      command=lambda row=r: self._confirm_delete_missing_ep_series(row)
-                      ).pack(fill="both", expand=True)
+                      command=lambda row=r: self._confirm_delete_missing_ep_series(row))
+        attach_tooltip(del_series_btn, lambda: "Borrar la serie DEL SERVIDOR, con todos sus "
+                       "episodios. Pide confirmación antes y queda registrado en el historial "
+                       "de borrados.")
+        del_series_btn.pack(fill="both", expand=True)
 
         detail_fr = None
         if expanded:
@@ -11481,7 +11657,15 @@ class App(_AppBase):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _dl_btn_reset(self, button, color):
-        button.configure(fg_color=color, state="normal")
+        # La búsqueda en aMule tarda hasta 20 s y el resultado vuelve por
+        # self.after(0, ...): para entonces el usuario puede haber cambiado de
+        # página o refrescado la tabla, y el botón de esa fila ya no existe
+        # ("invalid command name ...!ctkbutton" de Tcl). No hay nada que
+        # actualizar en ese caso -- la descarga se lanzó igual.
+        try:
+            button.configure(fg_color=color, state="normal")
+        except tk.TclError:
+            pass
 
     # ---- Autocompletado por serie (pestaña "Episodios que faltan") ----
     #
@@ -11958,18 +12142,29 @@ class App(_AppBase):
                 st = self.config_data.get("amule_search_type", "Kad")
                 best = None
                 last = None
-                for results in ec.iter_search(
-                        query, search_type=st, poll_interval=2.0, max_duration=20.0):
-                    candidate = best_result(results, query) if results else None
-                    if candidate is not None:
-                        best = candidate
-                        if last is not None and best is last:
-                            break
-                        last = best
-                if best is None:
-                    return False, "sin candidato que cumpla el umbral"
-                ok, _raw = ec.download(best)
-                return (True, "") if ok else (False, "aMule rechazó la descarga")
+                try:
+                    for results in ec.iter_search(
+                            query, search_type=st, poll_interval=2.0, max_duration=20.0):
+                        candidate = best_result(results, query) if results else None
+                        if candidate is not None:
+                            best = candidate
+                            if last is not None and best is last:
+                                break
+                            last = best
+                    if best is None:
+                        return False, "sin candidato que cumpla el umbral"
+                    ok, _raw = ec.download(best)
+                    return (True, "") if ok else (False, "aMule rechazó la descarga")
+                except (EcProtocolError, OSError) as e:
+                    # Conectar al puerto EC no garantiza que aMule esté
+                    # conectado a la red: con eD2k caído, iter_search lanza
+                    # EcSearchResultError ("no se está conectado a eD2k").
+                    # Sin capturarlo, la excepción subía hasta la pasada y
+                    # abortaba la serie ENTERA, dejando una traza por serie y
+                    # por pasada en el log (visto de verdad: 5 trazas cada 30
+                    # minutos durante días). Devolverlo como fallo normal deja
+                    # el episodio en el backoff, que es lo que toca.
+                    return False, f"aMule: {e}"
         finally:
             try:
                 ec.close()
@@ -12005,8 +12200,11 @@ class App(_AppBase):
             command=self._on_downloads_red_changed)
         self._downloads_type_menu.pack(side="left", padx=(0, 6))
 
-        ctk.CTkButton(top, text="Buscar", width=70, height=28,
-                      command=self._downloads_do_search).pack(side="left", padx=(0, 6))
+        dl_search_btn = ctk.CTkButton(top, text="Buscar", width=70, height=28,
+                      command=self._downloads_do_search)
+        attach_tooltip(dl_search_btn, lambda: "Buscar en aMule por la red elegida. Kad no "
+                       "necesita servidor; Global consulta los servidores eD2k.")
+        dl_search_btn.pack(side="left", padx=(0, 6))
 
         self._downloads_status_lbl = ctk.CTkLabel(parent, text="",
                                                    font=ctk.CTkFont(size=11), anchor="w")
@@ -12271,8 +12469,10 @@ class App(_AppBase):
                                 job["done"].set()
         except Exception as e:
             if token == self._downloads_search_token:
-                self.after(0, lambda: self._downloads_status_lbl.configure(
-                    text=f"Error: {e}", text_color=ERROR_COLOR))
+                # msg=str(e) por valor: 'e' ya no existe cuando Tk ejecuta el
+                # lambda (ver _apply_post_process_action).
+                self.after(0, lambda msg=str(e): self._downloads_status_lbl.configure(
+                    text=f"Error: {msg}", text_color=ERROR_COLOR))
         finally:
             if ec is not None:
                 try:
@@ -12481,9 +12681,11 @@ class App(_AppBase):
             # única columna expand de esta tabla), así que absorbe el espacio
             # sobrante y el botón se pega a la DERECHA, junto al borde.
             c = self._downloads_table.cell(row_fr, "accion", pady=6)
-            ctk.CTkButton(c, text="Descargar", width=80, height=24,
-                         command=lambda n=res.number: self._downloads_do_download(n)).pack(
-                side="right", padx=(0, 4))
+            dl_res_btn = ctk.CTkButton(c, text="Descargar", width=80, height=24,
+                         command=lambda n=res.number: self._downloads_do_download(n))
+            attach_tooltip(dl_res_btn, lambda: "Poner este resultado a descargar en aMule. "
+                           "Aparecerá en tu carpeta de descargas cuando termine.")
+            dl_res_btn.pack(side="right", padx=(0, 4))
         # Mide el alto medio por fila (igual que las demás tablas, ver
         # note_rows_rendered) para que el tamaño de página se ajuste al alto
         # real -- con el pady=6 de estas celdas el stride es mayor que el
@@ -12620,6 +12822,8 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._downloads_detail_cert.configure(state="disabled")
         self._downloads_detail_cert.pack(pady=(0, 0), fill="x")
+        self._downloads_detail_cast = self._make_cast_textbox(scroll, width=200)
+        self._downloads_detail_cast.pack(pady=(0, 0), fill="x")
         # Info local del archivo (tamaño, fuentes, estado, episodio detectado)
         # -- va antes de la sinopsis porque es la parte que se muestra SIN
         # red, al instante de pulsar.
@@ -12713,6 +12917,8 @@ class App(_AppBase):
                     self._set_textbox_text(self._downloads_detail_cert,
                                            f"Clasificación: {r.get('certification') or '…'}")
                     self._load_downloads_certification(r, token)
+                self._load_cast_into(self._downloads_detail_cast, media_type,
+                                     details.get("id") or r.get("id"), "_downloads_cast_token")
                 self._set_textbox_text(self._downloads_detail_overview,
                                        details.get("overview") or r.get("overview") or "Sin sinopsis disponible")
                 poster_path = details.get("poster_path") or r.get("poster_path")
@@ -12967,6 +13173,9 @@ class App(_AppBase):
             meta = (meta + " · " if meta else "") + ", ".join(genres)
         self._set_textbox_text(self._missing_ep_detail_meta, meta)
         self._set_textbox_text(self._missing_ep_detail_cert, "Serie")
+        # details viene de /tv/{id}, así que su "id" ES el tmdb_id de la serie.
+        self._load_cast_into(self._missing_ep_detail_cast, "tv", details.get("id"),
+                             "_missing_ep_cast_token")
         self._set_textbox_text(self._missing_ep_detail_overview, overview or "Sin sinopsis disponible")
         if poster_url:
             threading.Thread(target=self._load_missing_ep_poster,
@@ -13182,12 +13391,14 @@ class App(_AppBase):
             template = link.get("url_template", "")
             if not template:
                 continue
-            ctk.CTkButton(
+            link_btn = ctk.CTkButton(
                 self._missing_ep_links_frame, text=link.get("name", "Enlace"),
                 fg_color="transparent", border_width=1,
                 command=lambda t=template, v=variables, bg=link.get("background", False):
-                self._resolve_missing_ep_ruta_and_open(t, v, r, bg)
-            ).pack(fill="x", pady=2)
+                self._resolve_missing_ep_ruta_and_open(t, v, r, bg))
+            attach_tooltip(link_btn, lambda t=template, bg=link.get("background", False): (
+                "Abre: " + t + (" (en segundo plano)" if bg else "")))
+            link_btn.pack(fill="x", pady=2)
 
     def _resolve_missing_ep_ruta_and_open(self, template: str, base_variables: dict, r: dict,
                                           background: bool = False):
@@ -14837,10 +15048,17 @@ class App(_AppBase):
             row=1, column=0, pady=(0, 8))
         bf_transfer = ctk.CTkFrame(fr, fg_color="transparent")
         bf_transfer.grid(row=2, column=0, pady=(0, 12))
-        ctk.CTkButton(bf_transfer, text="⬇ Exportar configuración", command=self._export_config,
-                      fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=4)
-        ctk.CTkButton(bf_transfer, text="⬆ Importar configuración", command=self._import_config,
-                      fg_color="transparent", border_width=1).pack(side="left", padx=4)
+        export_cfg_btn = ctk.CTkButton(bf_transfer, text="⬇ Exportar configuración",
+                      command=self._export_config, fg_color=ACCENT, hover_color=ACCENT_HOVER)
+        attach_tooltip(export_cfg_btn, lambda: "Guardar en un archivo la configuración de ESTE "
+                       "equipo (FTP, carpeta vigilada, preferencias). La contraseña FTP no se "
+                       "exporta nunca en texto plano.")
+        export_cfg_btn.pack(side="left", padx=4)
+        import_cfg_btn = ctk.CTkButton(bf_transfer, text="⬆ Importar configuración",
+                      command=self._import_config, fg_color="transparent", border_width=1)
+        attach_tooltip(import_cfg_btn, lambda: "Cargar la configuración de cliente desde un "
+                       "archivo exportado. Tendrás que volver a escribir la contraseña del FTP.")
+        import_cfg_btn.pack(side="left", padx=4)
 
     def _export_config(self):
         path = filedialog.asksaveasfilename(
@@ -15045,8 +15263,12 @@ class App(_AppBase):
         hdr_cats.grid_columnconfigure(2, weight=1)
         ctk.CTkLabel(hdr_cats, text="Categorías FTP",
                      font=self._cfg_font_title).grid(row=0, column=1)
-        ctk.CTkButton(hdr_cats, text="🔄 Recargar géneros", width=160, height=26,
-                      command=self._load_genres_async).grid(row=0, column=2, sticky="e", padx=12)
+        reload_genres_btn = ctk.CTkButton(hdr_cats, text="🔄 Recargar géneros", width=160, height=26,
+                      command=self._load_genres_async)
+        attach_tooltip(reload_genres_btn, lambda: "Volver a pedir a TMDB la lista de géneros con "
+                       "la que se marcan las categorías. Solo hace falta si TMDB añade géneros "
+                       "nuevos o la lista salió vacía.")
+        reload_genres_btn.grid(row=0, column=2, sticky="e", padx=12)
         ctk.CTkLabel(cats_fr,
                      text="Cada categoría busca y sube contenido en su propia ruta del servidor. "
                           "La app elige la categoría sola según el género de TMDB (o, para Libros/"
@@ -15114,8 +15336,12 @@ class App(_AppBase):
         n = len(categories)
         for idx, cat in enumerate(categories):
             self._build_category_card(container, media_type, cat, idx, n)
-        ctk.CTkButton(container, text="+ Añadir categoría", width=160,
-                      command=lambda mt=media_type: self._add_category(mt)).pack(pady=(4, 0), anchor="w")
+        add_cat_btn = ctk.CTkButton(container, text="+ Añadir categoría", width=160,
+                      command=lambda mt=media_type: self._add_category(mt))
+        attach_tooltip(add_cat_btn, lambda: "Añadir una carpeta de destino nueva con sus propios "
+                       "géneros. Una categoría sin ningún género marcado hace de destino por "
+                       "defecto para lo que no encaje en ninguna otra.")
+        add_cat_btn.pack(pady=(4, 0), anchor="w")
 
     def _build_category_card(self, parent, media_type: str, cat: dict, idx: int, total: int):
         card = ctk.CTkFrame(parent, corner_radius=8)
@@ -15128,14 +15354,25 @@ class App(_AppBase):
         name_entry.insert(0, cat.get("name", ""))
         name_entry.pack(side="left", fill="x", expand=True)
         if idx > 0:
-            ctk.CTkButton(top, text="▲", width=28,
-                          command=lambda: self._move_category(media_type, cat, -1)).pack(side="left", padx=(4, 0))
+            up_btn = ctk.CTkButton(top, text="▲", width=28,
+                          command=lambda: self._move_category(media_type, cat, -1))
+            # El orden importa de verdad: al clasificar por género se usa la
+            # PRIMERA categoría que encaje, así que subirla le da prioridad.
+            attach_tooltip(up_btn, lambda: "Subir esta categoría. El orden decide: se usa la "
+                           "primera categoría cuyos géneros encajen.")
+            up_btn.pack(side="left", padx=(4, 0))
         if idx < total - 1:
-            ctk.CTkButton(top, text="▼", width=28,
-                          command=lambda: self._move_category(media_type, cat, 1)).pack(side="left", padx=(4, 0))
-        ctk.CTkButton(top, text="✕", width=28, fg_color="transparent", border_width=1,
+            down_btn = ctk.CTkButton(top, text="▼", width=28,
+                          command=lambda: self._move_category(media_type, cat, 1))
+            attach_tooltip(down_btn, lambda: "Bajar esta categoría. El orden decide: se usa la "
+                           "primera categoría cuyos géneros encajen.")
+            down_btn.pack(side="left", padx=(4, 0))
+        del_cat_btn = ctk.CTkButton(top, text="✕", width=28, fg_color="transparent", border_width=1,
                       border_color=ERROR_COLOR, text_color=ERROR_COLOR,
-                      command=lambda: self._remove_category(media_type, cat)).pack(side="left", padx=(4, 0))
+                      command=lambda: self._remove_category(media_type, cat))
+        attach_tooltip(del_cat_btn, lambda: "Eliminar esta categoría. No toca nada del servidor: "
+                       "solo deja de usarse para decidir a qué carpeta va cada archivo.")
+        del_cat_btn.pack(side="left", padx=(4, 0))
         cat["_name_entry"] = name_entry
 
         ctk.CTkLabel(card, text="Géneros (ninguno marcado = categoría por defecto):",
@@ -15720,6 +15957,12 @@ class App(_AppBase):
                 hover_color=("gray85", "#2b2b2b"),
                 state="normal" if (entry.media_info and entry.status == "subido") else "disabled",
                 command=lambda e=entry: self._toggle_entry_reservation(e))
+            attach_tooltip(lock_btn, lambda e=entry: (
+                "Solo se puede reservar algo que ya esté identificado y subido."
+                if not (e.media_info and e.status == "subido") else
+                "Soltar la reserva: deja de estar protegido del borrado."
+                if self._entry_is_reserved(e) else
+                "Reservar: lo protege del borrado para todos, no solo para ti. Ocupa cuota."))
             lock_btn.pack(fill="both", expand=True)
 
             # Los tres botones de acción comparten una única celda ("btns",
@@ -15729,11 +15972,15 @@ class App(_AppBase):
             ftp_up = ctk.CTkButton(btns_cell, text="▲", width=cw["btn"], height=26,
                                     font=_BF, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                                     command=lambda e=entry: self._upload_one(e))
+            attach_tooltip(ftp_up, lambda: "Subir SOLO este archivo al servidor, a la carpeta "
+                           "que indica la columna \"Destino\".")
             ftp_up.pack(side="left")
 
             play_btn = ctk.CTkButton(btns_cell, text="▶", width=cw["btn"], height=26,
                                       font=_BF, fg_color="transparent", border_width=1,
                                       command=lambda e=entry: self._play_file(e))
+            attach_tooltip(play_btn, lambda: "Abrir el archivo local con el reproductor "
+                           "predeterminado del sistema, para comprobarlo antes de subirlo.")
             play_btn.pack(side="left", padx=(2, 0))
 
             del_btn = ctk.CTkButton(btns_cell, text="✕", width=cw["btn"], height=26,
@@ -15741,6 +15988,8 @@ class App(_AppBase):
                                      border_color=ERROR_COLOR, text_color=ERROR_COLOR,
                                      hover_color=("gray85", "#3d1010"),
                                      command=lambda e=entry: self._remove_entry(e))
+            attach_tooltip(del_btn, lambda: "Quitar el archivo de esta lista. No borra nada "
+                           "del disco ni del servidor: solo desaparece de la tabla.")
             del_btn.pack(side="left", padx=(2, 0))
 
             # Las CELDAS también responden al clic, no solo las etiquetas de
@@ -16799,6 +17048,62 @@ class App(_AppBase):
         else:
             self._set_textbox_text(self._detail_cert, "")
             self._detail_cert_token = object()
+        self._load_detail_cast(info)
+
+    def _make_cast_textbox(self, parent, width=215):
+        """Caja de "Reparto" para un panel lateral. Hay SEIS paneles de
+        detalle (Archivos, Recomendado, Episodios que faltan, Descargas,
+        Liberar espacio y Protegidos) construidos cada uno por su lado; esto
+        y _load_cast_into existen para no repetir el reparto seis veces."""
+        box = ctk.CTkTextbox(
+            parent, width=width, height=1, wrap="word",
+            font=ctk.CTkFont(size=11), fg_color="transparent",
+            text_color=PENDING_COLOR, activate_scrollbars=False)
+        box.configure(state="disabled")
+        return box
+
+    _CAST_LIMIT = 6
+
+    def _load_cast_into(self, box, media_type: str, tmdb_id: int, token_attr: str):
+        """Pide el reparto a TMDB en segundo plano y lo pinta en *box*.
+
+        /credits es una llamada aparte (no viene en el resultado de búsqueda),
+        así que se hace en un hilo y se pinta al llegar -- mismo patrón que
+        las clasificaciones por edad de estos mismos paneles.
+
+        *token_attr* es el nombre del atributo donde guardar el testigo de
+        "esta es la petición vigente": si el usuario cambia de fila mientras
+        la petición está en vuelo, la respuesta de la fila anterior NO debe
+        sobrescribir el reparto de la nueva. Cada panel usa el suyo para no
+        pisarse entre pestañas."""
+        token = object()
+        setattr(self, token_attr, token)
+        # Libros y cómics no están en TMDB: ni se pregunta.
+        if not tmdb_id or media_type == "libro":
+            self._set_textbox_text(box, "")
+            return
+        self._set_textbox_text(box, "Reparto: …")
+
+        def _worker():
+            client = TMDBClient(self.config_data.get("tmdb_api_key", ""))
+            names = []
+            try:
+                names = client.get_top_cast(media_type, tmdb_id, self._CAST_LIMIT)
+            except Exception:
+                _log.warning("Reparto: fallo al pedirlo para tmdb_id=%s", tmdb_id)
+            def _apply():
+                if getattr(self, token_attr, None) is not token:
+                    return
+                self._set_textbox_text(
+                    box, ("Reparto: " + ", ".join(names)) if names else "Reparto: sin datos")
+            self.after(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _load_detail_cast(self, info: MediaInfo):
+        """Reparto del panel de detalle de Archivos (ver _load_cast_into)."""
+        self._load_cast_into(self._detail_cast, info.media_type, info.tmdb_id,
+                             "_detail_cast_token")
 
     def _load_detail_certification(self, info: MediaInfo):
         """Clasificación por edad (PG-13, 12, 18...) de una película del
@@ -17109,6 +17414,10 @@ class App(_AppBase):
             self._detail_cert.delete("1.0", "end")
             self._detail_cert.configure(state="disabled")
             self._detail_cert_token = object()
+            # Sin ficha de TMDB tampoco hay reparto que enseñar; el token nuevo
+            # descarta la respuesta de la fila anterior si venía en camino.
+            self._set_textbox_text(self._detail_cast, "")
+            self._detail_cast_token = object()
             self._overview_token = None
             self._set_overview_text("")
             self._poster_token = None
@@ -17317,12 +17626,14 @@ class App(_AppBase):
             template = link.get("url_template", "")
             if not template:
                 continue
-            ctk.CTkButton(
+            link_btn = ctk.CTkButton(
                 self._detail_links_frame, text=link.get("name", "Enlace"),
                 fg_color="transparent", border_width=1,
                 command=lambda t=template, v=variables, bg=link.get("background", False):
-                self._resolve_detail_ruta_and_open(t, v, info, bg)
-            ).pack(fill="x", pady=2)
+                self._resolve_detail_ruta_and_open(t, v, info, bg))
+            attach_tooltip(link_btn, lambda t=template, bg=link.get("background", False): (
+                "Abre: " + t + (" (en segundo plano)" if bg else "")))
+            link_btn.pack(fill="x", pady=2)
 
     def _resolve_detail_ruta_and_open(self, template: str, base_variables: dict, info,
                                       background: bool = False):
@@ -17842,9 +18153,12 @@ class App(_AppBase):
                 row = ctk.CTkFrame(list_fr, fg_color="transparent")
                 row.pack(fill="x", pady=2)
                 ctk.CTkLabel(row, text=term, anchor="w").pack(side="left", fill="x", expand=True, padx=(4, 0))
-                ctk.CTkButton(row, text="✕", width=28, fg_color="transparent", border_width=1,
-                              text_color=ERROR_COLOR,
-                              command=lambda t=term: _remove(t)).pack(side="right", padx=4)
+                del_term_btn = ctk.CTkButton(row, text="✕", width=28, fg_color="transparent",
+                              border_width=1, text_color=ERROR_COLOR,
+                              command=lambda t=term: _remove(t))
+                attach_tooltip(del_term_btn, lambda: "Olvidar este término: la app dejará de "
+                               "quitarlo automáticamente de los nombres de archivo.")
+                del_term_btn.pack(side="right", padx=4)
 
         def _remove(term):
             from core.learned_terms import remove_learned_term
@@ -18842,17 +19156,27 @@ class App(_AppBase):
         self._history_search_entry.bind("<KeyRelease>", self._on_history_search_key)
         self._history_search_debounce_id = None   # ver _on_history_search_key
 
-        ctk.CTkButton(header, text="🗑 Limpiar historial", width=150,
+        clear_hist_btn = ctk.CTkButton(header, text="🗑 Limpiar historial", width=150,
                       fg_color="transparent", border_width=1,
                       border_color=ERROR_COLOR, text_color=ERROR_COLOR,
                       hover_color=("gray85", "#3d1010"),
-                      command=self._clear_history).pack(side="right", padx=(4, 12), pady=8)
-        ctk.CTkButton(header, text="📥 Descargar log completo", width=180,
+                      command=self._clear_history)
+        attach_tooltip(clear_hist_btn, lambda: "Vaciar esta lista. Solo borra el registro de tu "
+                       "equipo: los archivos del servidor no se tocan.")
+        clear_hist_btn.pack(side="right", padx=(4, 12), pady=8)
+        export_log_btn = ctk.CTkButton(header, text="📥 Descargar log completo", width=180,
                       fg_color="transparent", border_width=1,
-                      command=self._export_log).pack(side="right", padx=4, pady=8)
-        ctk.CTkButton(header, text="📥 Descargar historial", width=170,
+                      command=self._export_log)
+        attach_tooltip(export_log_btn, lambda: "Guardar en un .zip todos los archivos de log de "
+                       "la app, incluidos los de respaldo. Es lo que hay que enviar para que se "
+                       "pueda diagnosticar un fallo.")
+        export_log_btn.pack(side="right", padx=4, pady=8)
+        export_hist_btn = ctk.CTkButton(header, text="📥 Descargar historial", width=170,
                       fg_color="transparent", border_width=1,
-                      command=self._export_history).pack(side="right", padx=4, pady=8)
+                      command=self._export_history)
+        attach_tooltip(export_hist_btn, lambda: "Guardar el historial en un archivo .json, para "
+                       "consultarlo fuera de la app.")
+        export_hist_btn.pack(side="right", padx=4, pady=8)
 
         table_fr = ctk.CTkFrame(parent, fg_color="transparent")
         table_fr.grid(row=1, column=0, sticky="nsew")
@@ -19143,6 +19467,9 @@ class App(_AppBase):
                 fg_color="transparent", border_width=1,
                 state="normal" if (st == "error" and not is_deletion) else "disabled",
                 command=lambda e=entry: self._retry_history_upload(e))
+            attach_tooltip(retry_btn, lambda st=st, isd=is_deletion: (
+                "Volver a intentar esta subida con el mismo archivo local." if (st == "error" and not isd)
+                else "Solo se puede reintentar una subida que falló (un borrado no)."))
             retry_btn.pack(fill="both", expand=True)
             row_labels["accion"] = retry_btn
 
@@ -19317,6 +19644,9 @@ class App(_AppBase):
         right_fr.grid(row=0, column=2, sticky="e")
         self._cleanup_scan_btn = ctk.CTkButton(right_fr, text="🔍 Analizar servidor", width=170,
                                                command=self._start_cleanup_scan)
+        attach_tooltip(self._cleanup_scan_btn, lambda: "Recorrer el servidor y proponer qué "
+                       "ocupa mucho y casi no se ve. Solo propone: no borra nada, cada borrado "
+                       "va aparte y con confirmación.")
         self._cleanup_scan_btn.pack(side="right", padx=(4, 12), pady=8)
 
         self._cleanup_status_lbl = ctk.CTkLabel(
@@ -19450,8 +19780,11 @@ class App(_AppBase):
         ctk.CTkLabel(filters_fr, text="(se rellena tras analizar)",
                      font=ctk.CTkFont(size=10), text_color=PENDING_COLOR).pack(anchor="w", pady=(0, 12))
 
-        ctk.CTkButton(filters_fr, text="Aplicar filtros",
-                      command=self._apply_cleanup_filters).pack(anchor="w", fill="x", pady=(4, 0))
+        apply_filters_btn = ctk.CTkButton(filters_fr, text="Aplicar filtros",
+                      command=self._apply_cleanup_filters)
+        attach_tooltip(apply_filters_btn, lambda: "Aplicar los filtros de arriba a la lista. Sin "
+                       "ningún filtro marcado se ve la lista COMPLETA, no una preselección.")
+        apply_filters_btn.pack(anchor="w", fill="x", pady=(4, 0))
 
         # -- Resultados en el centro --
         results_wrap = ctk.CTkFrame(body, fg_color="transparent")
@@ -20226,20 +20559,28 @@ class App(_AppBase):
         # muestra como candidata a borrar por defecto -- salvo que el
         # filtro "Mostrar favoritos" esté activo, ver más abajo.
         c = _cell("fav", padx=(0, 4))
-        ctk.CTkButton(c, text="★" if is_fav else "☆", fg_color="transparent", border_width=0,
+        fav_btn = ctk.CTkButton(c, text="★" if is_fav else "☆", fg_color="transparent", border_width=0,
                       text_color=ACCENT if is_fav else PENDING_COLOR, hover_color=("gray85", "#2b2b2b"),
-                      command=lambda it=item: self._toggle_cleanup_item_favorite(it)).pack(
-            fill="both", expand=True)
+                      command=lambda it=item: self._toggle_cleanup_item_favorite(it))
+        attach_tooltip(fav_btn, lambda: ("Quitar de favoritos: volverá a aparecer como candidata "
+                       "a borrar." if is_fav else
+                       "Marcar como favorito: deja de salir en esta lista de candidatas a borrar "
+                       "(salvo con el filtro \"Mostrar favoritos\")."))
+        fav_btn.pack(fill="both", expand=True)
 
         # Igual que favoritos pero con cuota configurable por usuario (ver
         # core/reservations.py) -- "🔒" reservado (por cualquiera, no solo
         # el usuario actual), "🔓" libre.
         c = _cell("reserve", padx=(0, 4))
-        ctk.CTkButton(c, text="🔒" if is_res else "🔓", fg_color="transparent",
+        res_btn = ctk.CTkButton(c, text="🔒" if is_res else "🔓", fg_color="transparent",
                       border_width=0, text_color=ACCENT if is_res else PENDING_COLOR,
                       hover_color=("gray85", "#2b2b2b"),
-                      command=lambda it=item: self._toggle_cleanup_item_reservation(it)).pack(
-            fill="both", expand=True)
+                      command=lambda it=item: self._toggle_cleanup_item_reservation(it))
+        attach_tooltip(res_btn, lambda: ("Liberar la reserva: deja de estar protegida y devuelve "
+                       "su tamaño a la cuota." if is_res else
+                       "Reservar: la protege del borrado para todos los usuarios, no solo para ti. "
+                       "Ocupa cuota de reserva."))
+        res_btn.pack(fill="both", expand=True)
 
         # Protegido (favorito o reservado) nunca se borra desde aquí, ni
         # aunque el filtro correspondiente lo esté mostrando -- deshabilitar
@@ -20259,6 +20600,18 @@ class App(_AppBase):
             hover_color=("gray85", "#3d1010") if not is_protected else ("gray90", "gray20"),
             state="disabled" if (is_protected or deleting) else "normal",
             command=lambda it=item: self._confirm_and_delete_cleanup_item(it))
+        # El botón cambia de texto según el estado, así que el tooltip explica
+        # sobre todo POR QUÉ está deshabilitado cuando lo está -- que es justo
+        # lo que no se ve mirándolo.
+        attach_tooltip(del_btn, lambda d=deleting, prot=is_protected, f=is_fav: (
+            "Borrado en curso. Una serie son cientos de llamadas al servidor y "
+            "puede tardar minutos." if d else
+            ("No se puede borrar: está marcada como favorita. Quita la estrella para "
+             "poder eliminarla." if f else
+             "No se puede borrar: está reservada. Abre el candado para poder eliminarla.")
+            if prot else
+            "Borrar esto DEL SERVIDOR de forma definitiva. Pide confirmación y queda "
+            "registrado en el historial de borrados."))
         del_btn.pack(fill="both", expand=True)
         self._cleanup_delete_buttons[item.ftp_path] = del_btn
 
@@ -20297,6 +20650,8 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._cleanup_detail_cert.configure(state="disabled")
         self._cleanup_detail_cert.pack(pady=(0, 0), fill="x")
+        self._cleanup_detail_cast = self._make_cast_textbox(scroll, width=200)
+        self._cleanup_detail_cast.pack(pady=(0, 0), fill="x")
         self._cleanup_detail_overview = ctk.CTkTextbox(
             scroll, width=200, height=1, wrap="word",
             font=ctk.CTkFont(size=11), fg_color="transparent",
@@ -20394,6 +20749,9 @@ class App(_AppBase):
         else:
             self._set_textbox_text(self._cleanup_detail_cert, "Clasificación: …")
             self._load_cleanup_certification(item.tmdb_id, token)
+        self._load_cast_into(self._cleanup_detail_cast, media_type,
+                             item.tmdb_id if item is not None else None,
+                             "_cleanup_cast_token")
         self._set_textbox_text(self._cleanup_detail_overview, overview or "Sin sinopsis disponible")
         if poster_url:
             threading.Thread(target=self._load_cleanup_poster, args=(poster_url, token), daemon=True).start()
@@ -20525,12 +20883,14 @@ class App(_AppBase):
             template = link.get("url_template", "")
             if not template:
                 continue
-            ctk.CTkButton(
+            link_btn = ctk.CTkButton(
                 self._cleanup_links_frame, text=link.get("name", "Enlace"),
                 fg_color="transparent", border_width=1,
                 command=lambda t=template, v=variables, bg=link.get("background", False):
-                self._resolve_cleanup_ruta_and_open(t, v, item, bg)
-            ).pack(fill="x", pady=2)
+                self._resolve_cleanup_ruta_and_open(t, v, item, bg))
+            attach_tooltip(link_btn, lambda t=template, bg=link.get("background", False): (
+                "Abre: " + t + (" (en segundo plano)" if bg else "")))
+            link_btn.pack(fill="x", pady=2)
 
     def _resolve_cleanup_ruta_and_open(self, template: str, base_variables: dict, item,
                                        background: bool = False):
@@ -20999,6 +21359,8 @@ class App(_AppBase):
             activate_scrollbars=False)
         self._protected_detail_cert.configure(state="disabled")
         self._protected_detail_cert.pack(pady=(0, 0), fill="x")
+        self._protected_detail_cast = self._make_cast_textbox(scroll, width=200)
+        self._protected_detail_cast.pack(pady=(0, 0), fill="x")
         # Datos de la reserva (tamaño, quién la reservó) -- van antes de la
         # sinopsis porque es la parte que se muestra SIN red, al instante.
         self._protected_detail_local = ctk.CTkTextbox(
@@ -21075,6 +21437,8 @@ class App(_AppBase):
                 else:
                     self._set_textbox_text(self._protected_detail_cert, "Clasificación: …")
                     self._load_protected_certification(tmdb_id, token)
+                self._load_cast_into(self._protected_detail_cast, media_type, tmdb_id,
+                                     "_protected_cast_token")
                 self._set_textbox_text(self._protected_detail_overview,
                                        details.get("overview") or "Sin sinopsis disponible")
                 poster_path = details.get("poster_path")
@@ -21168,11 +21532,15 @@ class App(_AppBase):
         # "Ver todo el servidor", donde la mayoría de filas serán ajenas.
         is_mine = owner == user
         c = _cell("release", padx=(8, 8), pady=6)
-        ctk.CTkButton(c, text="🔓 Liberar" if is_mine else "🔒 De otra persona",
+        release_btn = ctk.CTkButton(c, text="🔓 Liberar" if is_mine else "🔒 De otra persona",
                       fg_color="transparent", border_width=1,
                       state="normal" if is_mine else "disabled",
-                      command=lambda k=key, e=entry: self._release_protected_row(k, e)).pack(
-            fill="both", expand=True)
+                      command=lambda k=key, e=entry: self._release_protected_row(k, e))
+        attach_tooltip(release_btn, lambda mine=is_mine: (
+            "Soltar esta reserva: deja de estar protegida y su tamaño vuelve a tu cuota."
+            if mine else
+            "La reservó otra persona, así que solo ella puede soltarla."))
+        release_btn.pack(fill="both", expand=True)
 
     def _release_protected_row(self, key: str, entry: dict):
         # Reutiliza _toggle_reservation tal cual: la fila solo existe

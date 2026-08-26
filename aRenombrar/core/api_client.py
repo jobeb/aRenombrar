@@ -16,6 +16,31 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE = "https://image.tmdb.org/t/p/w300"
 
 
+def top_cast_names(credits: dict, limit: int = 6) -> list:
+    """Nombres del reparto principal a partir de la respuesta de
+    /{tv,movie}/{id}/credits, listos para mostrar: "Actor (Personaje)", o
+    solo el actor si TMDB no trae personaje.
+
+    Se ordena por el campo "order" de TMDB (0 = cabeza de cartel) en vez de
+    fiarse del orden de llegada: la API lo respeta casi siempre, pero no lo
+    garantiza, y con una serie de reparto largo la diferencia es entre
+    enseñar a los protagonistas o a tres secundarios cualesquiera. Las
+    entradas sin "order" van al final, no a la cabeza (de ahí el infinito).
+
+    Función aparte del cliente (y no un método) para poder probarla sin
+    tocar la red -- ver tests/test_top_cast_names.py."""
+    cast = (credits or {}).get("cast") or []
+    ordered = sorted(
+        (c for c in cast if isinstance(c, dict) and (c.get("name") or "").strip()),
+        key=lambda c: c.get("order") if isinstance(c.get("order"), int) else float("inf"))
+    names = []
+    for person in ordered[:max(0, limit)]:
+        name = person.get("name", "").strip()
+        character = (person.get("character") or "").strip()
+        names.append(f"{name} ({character})" if character else name)
+    return names
+
+
 @dataclass
 class MediaInfo:
     # Para libros/cómics (media_type="libro") esto aloja el id de Google
@@ -199,6 +224,18 @@ class TMDBClient:
 
     def get_movie_details(self, movie_id: int) -> dict:
         return self._get(f"/movie/{movie_id}")
+
+    def get_credits(self, media_type: str, tmdb_id: int) -> dict:
+        """Ficha de reparto/equipo de TMDB. media_type acepta lo que devuelve
+        detect_episode ("tv"/"anime"/"movie"), no solo lo que entiende TMDB --
+        ver _TMDB_TYPE."""
+        kind = self._TMDB_TYPE.get(media_type, "movie")
+        return self._get(f"/{kind}/{tmdb_id}/credits")
+
+    def get_top_cast(self, media_type: str, tmdb_id: int, limit: int = 6) -> list:
+        """Los *limit* intérpretes principales, ya formateados para mostrar
+        (ver top_cast_names). Lista vacía si TMDB no tiene reparto."""
+        return top_cast_names(self.get_credits(media_type, tmdb_id), limit)
 
     # Listas de películas que alimentan la pestaña "Películas" (recomendar
     # lo que no está en el servidor, ver gui/app.py::_scan_missing_movies).

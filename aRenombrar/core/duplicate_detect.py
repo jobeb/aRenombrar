@@ -68,10 +68,13 @@ def find_duplicate(existing_filenames: list, media_info, current_filename: str) 
         # Toy Story 5. Aquí se mira el año en el nombre de archivo CRUDO y,
         # si el archivo existente trae un año y no coincide con el real de
         # la película (media_info.year, de TMDB), NO es duplicado.
+        # (No se registra el descarte: esto se ejecuta contra CADA archivo de
+        # la carpeta remota, y en /datos2/peliculas eso eran ~300 líneas de
+        # log por cada película subida -- ahogaba el propio log. Lo que
+        # interesa es el duplicado que SÍ se encuentra, que sí se registra
+        # unas líneas más abajo.)
         existing_year = _year_in_name(name)
         if existing_year and target_year and existing_year != target_year:
-            _log.info("Duplicado película: '%s' (año %s) descartado vs '%s' (año %s) '%s'",
-                      target_title, target_year, existing_title, existing_year, name)
             continue
 
         ratio = series_similarity(target_title, existing_title)
