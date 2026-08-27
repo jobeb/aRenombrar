@@ -28,8 +28,17 @@ If needsInstall Then
         ' Solo se marca como "ya instalado" si pip termino sin error --
         ' si fallo (por ejemplo sin conexion la primera vez), se reintenta
         ' en el proximo arranque en vez de dejarlo marcado como hecho.
+        ' Si el marcador no se puede escribir (un antivirus mirandolo justo
+        ' en ese momento, otra copia del lanzador arrancando a la vez...), la
+        ' unica consecuencia es que el proximo arranque vuelva a pasar por
+        ' pip. Lo que NO puede pasar es que eso impida abrir la aplicacion:
+        ' antes el error cortaba el script aqui y no se llegaba a la linea
+        ' que la lanza (visto de verdad: "Permiso denegado", codigo 800A0046).
+        On Error Resume Next
         Set f = fso.CreateTextFile(markerFile, True)
-        f.Close
+        If Err.Number = 0 Then f.Close
+        Err.Clear
+        On Error GoTo 0
     End If
 End If
 

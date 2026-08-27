@@ -45,7 +45,7 @@ from core.anilist_client import AniListClient
 from core.kitsu_client import KitsuClient
 from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
-from core.ftp_client import FTPClient, _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
+from core.ftp_client import _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
 from core.amule_client import AmuleSearchResult
 from core.ec_client import EcClient, EcConnectionError, EcAuthError, EcProtocolError
 from core.auto_watcher import AutoWatcher
@@ -103,6 +103,14 @@ ICON_DL_FAIL   = ("#C0392B", "#8a1f16")   # no se encontró/como lanzado
 CONTAINER_GAP = 8   # separación estándar entre contenedores principales de la UI
 QUEUED_COLOR  = "#3498db"
 SELECTED_ROW_COLOR = ("#c8e6d0", "#204a34")   # (modo claro, modo oscuro) — fila seleccionada
+
+#: Cómo se llama cada protocolo en la pestaña de conexión. FTPS es FTP con
+#: TLS (mismo protocolo, cifrado); SFTP es SSH y no tiene nada que ver.
+PROTOCOL_LABELS = {
+    "ftp":  "FTP",
+    "ftps": "FTPS (FTP con TLS)",
+    "sftp": "SFTP (SSH)",
+}
 # Fila del "mejor candidato" de la tabla Descargar (ver _downloads_rebuild_page).
 DOWNLOAD_BEST_ROW_COLOR = ("#d2efc9", "#1e3a2c")
 STATUS_LABELS = {"en_cola": "En cola",
@@ -971,6 +979,16 @@ else:
 
 
 class App(_AppBase):
+    def _new_ftp_client(self):
+        """Una conexión nueva, del protocolo que esté configurado.
+
+        Todo el que necesite una conexión propia (las subidas en paralelo, las
+        estadísticas, liberar espacio...) la pide por aquí y no construyendo
+        FTPClient directamente: así cambiar entre FTP y SFTP es un ajuste y no
+        una búsqueda por medio archivo. Ver core/transfer.py."""
+        from core.transfer import make_client
+        return make_client(self.config_data.get("ftp_protocol", "ftp"))
+
     def __init__(self):
         # Instrumentación temporal de arranque -- para localizar qué fase
         # concreta tarda, en vez de seguir adivinando (ver _t: usado en
@@ -1014,7 +1032,7 @@ class App(_AppBase):
         self.mangadex_client = MangaDexClient()
         self.anilist_client   = AniListClient()
         self.kitsu_client     = KitsuClient()
-        self.ftp  = FTPClient()
+        self.ftp  = self._new_ftp_client()
         # self.ftp es una única conexión de control compartida con AutoWatcher
         # (ver _toggle_auto) y con varias comprobaciones de fondo de la propia
         # GUI (espacio libre, precarga de carpetas, "Probar conexión", cruce
@@ -2051,6 +2069,7 @@ class App(_AppBase):
                 folder, self.config_data, self.tmdb, self.ftp,
                 self._on_auto_event, self._on_auto_file_event,
                 upload_slots=self._upload_slots, ftp_lock=self._ftp_cmd_lock,
+                ftp_factory=self._new_ftp_client,   # que suba por el protocolo configurado
                 comicvine_client=self.comicvine, book_client=self.book_client,
                 openlibrary_client=self.openlibrary_client)
             self._watcher.start()
@@ -3175,8 +3194,7 @@ class App(_AppBase):
             # inanición real del hilo de este chequeo, que nunca consigue su
             # turno. Con conexión propia no depende de lo ocupado que esté
             # el automático -- mismo patrón que ya usa el detector de huecos.
-            from core.ftp_client import FTPClient as _FTPClient
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3280,9 +3298,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3354,9 +3371,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3477,10 +3493,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.server_config import filter_shared_config
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3592,10 +3607,9 @@ class App(_AppBase):
         self._set_status("Recuperando configuración del servidor...", PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.server_config import filter_shared_config
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3662,9 +3676,8 @@ class App(_AppBase):
         self._set_status("Publicando configuración del servidor...", PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3771,9 +3784,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3849,9 +3861,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3923,10 +3934,9 @@ class App(_AppBase):
         app_user_name = self.config_data.get("app_user_name", "")
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.shared_dub_verdicts import set_verdict
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -3969,9 +3979,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4015,9 +4024,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4071,9 +4079,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4113,10 +4120,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.upload_stats import add_upload
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4172,9 +4178,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4213,10 +4218,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.deletion_stats import add_deletion
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4274,9 +4278,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4322,10 +4325,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.category_upload_stats import add_category_upload
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4384,9 +4386,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4425,10 +4426,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.cleanup_candidates_cache import wrap_for_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4464,10 +4464,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.cleanup_candidates_cache import wrap_for_remote, unwrap_from_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4560,10 +4559,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.cleanup_candidates_cache import unwrap_from_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4605,10 +4603,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.missing_episodes_cache import load_cache, strip_personal_fields
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4650,10 +4647,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.missing_movies_cache import load_cache, merge_movies_cache
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4736,9 +4732,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4816,9 +4811,8 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4866,10 +4860,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.category_stats import add_folder_bytes, unwrap_from_remote, wrap_for_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -4950,10 +4943,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.category_stats import remove_folder, unwrap_from_remote, wrap_for_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -5023,10 +5015,9 @@ class App(_AppBase):
             return
 
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
             from core.category_stats import unwrap_from_remote
             import json as _json
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -5240,8 +5231,7 @@ class App(_AppBase):
         Silencioso: si falla, la columna se queda con la vista previa por
         género de siempre."""
         def worker():
-            from core.ftp_client import FTPClient as _FTPClient
-            own_ftp = _FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 ok, _msg = own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -5989,7 +5979,6 @@ class App(_AppBase):
 
     def _queue_worker(self):
         from concurrent.futures import ThreadPoolExecutor
-        from core.ftp_client import FTPClient as _FTPClient
 
         parallel   = max(1, min(5, int(self.config_data.get("ftp_parallel", 1))))
 
@@ -6035,7 +6024,7 @@ class App(_AppBase):
         pool = []
         connect_error = ""
         for _ in range(parallel):
-            c = _FTPClient()
+            c = self._new_ftp_client()
             ok, msg = c.connect(host, port, user, password, use_tls)
             if ok:
                 pool.append(c)
@@ -6541,6 +6530,34 @@ class App(_AppBase):
             e.grid(row=i, column=1, padx=10, pady=6, sticky="ew")
             self._amule_entries[key] = e
 
+    def _current_protocol_label(self) -> str:
+        guardado = self.config_data.get("ftp_protocol", "ftp")
+        if str(guardado).lower() == "sftp":
+            return PROTOCOL_LABELS["sftp"]
+        return PROTOCOL_LABELS["ftps" if self.config_data.get("ftp_use_tls") else "ftp"]
+
+    def _selected_protocol(self) -> tuple:
+        """(protocolo, usar_tls) según lo elegido en la pestaña de conexión."""
+        etiqueta = self._protocol_combo.get()
+        clave = next((k for k, v in PROTOCOL_LABELS.items() if v == etiqueta), "ftp")
+        return ("sftp" if clave == "sftp" else "ftp"), clave == "ftps"
+
+    def _on_protocol_changed(self, _etiqueta=None):
+        """Al cambiar de protocolo, propone su puerto estándar.
+
+        Solo si el puerto que hay es el de por defecto del otro protocolo: si
+        alguien tiene el suyo propio (un 2222, por ejemplo), no se le toca."""
+        from core.transfer import DEFAULT_PORTS, default_port
+        protocolo, _tls = self._selected_protocol()
+        entry = self._ftp_entries.get("ftp_port")
+        if entry is None:
+            return
+        actual = entry.get().strip()
+        if actual and actual not in {str(p) for p in DEFAULT_PORTS.values()}:
+            return
+        entry.delete(0, "end")
+        entry.insert(0, str(default_port(protocolo)))
+
     def _build_ftp_connection_tab(self, tab):
         scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         scroll.pack(fill="both", expand=True)
@@ -6564,10 +6581,16 @@ class App(_AppBase):
             e.insert(0, str(self.config_data.get(key, "")))
             e.grid(row=i, column=1, padx=10, pady=6, sticky="ew")
             self._ftp_entries[key] = e
-        self._tls_switch = ctk.CTkSwitch(conn, text="Usar FTP con TLS (FTPS)")
-        self._tls_switch.grid(row=5, column=0, columnspan=2, pady=6)
-        if self.config_data.get("ftp_use_tls"):
-            self._tls_switch.select()
+        # Un único selector en vez de un interruptor de TLS suelto: SFTP no es
+        # "FTP cifrado" sino otro protocolo (SSH), así que "SFTP + TLS" no
+        # significa nada. Con una sola lista no se puede elegir esa combinación.
+        ctk.CTkLabel(conn, text="Protocolo:").grid(
+            row=5, column=0, sticky="e", padx=10, pady=6)
+        self._protocol_combo = ctk.CTkComboBox(
+            conn, values=list(PROTOCOL_LABELS.values()), width=200, state="readonly",
+            command=self._on_protocol_changed)
+        self._protocol_combo.grid(row=5, column=1, sticky="w", padx=10, pady=6)
+        self._protocol_combo.set(self._current_protocol_label())
 
         # Subidas simultáneas
         ctk.CTkLabel(conn, text="Subidas simultáneas:").grid(
@@ -13281,8 +13304,7 @@ class App(_AppBase):
         self._missing_ep_path_lbl.configure(text="📁 Buscando la carpeta en el FTP...", text_color=PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -13346,8 +13368,7 @@ class App(_AppBase):
         token = self._missing_ep_poster_token
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -13422,8 +13443,7 @@ class App(_AppBase):
         self._set_status("Buscando la carpeta de la serie en el FTP...", PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -13565,8 +13585,7 @@ class App(_AppBase):
 
             ftp_filenames = []
             if self.config_data.get("ftp_host", ""):
-                from core.ftp_client import FTPClient as _FTPClient
-                own_ftp = _FTPClient()
+                own_ftp = self._new_ftp_client()
                 try:
                     own_ftp.connect(
                         self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
@@ -14005,8 +14024,7 @@ class App(_AppBase):
 
     def _resolve_missing_ep_series_path(self, r: dict):
         import types
-        from core.ftp_client import FTPClient
-        own_ftp = FTPClient()
+        own_ftp = self._new_ftp_client()
         ok, msg = own_ftp.connect(
             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -14056,8 +14074,7 @@ class App(_AppBase):
                          args=(r, ftp_path, size_bytes), daemon=True).start()
 
     def _delete_missing_ep_series_worker(self, r: dict, ftp_path: str, size_bytes: int):
-        from core.ftp_client import FTPClient
-        own_ftp = FTPClient()
+        own_ftp = self._new_ftp_client()
         ok, msg = own_ftp.connect(
             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -14615,10 +14632,9 @@ class App(_AppBase):
                 parallel = max(1, min(5, int(self.config_data.get("ftp_parallel", 1))))
                 if parallel > 1 and len(fallback_folders) > 1:
                     from concurrent.futures import ThreadPoolExecutor, as_completed
-                    from core.ftp_client import FTPClient as _FallbackFTPClient
 
                     def _list_folder_files(folder):
-                        worker_ftp = _FallbackFTPClient()
+                        worker_ftp = self._new_ftp_client()
                         ok, _ = worker_ftp.connect(
                             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
                             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -14710,8 +14726,7 @@ class App(_AppBase):
         # AutoWatcher y otras partes de la GUI; compartirla aquí bloquearía
         # esas subidas durante todo el escaneo, o peor, cruzaría respuestas
         # entre hilos (ver el candado _ftp_cmd_lock en las demás llamadas).
-        from core.ftp_client import FTPClient as _FTPClient
-        own_ftp = _FTPClient()
+        own_ftp = self._new_ftp_client()
         try:
             own_ftp.connect(
                 self.config_data.get("ftp_host", ""),
@@ -14789,8 +14804,7 @@ class App(_AppBase):
         if not new_expected:
             return result
 
-        from core.ftp_client import FTPClient as _FTPClient
-        own_ftp = _FTPClient()
+        own_ftp = self._new_ftp_client()
         try:
             own_ftp.connect(
                 self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
@@ -15156,10 +15170,7 @@ class App(_AppBase):
 
         for key, entry in self._ftp_entries.items():
             _set_entry(entry, self.config_data.get(key, ""))
-        if self.config_data.get("ftp_use_tls"):
-            self._tls_switch.select()
-        else:
-            self._tls_switch.deselect()
+        self._protocol_combo.set(self._current_protocol_label())
         self._ftp_parallel_combo.set(str(self.config_data.get("ftp_parallel", 1)))
         _set_entry(self._ftp_speed_entry, self.config_data.get("ftp_speed_limit", 0))
         _set_entry(self._ftp_retries_entry, self.config_data.get("ftp_retries", 3))
@@ -16300,7 +16311,7 @@ class App(_AppBase):
         patrón que el borrado de la herramienta de liberar espacio (ver
         _delete_cleanup_item): no se reutiliza self.ftp, que es el canal de
         control compartido. Se llama desde un hilo, nunca desde la interfaz."""
-        own_ftp = FTPClient()
+        own_ftp = self._new_ftp_client()
         ok, msg = own_ftp.connect(
             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -17516,8 +17527,7 @@ class App(_AppBase):
         self._detail_ftp_path_lbl.configure(text="📁 Buscando la carpeta en el FTP...", text_color=PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -17573,8 +17583,7 @@ class App(_AppBase):
         token = self._detail_ftp_token
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -17653,8 +17662,7 @@ class App(_AppBase):
         self._set_status("Buscando la carpeta en el FTP...", PENDING_COLOR)
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -18017,14 +18025,16 @@ class App(_AppBase):
         port = int(self._ftp_entries["ftp_port"].get() or 21)
         user = self._ftp_entries["ftp_user"].get().strip()
         pwd  = self._ftp_entries["ftp_password"].get()
-        tls  = self._tls_switch.get() in (True, "1", 1)
+        protocolo, tls = self._selected_protocol()
         self._ftp_status.configure(text="Conectando...", text_color=WARNING_COLOR)
         def worker():
             # Conexión propia y de usar y tirar -- solo para validar que
             # estas credenciales funcionan, NUNCA self.ftp (ver
             # _refresh_ftp_space): no hace falta dejarla abierta para nadie.
-            from core.ftp_client import FTPClient as _FTPClient
-            own_ftp = _FTPClient()
+            # Con el protocolo ELEGIDO en la pestaña, que puede no ser aún el
+            # guardado: probar la conexión antes de guardar es justo el caso.
+            from core.transfer import make_client
+            own_ftp = make_client(protocolo)
             ok, msg = own_ftp.connect(host, port, user, pwd, tls)
             own_ftp.disconnect()
             self.after(0, lambda: self._ftp_status.configure(
@@ -18253,7 +18263,8 @@ class App(_AppBase):
             "ftp_port":        int(self._ftp_entries["ftp_port"].get() or 21),
             "ftp_user":        self._ftp_entries["ftp_user"].get().strip(),
             "ftp_password":    self._ftp_entries["ftp_password"].get(),
-            "ftp_use_tls":     self._tls_switch.get() in (True, "1", 1),
+            "ftp_protocol":    self._selected_protocol()[0],
+            "ftp_use_tls":     self._selected_protocol()[1],
             "ftp_parallel":    parallel,
             "ftp_speed_limit": speed,
             "ftp_retries":     retries,
@@ -19510,8 +19521,7 @@ class App(_AppBase):
             self.after(0, lambda: self._set_status("Reintento cancelado", WARNING_COLOR))
             return
         try:
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             ok, msg = own_ftp.connect(
                 self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
                 self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -19991,7 +20001,6 @@ class App(_AppBase):
         compartida (subidas, refresco de espacio...)."""
         from core.cleanup_candidates import CleanupItem, merge_usage_entries
         from core.media_server_refresh import get_jellyfin_usage_stats, get_plex_usage_stats, parse_media_date
-        from core.ftp_client import FTPClient
 
         t0 = _time.monotonic()
         # Claves (nombre, tipo) en vez de solo nombre -- una serie y una
@@ -20036,7 +20045,7 @@ class App(_AppBase):
             _log.info("Liberar espacio: Plex -> %d elemento(s) en %.1fs",
                       len(stats), _time.monotonic() - t_px)
 
-        own_ftp = FTPClient()
+        own_ftp = self._new_ftp_client()
         ok, _msg = own_ftp.connect(
             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),
@@ -20836,8 +20845,7 @@ class App(_AppBase):
         token = self._cleanup_poster_token
 
         def worker():
-            from core.ftp_client import FTPClient
-            own_ftp = FTPClient()
+            own_ftp = self._new_ftp_client()
             try:
                 own_ftp.connect(
                     self.config_data.get("ftp_host", ""),
@@ -20978,8 +20986,7 @@ class App(_AppBase):
         threading.Thread(target=self._delete_cleanup_item_worker, args=(item, reason), daemon=True).start()
 
     def _delete_cleanup_item_worker(self, item, reason: str):
-        from core.ftp_client import FTPClient
-        own_ftp = FTPClient()
+        own_ftp = self._new_ftp_client()
         ok, msg = own_ftp.connect(
             self.config_data.get("ftp_host", ""), int(self.config_data.get("ftp_port", 21)),
             self.config_data.get("ftp_user", ""), self.config_data.get("ftp_password", ""),

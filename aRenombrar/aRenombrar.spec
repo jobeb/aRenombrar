@@ -24,7 +24,12 @@ datas = [
     ('jellyfin_logo.png', '.'),
 ]
 binaries = []
-hiddenimports = ['PIL._tkinter_finder']
+# paramiko (SFTP) se importa a propósito DENTRO de core/sftp_client.py, para
+# no cargar cryptography al arrancar si se usa FTP -- pero un import dentro de
+# una función no lo ve el analizador de PyInstaller, así que en el ejecutable
+# faltaría y SFTP fallaría solo en la versión instalada, no ejecutando el
+# código fuente.
+hiddenimports = ['PIL._tkinter_finder', 'paramiko']
 
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

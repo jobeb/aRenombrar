@@ -45,6 +45,11 @@ DEFAULTS = {
     # da ComicVine), año, y "#" + número con 2 dígitos.
     # Nombre: "Avatar - The Last Airbender - The Promise (2012) #01.cbr"
     "comic_template": "{serie} ({año}) #{episodio:02d}{ext}",
+    # "ftp" (con ftp_use_tls para FTPS explícito) o "sftp" (SSH, puerto 22).
+    # SFTP no es FTP cifrado sino otro protocolo distinto, ver
+    # core/sftp_client.py -- por eso es un ajuste aparte y no otro interruptor
+    # junto a ftp_use_tls.
+    "ftp_protocol": "ftp",
     "ftp_host": "",
     "ftp_port": 21,
     "ftp_user": "",

@@ -58,6 +58,8 @@ aRenombrar/
 │   ├── archive_extract.py # extract_archive() — .zip/.7z/.rar/.tar(+.gz/.bz2/.xz variants), zip-slip safe
 │   ├── renamer.py        # build_new_name(), rename_file(), is_video_file(), is_book_file(), is_archive_file()
 │   ├── ftp_client.py     # FTPClient — upload with progress, speed limit, resume
+│   ├── sftp_client.py    # SFTPClient — same public API over SSH (subclasses FTPClient)
+│   ├── transfer.py       # make_client() — the single place that picks FTP vs SFTP
 │   └── auto_watcher.py   # AutoWatcher — recursive folder polling thread; identifies video AND books/comics, optionally auto-extracts archives (see "auto_extract_archives" setting)
 └── gui/
     └── app.py          # entire UI in one App class (~2200 lines)
@@ -101,6 +103,46 @@ tkinter is not thread-safe. All GUI mutations from worker threads must be schedu
 - `config.json`, `session.json`, `upload_history.json`, `auto_processed.json`, `auto_watcher.log` all live directly in that folder.
 - The `Config` class merges saved values over `DEFAULTS` in `config.py` — add new settings to `DEFAULTS` first
 - FTP password is stored via `keyring` (Windows Credential Locker / macOS Keychain / whatever `keyring` resolves on Linux), never in `config.json` in plaintext.
+
+### FTP or SFTP
+
+`ftp_protocol` in config is either `"ftp"` (with `ftp_use_tls` for explicit FTPS)
+or `"sftp"`. SFTP is not "FTP with encryption" — it is a different protocol
+carried inside an SSH session, with no FTP commands and no separate data
+connection — so it gets its own client rather than another flag on the FTP one.
+Settings shows one combo (FTP / FTPS / SFTP) instead of a TLS switch, precisely
+so "SFTP + TLS" cannot be selected; changing it proposes that protocol's default
+port (21/22) unless the user set a custom one.
+
+`SFTPClient` **subclasses** `FTPClient` and overrides only what genuinely depends
+on the protocol: connect/disconnect, listing, stat, create/delete, and moving
+bytes. Everything else — path templates, tree walking, folder sizes, recursive
+delete, and the whole upload path (speed limit, progress, cancel/skip, final
+size verification) — is application logic and is inherited, so uploads behave
+identically over both. When touching `upload_file`, keep going through the
+`_store_stream`/`_delete_remote_file`/`_remove_remote_dir`/`get_remote_size`
+seams instead of reaching for `self.ftp` directly: `self.ftp` is `None` under
+SFTP, and a direct call there breaks SFTP silently (it already did once, for
+the resume check and the final size check).
+
+Free space is one place where SFTP is strictly better than FTP: instead of
+probing non-standard commands (AVBL/SITE AVAIL/XDISKFREE, none of which vsftpd
+answers), it uses the `statvfs@openssh.com` extension. paramiko exposes **no**
+statvfs method despite servers supporting it — `sftp.statvfs()` is just an
+`AttributeError` — so it is sent as a raw extended request and the eleven
+64-bit fields are unpacked by hand (`_statvfs_free`); use `f_bavail`, not
+`f_bfree`, or you report the root-reserved space as usable. The `df`-over-SSH
+fallback is mostly theoretical: SFTP-only accounts have no shell (the reference
+server answers "This service allows sftp connections only" to everything), which
+is why the output is validated as an actual df before being trusted.
+
+Nothing constructs a client directly — all ~50 call sites go through
+`App._new_ftp_client()` (which reads the setting) or `core/transfer.py::make_client()`.
+`AutoWatcher` receives it as its `ftp_factory`. `paramiko` is imported *inside*
+`connect()` so FTP users don't pay for loading `cryptography` at startup, which
+also means it must stay listed in `hiddenimports` in `aRenombrar.spec` — a
+function-level import is invisible to PyInstaller, and without it SFTP would
+fail only in the installed build, never when running from source.
 
 ### FTP encoding quirk
 

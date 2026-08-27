@@ -378,10 +378,10 @@ class FTPClient:
                 item_path = f"{path.rstrip('/')}/{name}"
                 if progress_cb:
                     progress_cb(item_path)
-                self.ftp.delete(item_path)
+                self._delete_remote_file(item_path)
             if progress_cb:
                 progress_cb(path)
-            self.ftp.rmd(path)
+            self._remove_remote_dir(path)
             return True, "Carpeta eliminada"
         except ftplib.all_errors as e:
             return False, str(e)
@@ -467,6 +467,30 @@ class FTPClient:
 
         return None
 
+    # ---------------------------------------------------------------------
+    # Primitivas de transporte. Son lo ÚNICO que cambia entre FTP y SFTP: el
+    # resto de la clase (recorrer carpetas, calcular tamaños, el límite de
+    # velocidad y el progreso de la subida, la verificación del tamaño final)
+    # es lógica de la aplicación y la comparten los dos, ver
+    # core/sftp_client.py.
+    # ---------------------------------------------------------------------
+
+    def _store_stream(self, fileobj, remote_file: str, blocksize: int,
+                      callback, resume_offset: int = 0):
+        """Vuelca *fileobj* (ya posicionado) en el archivo remoto, llamando a
+        *callback* con cada bloque enviado."""
+        if resume_offset > 0:
+            self.ftp.storbinary(f"STOR {remote_file}", fileobj, blocksize,
+                                callback, rest=resume_offset)
+        else:
+            self.ftp.storbinary(f"STOR {remote_file}", fileobj, blocksize, callback)
+
+    def _delete_remote_file(self, remote_file: str):
+        self.ftp.delete(remote_file)
+
+    def _remove_remote_dir(self, remote_dir: str):
+        self.ftp.rmd(remote_dir)
+
     def upload_file(
         self,
         local_path: str,
@@ -504,7 +528,9 @@ class FTPClient:
         resume_offset = 0
         if try_resume:
             try:
-                remote_size = self.ftp.size(remote_file)
+                # get_remote_size() y no self.ftp.size(): así la reanudación
+                # funciona igual por SFTP, donde no hay ningún self.ftp.
+                remote_size = self.get_remote_size(remote_file)
                 if remote_size is not None:
                     if remote_size >= total:
                         # Archivo ya completo en el servidor
@@ -613,9 +639,7 @@ class FTPClient:
                 with open(local_path, "rb") as f:
                     if resume_offset > 0:
                         f.seek(resume_offset)
-                        self.ftp.storbinary(f"STOR {remote_file}", f, BLOCKSIZE, callback, rest=resume_offset)
-                    else:
-                        self.ftp.storbinary(f"STOR {remote_file}", f, BLOCKSIZE, callback)
+                    self._store_stream(f, remote_file, BLOCKSIZE, callback, resume_offset)
             finally:
                 # Restaurar timeout original (o 30 s como valor seguro)
                 try:
@@ -630,10 +654,7 @@ class FTPClient:
             # claro...). Comparar el tamaño final contra el local antes de
             # dar la subida por buena -- si el servidor no soporta SIZE, se
             # omite el chequeo en vez de fallar (igual que get_free_space).
-            try:
-                final_size = self.ftp.size(remote_file)
-            except ftplib.all_errors:
-                final_size = None
+            final_size = self.get_remote_size(remote_file)
             if final_size is not None and final_size != total:
                 return False, (f"Subida incompleta: el servidor tiene {final_size} bytes, "
                                 f"se esperaban {total} (posible corte o corrupción)")

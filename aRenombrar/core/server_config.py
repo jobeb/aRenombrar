@@ -73,7 +73,7 @@ Categorías incluidas y por qué:
   en su propio equipo.
 
 Excluido a propósito, y por qué (configuración de CLIENTE):
-- ftp_host/ftp_port/ftp_user/ftp_password/ftp_use_tls/ftp_parallel/
+- ftp_protocol/ftp_host/ftp_port/ftp_user/ftp_password/ftp_use_tls/ftp_parallel/
   ftp_speed_limit/ftp_retries: toda la pestaña "Conexión FTP" -- hacen
   falta para conectar y descargar este mismo archivo (no se pueden
   autodescubrir), y además cada persona podría querer apuntar a un

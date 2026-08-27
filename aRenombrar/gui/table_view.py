@@ -168,6 +168,11 @@ class TableView(ctk.CTkFrame):
 
         self.page_size = self.DEFAULT_PAGE_ROWS
         self._row_stride_px = None   # alto medio medido por fila, ver note_rows_rendered
+        self._active_row = None      # fila resaltada con el teclado, ver _move_active_row
+        self._prev_row_bg = None     # su color de fondo original, para devolvérselo
+        self._active_index = None    # su posición, por si la lista se repinta entera
+        self._rows_clickable = None  # ¿las filas traen su propia selección? (ver _row_is_clickable)
+        self.on_row_activated = None # hook opcional: (indice, frame) al moverse
         self._resize_after_id = None
         self.on_page_size_changed = None   # callback opcional, ver enable_dynamic_page_size
         self.on_header_click = None   # callback opcional: ordenar por columna, ver set_sort_indicator
@@ -224,6 +229,13 @@ class TableView(ctk.CTkFrame):
     # Tecla -> (cuánto, unidad) para canvas.yview_scroll. "units" son líneas
     # sueltas (flechas) y "pages" pantallas enteras (AvPág/RePág); Inicio/Fin
     # se tratan aparte porque son yview_moveto, no un desplazamiento relativo.
+    #: alto de fila supuesto mientras no haya una medida real
+    DEFAULT_ROW_PX = 28
+
+    #: fondo de la fila activa -- el azul de acento del tema, que se ve
+    #: igual de bien en modo claro y en modo oscuro
+    _ACTIVE_ROW_COLOR = ("#3B8ED0", "#1F6AA5")
+
     _SCROLL_KEYS = {
         "Up":    (-3, "units"),
         "Down":  (3, "units"),
@@ -276,31 +288,206 @@ class TableView(ctk.CTkFrame):
         canvas = self._scroll_canvas()
         if canvas is None:
             return
-        # Si se está escribiendo, las flechas mueven el cursor de texto: no
-        # se tocan aunque el ratón esté encima de la tabla (real: el buscador
-        # de Historial está justo sobre su propia lista).
-        try:
-            focused = self.focus_get()
-        except Exception:
-            focused = None
-        if isinstance(focused, (tk.Entry, tk.Text, ctk.CTkEntry, ctk.CTkTextbox)):
-            return
         try:
             under_mouse = self.winfo_containing(event.x_root, event.y_root)
         except Exception:
             return
         if under_mouse is None or not self._is_inside(under_mouse, canvas):
             return
+        # Quien manda es la posición del ratón, NO el foco. Comprobar el foco
+        # rompía la función entera: en la aplicación real casi siempre lo tiene
+        # algún cuadro de texto (un buscador, la ficha de detalle...), así que
+        # las flechas no hacían nunca nada. La rueda del ratón se comporta
+        # igual, y aquí ya sabemos que el puntero está DENTRO de la tabla.
+        # Única excepción: un campo de texto dentro de la propia tabla, donde
+        # las flechas deben seguir moviendo el cursor de escritura.
+        try:
+            focused = self.focus_get()
+        except Exception:
+            focused = None
+        if (isinstance(focused, (tk.Entry, tk.Text, ctk.CTkEntry, ctk.CTkTextbox))
+                and self._is_inside(focused, canvas)):
+            return
+
+        rows = self._row_frames()
+        if rows:
+            self._move_active_row(canvas, rows, event.keysym)
+            return "break"
+        # Sin filas reconocibles (una lista que no se construya con un frame
+        # por fila): al menos desplazar la vista, que es mejor que nada.
         if canvas.yview() == (0.0, 1.0):
-            return   # todo cabe: no hay nada que desplazar
+            return
         if event.keysym == "Home":
             canvas.yview_moveto(0.0)
         elif event.keysym == "End":
             canvas.yview_moveto(1.0)
-        else:
+        elif event.keysym in ("Prior", "Next"):
             amount, what = self._SCROLL_KEYS[event.keysym]
             canvas.yview_scroll(amount, what)
+        else:
+            # OJO: NO usar yview_scroll(n, "units"). La unidad de un canvas de
+            # Tk es 1 píxel salvo que se configure yscrollincrement, así que
+            # una flecha movía la lista 1-2 px: se veía temblar la barra de
+            # desplazamiento y nada más.
+            total = max(1, self.body.winfo_reqheight())
+            fila = self._row_stride_px or self.DEFAULT_ROW_PX
+            paso = (1 if event.keysym == "Down" else -1) * fila / total
+            canvas.yview_moveto(max(0.0, canvas.yview()[0] + paso))
         return "break"
+
+    # --------------------------------------------------- fila activa ------
+    # Recorrer la lista con las flechas resaltando la fila, como en el
+    # Explorador de Windows. Se resuelve entero aquí para que funcione IGUAL
+    # en las nueve listas de la aplicación sin tocar ninguna: las filas se
+    # descubren solas mirando los hijos del cuerpo de la tabla, así que quien
+    # las construye (gui/app.py) no tiene que registrar nada.
+
+    def _row_frames(self) -> list:
+        """Los frames de fila, en el orden en que se ven.
+
+        Solo CTkFrame: en el cuerpo de una tabla puede haber además etiquetas
+        sueltas (el "no hay nada que mostrar", separadores...), y colarlas
+        como filas dejaba un hueco por el que el resaltado desaparecía."""
+        try:
+            return [w for w in self.body.pack_slaves()
+                    if isinstance(w, ctk.CTkFrame)]
+        except Exception:
+            return []
+
+    def _highlight_row(self, frame, on: bool):
+        """Pinta (o despinta) la fila activa.
+
+        Se cambia el COLOR DE FONDO, no el borde: un borde no se ve: las filas
+        empaquetan sus celdas con fill="both" y las celdas lo tapan por
+        completo (comprobado con una captura de pantalla, en el código parecía
+        correcto). El color anterior se guarda para devolvérselo al salir."""
+        try:
+            if on:
+                self._prev_row_bg = frame.cget("fg_color")
+                frame.configure(fg_color=self._ACTIVE_ROW_COLOR)
+            elif self._prev_row_bg is not None:
+                frame.configure(fg_color=self._prev_row_bg)
+        except Exception:
+            pass        # una fila que ya no existe
+
+    def _content_height(self, canvas) -> int:
+        """Alto TOTAL de lo que hay dentro del canvas, desplazado o no.
+
+        Se pregunta al propio canvas (bbox de su contenido) en vez de usar
+        body.winfo_reqheight(): no siempre coinciden, y usar el del body
+        dejaba la vista descuadrada -- con Inicio se quedaba a media lista en
+        vez de subir del todo."""
+        caja = canvas.bbox("all")
+        if caja:
+            return max(1, caja[3] - caja[1])
+        return max(1, self.body.winfo_reqheight())
+
+    def _rows_per_page(self, canvas) -> int:
+        """Cuántas filas caben a la vista (lo que salta AvPág/RePág)."""
+        fila = self._row_stride_px or self.DEFAULT_ROW_PX
+        return max(1, canvas.winfo_height() // max(1, fila))
+
+    def _ensure_row_visible(self, canvas, frame):
+        """Arrastra la vista lo justo para que la fila activa se vea entera.
+
+        Se mide con coordenadas de PANTALLA (winfo_rooty) porque son las
+        únicas que valen igual esté el contenido desplazado o no."""
+        total = self._content_height(canvas)
+        alto_visible = canvas.winfo_height()
+        desde_arriba = frame.winfo_rooty() - canvas.winfo_rooty()
+        desde_abajo = desde_arriba + frame.winfo_height() - alto_visible
+        actual = canvas.yview()[0]
+        if desde_arriba < 0:
+            canvas.yview_moveto(max(0.0, actual + desde_arriba / total))
+        elif desde_abajo > 0:
+            canvas.yview_moveto(max(0.0, actual + desde_abajo / total))
+
+    def _row_is_clickable(self, frame) -> bool:
+        """¿La fila responde al clic con su propia selección?
+
+        Se comprueba una vez por tabla. Las listas que ya gestionan selección
+        (Archivos y compañía) enganchan <Button-1> en el frame de la fila, y
+        ahí es donde vive TODO lo que hay que hacer al seleccionar: resaltarla,
+        cargar el panel de detalles de la derecha, actualizar la barra de
+        estado... Repetir eso aquí sería duplicarlo y quedarse corto."""
+        if self._rows_clickable is None:
+            self._rows_clickable = self._click_target(frame) is not None
+        return self._rows_clickable
+
+    @staticmethod
+    def _click_target(frame):
+        """El widget donde de verdad está enganchado el clic de la fila.
+
+        OJO: no es el frame. customtkinter redirige `CTkFrame.bind()` al
+        CTkCanvas con el que el frame se dibuja el fondo (`_canvas`), así que
+        preguntarle al frame por sus bindings devuelve None y generar el
+        evento sobre él no dispara nada -- parecía que las listas no tenían
+        selección cuando todas la tienen."""
+        canvas = getattr(frame, "_canvas", None)
+        try:
+            if canvas is not None and canvas.bind("<Button-1>"):
+                return canvas
+        except Exception:
+            pass
+        return None
+
+    def _activate_row(self, frame, anterior=None):
+        """Deja *frame* como fila seleccionada; *anterior* es la que lo era.
+
+        La anterior se recibe como parámetro y no se lee de self._active_row:
+        cuando se leía de ahí ya estaba reasignada, así que nunca se despintaba
+        ninguna y la lista se iba llenando de filas azules."""
+        if self._row_is_clickable(frame):
+            # Se simula el clic en vez de reimplementar la selección: así la
+            # flecha hace EXACTAMENTE lo mismo que pulsar la fila con el ratón
+            # (incluido cargar el panel de la derecha), y sigue haciéndolo si
+            # esa pestaña cambia lo que ocurre al seleccionar.
+            destino = self._click_target(frame)
+            if destino is not None:
+                destino.event_generate("<Button-1>", x=5, y=5)
+                return
+        # Listas sin selección propia (solo se consultan): al menos marcar por
+        # dónde va uno.
+        if anterior is not None and anterior is not frame:
+            self._highlight_row(anterior, False)
+        self._highlight_row(frame, True)
+
+    def _move_active_row(self, canvas, rows: list, keysym: str):
+        actual = rows.index(self._active_row) if self._active_row in rows else None
+        if actual is None and self._active_index is not None:
+            # La lista se ha repintado entera (ordenar, filtrar, seleccionar...)
+            # y los frames de antes ya no existen: se sigue por donde se iba,
+            # que si no la flecha volvía a saltar a la primera fila.
+            actual = min(self._active_index, len(rows) - 1)
+
+        por_pagina = self._rows_per_page(canvas)
+        if actual is None:
+            nuevo = 0 if keysym in ("Down", "Next", "Home") else len(rows) - 1
+        elif keysym == "Home":
+            nuevo = 0
+        elif keysym == "End":
+            nuevo = len(rows) - 1
+        else:
+            saltos = {"Down": 1, "Up": -1, "Next": por_pagina, "Prior": -por_pagina}
+            nuevo = actual + saltos[keysym]
+        nuevo = max(0, min(len(rows) - 1, nuevo))
+        if nuevo == actual:
+            return                      # ya se estaba en el extremo
+
+        anterior = self._active_row
+        self._active_index = nuevo
+        self._active_row = rows[nuevo]
+        self._activate_row(self._active_row, anterior)
+
+        # Seleccionar puede reconstruir la lista entera, así que la fila se
+        # vuelve a buscar por posición antes de arrastrar la vista hasta ella.
+        self.update_idletasks()
+        rows = self._row_frames()
+        if nuevo < len(rows):
+            self._active_row = rows[nuevo]
+            self._ensure_row_visible(canvas, self._active_row)
+        if self.on_row_activated:
+            self.on_row_activated(nuevo, self._active_row)
 
     # ------------------------------------------------------------ anchos --
 
