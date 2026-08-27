@@ -54,6 +54,7 @@ class SFTPClient(FTPClient):
         except ImportError:
             return False, ("Falta la biblioteca paramiko, necesaria para SFTP. "
                            "Instálala con: pip install paramiko")
+        _permitir_nombres_no_utf8()
         try:
             self.host = host
             self.port = int(port) or DEFAULT_SFTP_PORT
@@ -396,6 +397,40 @@ class SFTPClient(FTPClient):
             return False, f"Error de archivo: {e}"
         except Exception as e:
             return False, f"Error SFTP: {self._explain(e)}"
+
+
+def _permitir_nombres_no_utf8():
+    """Que un nombre de archivo raro no tire abajo la carpeta entera.
+
+    paramiko decodifica en UTF-8 ESTRICTO todo el texto que llega del
+    servidor, nombres de archivo incluidos. Un servidor con archivos
+    antiguos en latin-1 -- una "ñ" es ahí el byte 0xf1, que no es UTF-8
+    válido -- hace saltar UnicodeDecodeError, y eso no se lleva por delante
+    solo ese nombre: se lleva el LISTADO ENTERO de la carpeta. La aplicación
+    la ve vacía y actúa como si no hubiera nada, así que no encuentra la
+    carpeta de la serie, no detecta duplicados y no ve los episodios que ya
+    están subidos. Pasa de verdad, y sin ningún error a la vista.
+
+    Es el mismo compromiso que ya hacía el cliente FTP en
+    FTPClient._retrlines_lenient (ver ahí): el nombre problemático sale con
+    un "?" en el carácter que no se pudo decodificar, pero el resto de la
+    carpeta se lee entero, y el patrón NxNN de temporada/episodio -- que no
+    lleva acentos -- se mantiene intacto para poder seguir analizándolo.
+
+    Se parchea paramiko.message y no paramiko.util porque el primero importa
+    `u` directamente, así que cambiar el segundo no le afectaría."""
+    import paramiko.message as _message
+    if getattr(_message, "_arenombrar_utf8_indulgente", False):
+        return
+    original = _message.u
+
+    def _u_indulgente(s, encoding="utf8"):
+        if isinstance(s, bytes):
+            return s.decode(encoding, "replace")
+        return original(s, encoding)
+
+    _message.u = _u_indulgente
+    _message._arenombrar_utf8_indulgente = True
 
 
 def _shell_quote(path: str) -> str:

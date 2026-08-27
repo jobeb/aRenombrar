@@ -423,3 +423,44 @@ def test_sin_extension_y_sin_shell_devuelve_nada(cliente):
     _con_statvfs(cliente, revienta=True)
     cliente._ssh = None
     assert cliente.get_free_space("/datos2") is None
+
+
+# ----------------------------------------------- nombres que no son UTF-8 --
+
+def test_un_nombre_en_latin1_no_tira_abajo_la_carpeta_entera():
+    """Caso real: una sola carpeta llamada "El Sueño Producciones" con la eñe
+    en latin-1 (byte 0xf1) hacía que paramiko lanzara UnicodeDecodeError y se
+    perdieran las 97 entradas de la carpeta. La aplicación la veía vacía y
+    actuaba en consecuencia: no encontraba la carpeta de la serie, no
+    detectaba duplicados y no veía los episodios ya subidos, todo ello sin un
+    solo error a la vista."""
+    pytest.importorskip("paramiko")
+    import paramiko.message as msg
+    from core.sftp_client import _permitir_nombres_no_utf8
+
+    _permitir_nombres_no_utf8()
+    nombre = msg.u(b"El Sue\xf1o Producciones")     # antes: UnicodeDecodeError
+    assert nombre.startswith("El Sue") and nombre.endswith(" Producciones")
+
+
+def test_los_nombres_normales_se_leen_igual_que_siempre():
+    pytest.importorskip("paramiko")
+    import paramiko.message as msg
+    from core.sftp_client import _permitir_nombres_no_utf8
+
+    _permitir_nombres_no_utf8()
+    assert msg.u("Películas".encode("utf-8")) == "Películas"
+    assert msg.u("ya es texto") == "ya es texto"
+
+
+def test_el_parche_no_se_encadena_sobre_si_mismo():
+    """Se llama en cada connect(), y hay medio centenar de conexiones."""
+    pytest.importorskip("paramiko")
+    import paramiko.message as msg
+    from core.sftp_client import _permitir_nombres_no_utf8
+
+    _permitir_nombres_no_utf8()
+    primera = msg.u
+    for _ in range(5):
+        _permitir_nombres_no_utf8()
+    assert msg.u is primera

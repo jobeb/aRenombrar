@@ -2524,6 +2524,7 @@ class App(_AppBase):
             ColumnSpec("logo", "", width=24, hideable=False),
             ColumnSpec("fav", "", width=28, hideable=False),
             ColumnSpec("lock", "", width=28, hideable=False),
+            ColumnSpec("auto", "", width=28, hideable=False),
             ColumnSpec("btns", "", width=28 * 3 + 6, hideable=False),
         ], header_right_pad=16,   # ver TableView.__init__ -- medido a mano contra esta tabla en concreto
         on_visibility_changed=self._on_file_table_visibility_changed)
@@ -2544,6 +2545,11 @@ class App(_AppBase):
             "<Configure>", self._on_table_resize, add="+")
         self._file_table.enable_dynamic_page_size(lambda _size: self._refresh_table())
         self._file_rows = []
+        # tmdb_id -> [etiquetas "⚡" de la tabla de Archivos]. Es una LISTA y no
+        # un widget suelto (como en Episodios que faltan) porque aquí puede
+        # haber varios archivos de la misma serie a la vez, y al activar el
+        # autocompletado tienen que encenderse todos.
+        self._file_auto_widgets = {}
         self._files_page = 0
         self._table_resize_debounce_id = None   # ver _on_table_resize
         self._files_sort_key, self._files_sort_asc = self._saved_table_sort(
@@ -11913,10 +11919,34 @@ class App(_AppBase):
         if new_state:
             threading.Thread(target=self._auto_complete_pass, daemon=True).start()
 
+    @staticmethod
+    def _entry_series_tmdb_id(entry):
+        """El tmdb_id de la SERIE de este archivo, o None si no procede.
+
+        El autocompletado busca capítulos que falten, así que solo tiene
+        sentido en series ya identificadas: una película no tiene capítulos y
+        un archivo sin identificar todavía no se sabe de qué serie es."""
+        info = getattr(entry, "media_info", None)
+        if info is None or getattr(info, "media_type", "") not in ("tv", "anime"):
+            return None
+        tid = getattr(info, "tmdb_id", None)
+        return int(tid) if tid else None
+
     def _refresh_missing_ep_auto_button(self, tmdb_id: int, active: bool):
+        """Pone al día TODOS los rayos de esa serie, estén donde estén.
+
+        El mismo interruptor se ve en "Episodios que faltan", en "Películas" y
+        (una vez por archivo) en "Archivos", así que activarlo en cualquiera
+        de los sitios tiene que encenderlos todos."""
+        color = ACCENT if active else PENDING_COLOR
         btn = self._missing_ep_auto_widgets.get(tmdb_id)
         if btn is not None:
-            btn.configure(text_color=ACCENT if active else PENDING_COLOR)
+            btn.configure(text_color=color)
+        for lbl in self._file_auto_widgets.get(tmdb_id, []):
+            try:
+                lbl.configure(text_color=color)
+            except Exception:
+                pass        # una fila que ya se repintó y no existe
 
     def _start_missing_ep_auto_worker(self):
         """Hilo daemon que recorre las series con autocompletado: arranca al
@@ -15767,6 +15797,7 @@ class App(_AppBase):
                     except Exception:
                         pass
         self._file_rows.clear()
+        self._file_auto_widgets.clear()
         if not self.files:
             self._drop_zone.pack(pady=40)
             self._files_page_lbl.configure(text="")
@@ -15975,6 +16006,30 @@ class App(_AppBase):
                 if self._entry_is_reserved(e) else
                 "Reservar: lo protege del borrado para todos, no solo para ti. Ocupa cuota."))
             lock_btn.pack(fill="both", expand=True)
+
+            # Autocompletar la serie (⚡) -- mismo interruptor que el de
+            # "Episodios que faltan": marca la serie para que se vayan
+            # descargando solos los capítulos que salgan. Aquí resulta natural
+            # porque es donde se está viendo el archivo de esa serie, sin
+            # tener que ir a buscarla a la otra pestaña.
+            # CTkLabel + bind y no CTkButton, igual que ★/🔒 en las otras
+            # tablas: un botón transparente deja un marco visible alrededor.
+            c = self._file_table.cell(rf, "auto", pady=2); cells.append(c)
+            auto_tid = self._entry_series_tmdb_id(entry)
+            if auto_tid is not None:
+                auto_on = self._is_missing_ep_auto_enabled(auto_tid)
+                auto_btn = ctk.CTkLabel(
+                    c, text="⚡", cursor="hand2",
+                    text_color=ACCENT if auto_on else PENDING_COLOR)
+                auto_btn.pack(fill="both", expand=True)
+                auto_btn.bind("<Button-1>", lambda ev, tid=auto_tid:
+                              self._toggle_missing_ep_auto_complete(tid))
+                attach_tooltip(auto_btn, lambda tid=auto_tid: self._auto_btn_tooltip(tid))
+                self._file_auto_widgets.setdefault(auto_tid, []).append(auto_btn)
+            else:
+                # Ni series sin identificar ni películas/libros: la celda se
+                # pinta igualmente para que las columnas sigan cuadrando.
+                ctk.CTkLabel(c, text="").pack(fill="both", expand=True)
 
             # Los tres botones de acción comparten una única celda ("btns",
             # ancha 28*3+6) -- dentro de ella siguen empaquetándose en
