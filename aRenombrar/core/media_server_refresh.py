@@ -22,7 +22,7 @@ from plexapi.server import PlexServer
 
 from core.applog import get_logger
 
-_log = get_logger("aRenombrar.media_refresh", "media_refresh.log")
+_log = get_logger("aIBechos.media_refresh", "media_refresh.log")
 
 
 class _ItemNotFoundSentinel:
@@ -1096,7 +1096,7 @@ def verify_jellyfin_password(host: str, username: str, password: str, timeout: i
     try:
         resp = requests.post(
             f"{base}/Users/AuthenticateByName",
-            headers={"Authorization": 'MediaBrowser Client="aRenombrar", Device="aRenombrar", '
+            headers={"Authorization": 'MediaBrowser Client="aIBechos", Device="aIBechos", '
                                       'DeviceId="arenombrar-watch-sync", Version="1.0.0"'},
             json={"Username": username, "Pw": password},
             timeout=timeout,

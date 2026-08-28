@@ -1,5 +1,5 @@
 """
-Crea un acceso directo de aRenombrar en el Escritorio.
+Crea un acceso directo de aIBechos en el Escritorio.
 Funciona en Windows sin necesidad de PowerShell.
 """
 import os
@@ -31,7 +31,7 @@ def create_shortcut():
     script_dir = Path(__file__).parent.resolve()
     python_exe = find_python()
     desktop = get_desktop()
-    shortcut_path = desktop / "aRenombrar.lnk"
+    shortcut_path = desktop / "aIBechos.lnk"
 
     try:
         import pythoncom
@@ -39,7 +39,7 @@ def create_shortcut():
         import win32com.client
     except ImportError:
         # pywin32 no está instalado: crear un .bat en el escritorio como alternativa
-        bat_path = desktop / "aRenombrar.bat"
+        bat_path = desktop / "aIBechos.bat"
         bat_path.write_text(
             f'@echo off\ncd /d "{script_dir}"\n"{python_exe}" main.py\n',
             encoding="utf-8"
@@ -52,7 +52,7 @@ def create_shortcut():
     shortcut.TargetPath = python_exe
     shortcut.Arguments = f'"{script_dir / "main.py"}"'
     shortcut.WorkingDirectory = str(script_dir)
-    shortcut.Description = "aRenombrar - Renombrador de series y películas"
+    shortcut.Description = "aIBechos - Renombrador de series y películas"
     icon_path = script_dir / "iconoPrincipal.ico"
     if icon_path.exists():
         shortcut.IconLocation = str(icon_path)

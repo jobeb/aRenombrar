@@ -108,7 +108,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='aRenombrar',
+    name='aIBechos',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -128,7 +128,7 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='aRenombrar',
+    name='aIBechos',
 )
 
 # Sin este bloque, en macOS PyInstaller deja una carpeta con un ejecutable
@@ -137,9 +137,9 @@ coll = COLLECT(
 if _is_macos:
     app = BUNDLE(
         coll,
-        name='aRenombrar.app',
+        name='aIBechos.app',
         icon='iconoPrincipal.icns',
-        bundle_identifier='com.arenombrar.app',
+        bundle_identifier='com.aibechos.app',
         info_plist={
             'NSHighResolutionCapable': True,
             'CFBundleShortVersionString': _app_version,

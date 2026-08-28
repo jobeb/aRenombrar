@@ -1,6 +1,6 @@
 """
 Recuento y tamaño por categoría, compartido entre todos los clientes de
-aRenombrar que apuntan al mismo servidor FTP -- mismo patrón que
+aIBechos que apuntan al mismo servidor FTP -- mismo patrón que
 core/upload_stats.py, pero acumulado por CARPETA de nivel superior (una
 serie o película completa), no por persona.
 

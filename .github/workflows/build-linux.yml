@@ -29,9 +29,9 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: Empaquetar en tar.gz
         run: |
-          cp aRenombrar.desktop IconoSinFondo.png dist/aRenombrar/
-          tar -C dist -czf "aRenombrar_${{ steps.version.outputs.version }}_linux.tar.gz" aRenombrar
+          cp aRenombrar.desktop IconoSinFondo.png dist/aIBechos/
+          tar -C dist -czf "aIBechos_${{ steps.version.outputs.version }}_linux.tar.gz" aIBechos
       - uses: actions/upload-artifact@v4
         with:
-          name: aRenombrar-linux
-          path: aRenombrar/aRenombrar_${{ steps.version.outputs.version }}_linux.tar.gz
+          name: aIBechos-linux
+          path: aRenombrar/aIBechos_${{ steps.version.outputs.version }}_linux.tar.gz

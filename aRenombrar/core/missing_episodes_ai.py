@@ -19,7 +19,7 @@ import requests
 from core.ai_title_fallback import GROQ_URL, DEFAULT_MODEL
 from core.applog import get_logger
 
-_log = get_logger("aRenombrar.missing_episodes_ai", "ai_fallback.log")
+_log = get_logger("aIBechos.missing_episodes_ai", "ai_fallback.log")
 
 # Modelo usado SOLO para la pregunta de doblaje castellano
 # (check_spanish_dub=True), en vez de DEFAULT_MODEL -- probado en vivo

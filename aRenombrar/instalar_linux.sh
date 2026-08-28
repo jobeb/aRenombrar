@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 echo "============================================"
-echo "  aRenombrar - Instalador Linux"
+echo "  aIBechos - Instalador Linux"
 echo "============================================"
 echo
 

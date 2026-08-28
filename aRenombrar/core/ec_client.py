@@ -122,7 +122,7 @@ _SEARCH_TYPE_MAP = {
     "web": EC_SEARCH_WEB,
 }
 
-_CLIENT_NAME = "aRenombrar"
+_CLIENT_NAME = "aIBechos"
 _CLIENT_VERSION = "1.0"
 
 

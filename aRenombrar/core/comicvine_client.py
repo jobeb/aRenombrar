@@ -1,6 +1,6 @@
 """
 ComicVine API client -- identifica cómics/manga escaneados (cbz, cbr) para
-aRenombrar. A diferencia de Google Books (core/book_client.py), ComicVine
+aIBechos. A diferencia de Google Books (core/book_client.py), ComicVine
 SIEMPRE exige: una api_key válida (401 sin ella), format=json explícito
 (su formato por defecto es XML) y un User-Agent que no sea el genérico de
 requests (lo rechaza). Cuota mucho más ajustada que TMDB -- se limita de
@@ -19,7 +19,7 @@ from core.applog import get_logger
 
 COMICVINE_BASE = "https://comicvine.gamespot.com/api"
 
-_log = get_logger("aRenombrar.comicvine", "app.log")
+_log = get_logger("aIBechos.comicvine", "app.log")
 
 
 class ComicVineClient:
@@ -45,7 +45,7 @@ class ComicVineClient:
         self.session = requests.Session()
         # ComicVine bloquea el User-Agent por defecto de requests
         # ("python-requests/x.x") -- exige uno que identifique la app.
-        self.session.headers["User-Agent"] = "aRenombrar/1.0 (+https://github.com/)"
+        self.session.headers["User-Agent"] = "aIBechos/1.0 (+https://github.com/)"
         self._request_times: deque = deque()
         self._rate_lock = threading.Lock()
 

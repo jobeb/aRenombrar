@@ -23,7 +23,7 @@ aRenombrar/macos_dl/
 aRenombrar/.deps_installed
 
 # Config local (contiene contraseñas FTP y API keys)
-# El archivo real vive en %APPDATA%\aRenombrar\config.json
+# El archivo real vive en %APPDATA%\aIBechos\config.json
 aRenombrar/auto_processed.json
 
 # Entornos virtuales

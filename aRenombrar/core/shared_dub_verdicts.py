@@ -1,7 +1,7 @@
 """
 Veredictos de doblaje castellano (solo los obtenidos por IA, ver
 gui/app.py::_ask_ai_about_current_missing_ep_show) compartidos entre todos
-los clientes de aRenombrar que apuntan al mismo servidor FTP -- mismo
+los clientes de aIBechos que apuntan al mismo servidor FTP -- mismo
 motivo y mismo patrón que core/favorites.py/core/reservations.py: este
 módulo solo tiene el mirror local en disco y la función pura para fijar el
 veredicto de una serie, sin tocar la red (ver gui/app.py para la

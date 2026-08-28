@@ -13,7 +13,7 @@ motivo (cierre normal, cuelgue, kill de la tarea) — no puede quedar un
 bloqueo "fantasma" que impida arrancar la app tras un cierre anómalo.
 """
 
-from core.appdirs import app_data_dir, is_windows
+from core.appdirs import APP_NAME, app_data_dir, is_windows
 
 # Referencia global al fichero abierto: si se recolectara (garbage
 # collection), el SO liberaría el bloqueo antes de tiempo.
@@ -25,7 +25,7 @@ def acquire() -> bool:
     True si se consiguió (esta es la única instancia corriendo).
     False si ya hay otra instancia con el bloqueo tomado."""
     global _lock_file
-    lock_path = app_data_dir() / "aRenombrar.lock"
+    lock_path = app_data_dir() / f"{APP_NAME}.lock"
     try:
         _lock_file = open(lock_path, "a+")
         if is_windows():

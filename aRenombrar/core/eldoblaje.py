@@ -23,7 +23,7 @@ import requests
 
 from core.applog import get_logger
 
-_log = get_logger("aRenombrar.eldoblaje", "ai_fallback.log")
+_log = get_logger("aIBechos.eldoblaje", "ai_fallback.log")
 
 _BASE = "https://www.eldoblaje.com/datos"
 

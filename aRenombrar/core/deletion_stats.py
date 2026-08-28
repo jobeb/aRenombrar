@@ -1,6 +1,6 @@
 """
 Ranking de borrados por usuario ("Liberar espacio"), compartido entre
-todos los clientes de aRenombrar que apuntan al mismo servidor FTP --
+todos los clientes de aIBechos que apuntan al mismo servidor FTP --
 mismo patrón que core/upload_stats.py, mismo motivo (mirror local en
 disco + función pura para sumar un borrado, sin tocar la red -- ver
 gui/app.py para la sincronización real).

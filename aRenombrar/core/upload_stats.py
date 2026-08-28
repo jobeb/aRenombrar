@@ -1,12 +1,12 @@
 """
 Ranking de subidas por usuario, compartido entre todos los clientes de
-aRenombrar que apuntan al mismo servidor FTP -- mismo motivo y mismo
+aIBechos que apuntan al mismo servidor FTP -- mismo motivo y mismo
 patrón que core/favorites.py/core/shared_dub_verdicts.py: este módulo
 solo tiene el mirror local en disco y la función pura para sumar una
 subida, sin tocar la red (ver gui/app.py para la sincronización real).
 
 Deliberadamente NO es lo mismo que el historial de actividad compartido
-(aRenombrar_actividad.json, ver gui/app.py) -- ese guarda solo los
+(aIBechos_actividad.json, ver gui/app.py) -- ese guarda solo los
 últimos 500 registros (los antiguos se descartan), válido para "actividad
 reciente" pero no para un ranking que de verdad importe a largo plazo: si
 alguien lleva meses subiendo, su aportación de hace tres meses no debe

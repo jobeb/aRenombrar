@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   aRenombrar - Instalador Windows
+echo   aIBechos - Instalador Windows
 echo ============================================
 echo.
 

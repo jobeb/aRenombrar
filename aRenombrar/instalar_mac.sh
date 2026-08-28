@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 echo "============================================"
-echo "  aRenombrar - Instalador macOS"
+echo "  aIBechos - Instalador macOS"
 echo "============================================"
 echo
 

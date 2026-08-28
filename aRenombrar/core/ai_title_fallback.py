@@ -38,7 +38,7 @@ SYSTEM_PROMPT = (
 # fichero lo usan también eldoblaje.py y missing_episodes_ai.py, y un handler
 # por módulo impide que el fichero rote en Windows (os.rename sobre un fichero
 # que otro handler tiene abierto = WinError 32, ver core/applog.py).
-_log = get_logger("aRenombrar.ai_fallback", "ai_fallback.log")
+_log = get_logger("aIBechos.ai_fallback", "ai_fallback.log")
 
 
 def guess_title_via_ai(stem: str, api_key: str, model: str = DEFAULT_MODEL,

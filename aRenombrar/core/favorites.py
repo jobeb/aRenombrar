@@ -1,5 +1,5 @@
 """
-Favoritos compartidos entre todos los clientes de aRenombrar que apuntan al
+Favoritos compartidos entre todos los clientes de aIBechos que apuntan al
 mismo servidor FTP (ver gui/app.py para la sincronización real -- este
 módulo solo tiene el mirror local en disco y las funciones puras de
 add/remove/is_favorite, sin tocar la red).

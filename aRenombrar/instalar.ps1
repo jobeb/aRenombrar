@@ -1,8 +1,8 @@
-# aRenombrar - Instalador PowerShell
+# aIBechos - Instalador PowerShell
 # Ejecutar con: powershell -ExecutionPolicy Bypass -File instalar.ps1
 
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  aRenombrar - Instalador Windows" -ForegroundColor Cyan
+Write-Host "  aIBechos - Instalador Windows" -ForegroundColor Cyan
 Write-Host "============================================`n"
 
 # Buscar Python: comando py, python, o ruta directa en AppData/Program Files
@@ -63,7 +63,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Write-Host "Creando acceso directo en el Escritorio..." -ForegroundColor Yellow
 try {
     $desktopPath = [System.Environment]::GetFolderPath("Desktop")
-    $shortcutPath = Join-Path $desktopPath "aRenombrar.lnk"
+    $shortcutPath = Join-Path $desktopPath "aIBechos.lnk"
 
     # Resolver ruta absoluta del ejecutable Python
     $pythonExe = (Get-Command $python -ErrorAction SilentlyContinue)?.Source
@@ -74,7 +74,7 @@ try {
     $Shortcut.TargetPath    = $pythonExe
     $Shortcut.Arguments     = "`"$scriptDir\main.py`""
     $Shortcut.WorkingDirectory = $scriptDir
-    $Shortcut.Description   = "aRenombrar - Renombrador de series y películas"
+    $Shortcut.Description   = "aIBechos - Renombrador de series y películas"
     $iconPath = Join-Path $scriptDir "iconoPrincipal.ico"
     if (Test-Path $iconPath) {
         $Shortcut.IconLocation = "$iconPath,0"

@@ -7,17 +7,28 @@ from pathlib import Path
 
 import keyring
 
-from core.appdirs import APP_NAME, app_data_dir
+from core.appdirs import APP_NAME, LEGACY_APP_NAME, app_data_dir
 
 # Claves que se guardan en el almacén de credenciales del sistema (keyring)
 # en vez de en config.json en texto plano. El nombre de la clave en config
 # y en keyring es el mismo en los cuatro casos.
 _KEYRING_KEYS = ("ftp_password", "ai_api_key", "plex_token", "jellyfin_api_key")
 
+# Marcas internas de "esta migración ya se hizo". SÍ se guardan en config.json
+# (si no, la migración se repetiría en cada arranque), pero NO deben viajar al
+# exportar la configuración: llevarlas a otro equipo le haría saltarse una
+# migración que allí no se ha hecho nunca, y ese equipo se quedaría sin
+# contraseña o sin sus datos compartidos sin motivo aparente.
+INTERNAL_FLAGS = (
+    "_keyring_service_migrated",
+    "_shared_data_migrated",
+    "_autostart_identity_migrated",
+)
+
 # Versión del FORMATO de exportación/importación de configuración (gui/app.py
 # ::_export_config/_import_config) -- distinta de la versión de la app
 # (core/version.py): esta solo sube cuando cambia la ESTRUCTURA del archivo
-# exportado de forma que una versión más vieja de aRenombrar no sepa
+# exportado de forma que una versión más vieja de aIBechos no sepa
 # interpretarla correctamente (p.ej. una clave que cambia de significado o
 # se divide en varias) -- añadir una clave nueva opcional NO cuenta, eso ya
 # lo absorbe set_many() sin problema.
@@ -153,7 +164,7 @@ DEFAULTS = {
     # deshabilitados (solo mirror local, sin sincronizar).
     "shared_data_ftp_path": "",
     # Nombre que identifica a esta persona frente a las demás que usan
-    # aRenombrar contra el mismo servidor -- clave de su cuota individual
+    # aIBechos contra el mismo servidor -- clave de su cuota individual
     # de 100GB en "Liberar espacio" (ver core/reservations.py). Vacío =
     # no puede reservar espacio todavía (hace falta para saber a quién
     # cargarle la cuota).
@@ -316,6 +327,14 @@ class Config:
             if old_links and self._data.get("custom_links_episode") == DEFAULTS["custom_links_episode"]:
                 self._data["custom_links_episode"] = old_links
 
+        # Traer las credenciales de cuando la aplicación se llamaba de otra
+        # forma: el llavero del sistema las guarda bajo AQUEL nombre, así que
+        # sin esto el usuario se quedaría sin contraseña del servidor nada más
+        # actualizar. Va ANTES del bloque de abajo para que su lectura final
+        # (_get_keyring) ya encuentre lo que se acaba de copiar.
+        if "_keyring_service_migrated" not in self._data:
+            self._migrate_keyring_service()
+
         # Migrar credenciales de versiones anteriores (guardadas en texto
         # plano en config.json, p.ej. por edición manual o versiones
         # antiguas) al almacén de credenciales del sistema, y no dejar
@@ -334,6 +353,36 @@ class Config:
         # (aunque esté vacío a propósito) no se vuelve a tocar.
         if "ftp_categories" not in self._data:
             self._migrate_ftp_categories()
+
+    def _migrate_keyring_service(self):
+        """Trae las credenciales del llavero guardadas con el nombre antiguo.
+
+        Se hace UNA sola vez y queda anotado en config.json. La marca importa
+        sobre todo en macOS: al cambiar el identificador de la aplicación, el
+        Llavero pide permiso ("aIBechos quiere usar información guardada por
+        aIBechos"), y si el usuario dice que no, sin la marca volvería a
+        preguntar en cada arranque.
+
+        Cada clave va por su cuenta: que una falle o se deniegue no impide
+        traer las demás. Lo que no se pueda traer se queda vacío y el usuario
+        vuelve a escribirlo, igual que ya pasaba cuando no hay llavero."""
+        for key in _KEYRING_KEYS:
+            try:
+                anterior = keyring.get_password(LEGACY_APP_NAME, key)
+            except Exception:
+                continue
+            if not anterior:
+                continue
+            try:
+                keyring.set_password(APP_NAME, key, anterior)
+            except Exception:
+                continue      # no se pudo escribir: se deja donde estaba
+            try:
+                keyring.delete_password(LEGACY_APP_NAME, key)
+            except Exception:
+                pass          # limpiar el rastro es deseable, no imprescindible
+        self._data["_keyring_service_migrated"] = True
+        self.save()
 
     def _migrate_ftp_categories(self):
         from core.ftp_categories import build_wildcard_category

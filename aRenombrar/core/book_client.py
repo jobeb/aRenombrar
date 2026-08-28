@@ -1,6 +1,6 @@
 """
 Google Books API client -- identifica ebooks de texto (pdf, epub, mobi,
-azw3) para aRenombrar, igual que TMDBClient identifica series/películas.
+azw3) para aIBechos, igual que TMDBClient identifica series/películas.
 
 No hace falta API key para búsquedas básicas -- PERO, a diferencia de lo
 que se pensó al principio, la cuota anónima NO es "de sobra": Google la

@@ -1,5 +1,5 @@
 """
-Ventana principal de aRenombrar.
+Ventana principal de aIBechos.
 Tabs: Archivos | FTP | Configuracion
 Sin ventanas emergentes: todo integrado en la ventana principal.
 Progreso FTP integrado como columnas en la lista de archivos.
@@ -35,7 +35,7 @@ try:
 except ImportError:
     _DND_AVAILABLE = False
 
-from config import Config, CONFIG_EXPORT_SCHEMA_VERSION
+from config import Config, CONFIG_EXPORT_SCHEMA_VERSION, INTERNAL_FLAGS
 from core.api_client import TMDBClient, detect_episode, MediaInfo, TMDB_IMAGE
 from core.book_client import GoogleBooksClient
 from core.comicvine_client import ComicVineClient
@@ -46,6 +46,7 @@ from core.kitsu_client import KitsuClient
 from core.renamer import (build_new_name, rename_file, is_video_file, is_book_file,
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
+from core import shared_data
 from core.amule_client import AmuleSearchResult
 from core.ec_client import EcClient, EcConnectionError, EcAuthError, EcProtocolError
 from core.auto_watcher import AutoWatcher
@@ -69,13 +70,13 @@ _FTP_PRESENT_MIN_RATIO = 0.75
 from core.ftp_categories import choose_category, new_category_id
 from core.upload_slots import UploadSlotManager
 from gui.table_view import TableView, ColumnSpec
-from core.appdirs import app_data_dir, is_windows, is_macos, is_linux
+from core.appdirs import APP_NAME, LEGACY_APP_NAME, app_data_dir, is_windows, is_macos, is_linux
 from core.applog import get_logger
 from core.version import __version__
 from core.trending import trending_score, format_trending_score, explain_trending_score
 from gui.tooltip import attach_tooltip
 
-_log = get_logger("aRenombrar.gui", "app.log")
+_log = get_logger("aIBechos.gui", "app.log")
 
 
 ACCENT        = "#1DB954"
@@ -1121,7 +1122,7 @@ class App(_AppBase):
         ctk.set_appearance_mode(self.config_data.get("appearance", "dark"))
         ctk.set_default_color_theme(self.config_data.get("color_theme", "blue"))
 
-        self.title(f"aRenombrar v{__version__}")
+        self.title(f"aIBechos v{__version__}")
         self.geometry("1200x820")
         self.minsize(1000, 680)
         self._apply_window_state()
@@ -1189,7 +1190,7 @@ class App(_AppBase):
         _mark("_build_ui() TOTAL")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if is_macos():
-            # Cmd+Q (y "Salir de aRenombrar" del menú de la app en la barra
+            # Cmd+Q (y "Salir de aIBechos" del menú de la app en la barra
             # superior del sistema) los gestiona Tk directamente en macOS,
             # sin pasar por WM_DELETE_WINDOW — sin este remapeo, se saltaría
             # el diálogo de "hay una subida en curso" y el guardado de
@@ -1266,6 +1267,11 @@ class App(_AppBase):
         # -- ver core/server_config.py. Silencioso si no hay ruta
         # configurada o la descarga falla; los valores locales se quedan
         # como estaban.
+        # Antes que las sincronizaciones de abajo: tras el cambio de nombre de
+        # la aplicación, los datos que el grupo comparte están todavía con el
+        # nombre anterior y hay que traerlos (una sola vez, ver el método).
+        self.after(300, self._migrate_shared_data_folder)
+        self.after(400, self._migrate_autostart_identity)
         self.after(2200, self._sync_server_config_from_ftp)
         # Episodios que faltan y Películas: la caché compartida se refresca
         # desde el FTP también al abrir la app (no solo al entrar en cada
@@ -1632,7 +1638,7 @@ class App(_AppBase):
         header.grid_columnconfigure(2, weight=1)
         self._header = header
 
-        # Sin etiqueta "aRenombrar" aquí -- el título ya se ve en la barra
+        # Sin etiqueta "aIBechos" aquí -- el título ya se ve en la barra
         # de la ventana (self.title(), ver __init__) y duplicarlo en la
         # cabecera solo quitaba espacio a la navegación sin aportar nada.
         # Navegación: las 4 vistas como pestañas conectadas (una activa a
@@ -3273,8 +3279,76 @@ class App(_AppBase):
             return ""
         return f"{folder.rstrip('/')}/{filename}"
 
+    def _migrate_shared_data_folder(self):
+        """Trae los datos que el grupo comparte a la carpeta y los nombres
+        nuevos, una sola vez, tras el cambio de nombre de la aplicación.
+
+        Se COPIA, no se mueve: los archivos antiguos se quedan donde están, así
+        que quien todavía no haya actualizado sigue trabajando con normalidad.
+
+        No se pisa nada que ya exista en el destino. Esa es la salvaguarda
+        importante: si otro usuario actualiza más tarde que tú, su migración no
+        machacará con datos viejos lo que tú ya hayas escrito en la carpeta
+        nueva.
+
+        Si la conexión falla no se marca nada, así que se reintenta en el
+        siguiente arranque."""
+        if self.config_data.get("_shared_data_migrated"):
+            return
+        carpeta_antigua = self.config_data.get("shared_data_ftp_path", "").strip()
+        if not carpeta_antigua:
+            self.config_data.set("_shared_data_migrated", True)   # nada que traer
+            self.config_data.save()
+            return
+        carpeta_nueva = shared_data.compute_new_folder(carpeta_antigua)
+
+        def worker():
+            own_ftp = self._new_ftp_client()
+            copiados = 0
+            try:
+                ok, _msg = own_ftp.connect(
+                    self.config_data.get("ftp_host", ""),
+                    int(self.config_data.get("ftp_port", 21)),
+                    self.config_data.get("ftp_user", ""),
+                    self.config_data.get("ftp_password", ""),
+                    self.config_data.get("ftp_use_tls", False))
+                if not ok:
+                    return
+                for clave in shared_data.SHARED_DATA_FILES:
+                    destino = f"{carpeta_nueva.rstrip('/')}/{shared_data.filename(clave)}"
+                    if own_ftp.file_exists(destino):
+                        continue          # ya lo trajo alguien: no se toca
+                    origen = (f"{carpeta_antigua.rstrip('/')}/"
+                              f"{shared_data.filename(clave, legacy=True)}")
+                    raw = own_ftp.download_bytes(origen)
+                    if raw is None:
+                        continue          # ese archivo no existía; es normal
+                    ok_subida, _ = own_ftp.upload_bytes(raw, destino)
+                    if ok_subida:
+                        copiados += 1
+            except Exception as e:
+                _log.warning("Cambio de nombre: no se pudieron traer los datos "
+                             "compartidos (se reintentará): %s", e)
+                return
+            finally:
+                own_ftp.disconnect()
+            self.after(0, lambda: self._finish_shared_data_migration(
+                carpeta_nueva, copiados))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_shared_data_migration(self, carpeta_nueva: str, copiados: int):
+        self.config_data.set("shared_data_ftp_path", carpeta_nueva)
+        self.config_data.set("_shared_data_migrated", True)
+        self.config_data.save()
+        _log.info("Cambio de nombre: %d archivo(s) compartido(s) traído(s) a '%s'",
+                  copiados, carpeta_nueva)
+        # Aplicar ya la configuración compartida desde su sitio nuevo, para no
+        # arrancar esta sesión con la de antes del cambio.
+        self._sync_server_config_from_ftp()
+
     def _favorites_remote_path(self) -> str:
-        return self._shared_data_path("aRenombrar_favoritos.json")
+        return self._shared_data_path(shared_data.filename("favoritos"))
 
     def _is_favorite(self, media_type: str, tmdb_id: int) -> bool:
         from core.favorites import is_favorite
@@ -3408,69 +3482,69 @@ class App(_AppBase):
         aparte: reservas, favoritos y configuración de servidor comparten
         la misma conexión/carpeta FTP, así que basta con una única ruta
         (de carpeta) configurada por el usuario."""
-        return self._shared_data_path("aRenombrar_reservas.json")
+        return self._shared_data_path(shared_data.filename("reservas"))
 
     def _server_config_remote_path(self) -> str:
         """Ruta remota de la configuración compartida del servidor (ver
         core/server_config.py) -- archivo propio dentro de la misma
         carpeta compartida, mismo motivo que _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_config_servidor.json")
+        return self._shared_data_path(shared_data.filename("config_servidor"))
 
     def _shared_dub_verdicts_remote_path(self) -> str:
         """Ruta remota de los veredictos de doblaje castellano obtenidos
         por IA, compartidos entre clientes (ver core/shared_dub_verdicts.py)
         -- archivo propio dentro de la misma carpeta compartida, mismo
         motivo que _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_doblaje_ia.json")
+        return self._shared_data_path(shared_data.filename("doblaje_ia"))
 
     def _activity_remote_path(self) -> str:
         """Ruta remota del historial de actividad compartido (subidas y
         borrados de todos los clientes, ver Historial → "Ver todo el
         servidor") -- archivo propio dentro de la misma carpeta
         compartida, mismo motivo que _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_actividad.json")
+        return self._shared_data_path(shared_data.filename("actividad"))
 
     def _upload_stats_remote_path(self) -> str:
         """Ruta remota del ranking de subidas por usuario (ver
         core/upload_stats.py, pestaña Estadísticas) -- archivo propio
         dentro de la misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_estadisticas_usuarios.json")
+        return self._shared_data_path(shared_data.filename("estadisticas_usuarios"))
 
     def _category_stats_remote_path(self) -> str:
         """Ruta remota del recuento/tamaño por categoría (ver
         core/category_stats.py, pestaña Estadísticas) -- archivo propio
         dentro de la misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_estadisticas_categorias.json")
+        return self._shared_data_path(shared_data.filename("estadisticas_categorias"))
 
     def _deletion_stats_remote_path(self) -> str:
         """Ruta remota del ranking de borrados por usuario (ver
         core/deletion_stats.py, pestaña Estadísticas) -- archivo propio
         dentro de la misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_estadisticas_borrados.json")
+        return self._shared_data_path(shared_data.filename("estadisticas_borrados"))
 
     def _category_upload_stats_remote_path(self) -> str:
         """Ruta remota del ranking de subidas desglosado por categoría
         (ver core/category_upload_stats.py, pestaña Estadísticas) --
         archivo propio dentro de la misma carpeta compartida, mismo
         motivo que _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_estadisticas_subidores_categoria.json")
+        return self._shared_data_path(shared_data.filename("estadisticas_subidores_categoria"))
 
     def _cleanup_candidates_remote_path(self) -> str:
         """Ruta remota de la lista compartida de "Liberar espacio" (ver
         core/cleanup_candidates_cache.py) -- archivo propio dentro de la
         misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_liberar_espacio.json")
+        return self._shared_data_path(shared_data.filename("liberar_espacio"))
 
     def _missing_episodes_remote_path(self) -> str:
         """Ruta remota de la caché compartida de "Episodios que faltan"
         (ver core/missing_episodes_cache.py) -- archivo propio dentro de
         la misma carpeta compartida, mismo motivo que
         _reservations_remote_path."""
-        return self._shared_data_path("aRenombrar_episodios_que_faltan.json")
+        return self._shared_data_path(shared_data.filename("episodios_que_faltan"))
 
     def _missing_movies_remote_path(self) -> str:
         """Ruta remota de la caché compartida de "Películas" (ver
@@ -3483,7 +3557,7 @@ class App(_AppBase):
         instalación del mismo servidor ya subió una película sin tener que
         esperar a que su propio Jellyfin/Plex la reindexe -- ver
         _push_missing_movies_to_ftp/_sync_missing_movies_from_ftp."""
-        return self._shared_data_path("aRenombrar_peliculas.json")
+        return self._shared_data_path(shared_data.filename("peliculas"))
 
     def _sync_server_config_from_ftp(self):
         """Descarga la configuración compartida del servidor y la aplica en
@@ -3653,7 +3727,7 @@ class App(_AppBase):
         compartida del servidor -- a diferencia de favoritos/reservas
         (que se fusionan), esto es una publicación deliberada que
         SOBRESCRIBE por completo lo que hubiera, así que pide confirmación
-        explícita: afecta a cualquier otra persona que use aRenombrar
+        explícita: afecta a cualquier otra persona que use aIBechos
         contra este mismo servidor la próxima vez que arranque. Incluye
         credenciales (TMDB/IA/Plex/Jellyfin) a propósito -- ver la nota de
         seguridad en core/server_config.py: viajan en texto plano dentro
@@ -3671,7 +3745,7 @@ class App(_AppBase):
                 "Esto sobrescribirá la configuración compartida (TMDB/IA -- incluidas las claves de "
                 "API --, plantillas de nombre, categorías FTP, Plex/Jellyfin -- incluidos sus tokens --, "
                 "enlaces y la cuota de reservas) con la de este equipo. Cualquier otra persona que use "
-                "aRenombrar contra este servidor la adoptará la próxima vez que abra la app.",
+                "aIBechos contra este servidor la adoptará la próxima vez que abra la app.",
                 confirm_text="Sí, publicar").result:
             return
 
@@ -6323,7 +6397,7 @@ class App(_AppBase):
         # SHARED_CONFIG_KEYS para qué claves son de cada lado. "Cliente":
         # cada equipo/persona la suya, nunca se toca al sincronizar ni al
         # publicar. "Servidor": debe ser igual para todo el que use
-        # aRenombrar contra este mismo FTP, se sincroniza sola al arrancar
+        # aIBechos contra este mismo FTP, se sincroniza sola al arrancar
         # y "Publicar" (cabecera de esta pestaña, ver
         # _build_server_publish_header) la sobrescribe para todos.
         # command=: ver el mismo motivo en server_tabs más abajo -- cambiar
@@ -6361,7 +6435,7 @@ class App(_AppBase):
         self._build_media_servers_section(server_tabs.add("Servidores de medios"))
         self._build_reservation_quota_tab(server_tabs.add("Reservas"))
 
-        ctk.CTkLabel(panel, text=f"aRenombrar v{__version__}",
+        ctk.CTkLabel(panel, text=f"aIBechos v{__version__}",
                      text_color=PENDING_COLOR, font=self._cfg_font_desc).grid(
             row=1, column=0, pady=(4, 8))
 
@@ -6626,13 +6700,13 @@ class App(_AppBase):
         # Carpeta compartida donde viven favoritos/reservas/configuración
         # de servidor -- una CARPETA, no un archivo (ver _shared_data_path):
         # dentro se crean 3 archivos con nombre fijo, uno por función
-        # (aRenombrar_favoritos.json, aRenombrar_reservas.json,
-        # aRenombrar_config_servidor.json). Vacío = las 3 funciones solo
+        # (aIBechos_favoritos.json, aIBechos_reservas.json,
+        # aIBechos_config_servidor.json). Vacío = las 3 funciones solo
         # locales, sin sincronizar.
         ctk.CTkLabel(conn, text="Carpeta compartida (datos):").grid(
             row=9, column=0, sticky="e", padx=10, pady=6)
         self._shared_data_ftp_path_entry = ctk.CTkEntry(
-            conn, width=200, placeholder_text="/datos2/aRenombrar")
+            conn, width=200, placeholder_text="/datos2/aIBechos")
         self._shared_data_ftp_path_entry.insert(0, str(self.config_data.get("shared_data_ftp_path", "")))
         self._shared_data_ftp_path_entry.grid(row=9, column=1, padx=10, pady=6, sticky="ew")
 
@@ -6852,7 +6926,7 @@ class App(_AppBase):
                      font=ctk.CTkFont(size=12, weight="bold")).grid(row=0, column=0, pady=(10, 2))
         ctk.CTkLabel(schedule_fr, text="A la hora indicada se sincroniza sola, SIN pedir "
                                        "confirmación -- a diferencia del botón manual. Solo "
-                                       "funciona mientras aRenombrar esté abierto en ese "
+                                       "funciona mientras aIBechos esté abierto en ese "
                                        "momento -- no es una tarea del sistema operativo.",
                      font=ctk.CTkFont(size=11), text_color=WARNING_COLOR, wraplength=420,
                      justify="center").grid(row=1, column=0, pady=(0, 8), padx=10)
@@ -7673,7 +7747,7 @@ class App(_AppBase):
             self.config_data.set("watch_sync_last_run_ts", _time.time())
             self.config_data.save()
         self.after(0, lambda: self._send_notification(
-            "aRenombrar — Sincronización de visionado",
+            "aIBechos — Sincronización de visionado",
             f"{ok} cambio(s) aplicados" + (f", {fail} fallido(s)" if fail else "")))
         self.after(0, lambda: self._watch_sync_last_run_label.configure(
             text="Última sincronización: hace un momento"))
@@ -15109,7 +15183,7 @@ class App(_AppBase):
             title="Exportar configuración",
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
-            initialfile="aRenombrar_config.json",
+            initialfile="aIBechos_config.json",
         )
         if not path:
             return
@@ -15120,9 +15194,10 @@ class App(_AppBase):
         # (ver _sync_server_config_from_ftp/_publish_server_config);
         # meterla también aquí sería redundante y confuso, dos caminos
         # distintos para cambiar lo mismo.
-        data = {k: v for k, v in self.config_data.to_dict().items() if k not in SHARED_CONFIG_KEYS}
+        data = {k: v for k, v in self.config_data.to_dict().items()
+                if k not in SHARED_CONFIG_KEYS and k not in INTERNAL_FLAGS}
         # Metadatos de versión: permiten avisar al importar si el archivo
-        # viene de una versión de aRenombrar más nueva que podría usar un
+        # viene de una versión de aIBechos más nueva que podría usar un
         # formato que esta versión no entiende del todo.
         data["_export_schema_version"] = CONFIG_EXPORT_SCHEMA_VERSION
         data["_app_version"] = __version__
@@ -15158,7 +15233,7 @@ class App(_AppBase):
         if file_schema > CONFIG_EXPORT_SCHEMA_VERSION:
             if not messagebox.askyesno(
                     "Archivo de una versión más nueva",
-                    f"Este archivo se exportó con una versión de aRenombrar más "
+                    f"Este archivo se exportó con una versión de aIBechos más "
                     f"reciente que esta{f' (v{file_app_ver})' if file_app_ver else ''} "
                     f"y puede usar un formato que esta versión no entiende del todo. "
                     f"¿Importar de todas formas?"):
@@ -18511,11 +18586,11 @@ class App(_AppBase):
         try:
             img  = self._get_tray_image()
             menu = pystray.Menu(
-                pystray.MenuItem("Abrir aRenombrar", self._tray_show, default=True),
+                pystray.MenuItem("Abrir aIBechos", self._tray_show, default=True),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Salir", self._tray_quit),
             )
-            self._tray = pystray.Icon("aRenombrar", img, "aRenombrar", menu)
+            self._tray = pystray.Icon("aIBechos", img, "aIBechos", menu)
         except Exception:
             self._tray = None
 
@@ -18532,7 +18607,7 @@ class App(_AppBase):
         if not self._tray_running:
             # pystray.Icon NO se puede reutilizar tras .stop(): minimizar a la
             # bandeja una segunda vez (tras restaurar antes con "Abrir
-            # aRenombrar", que llama _tray_show_->_tray.stop()) dejaba
+            # aIBechos", que llama _tray_show_->_tray.stop()) dejaba
             # self._tray detenido y un .run() posterior no repone el icono
             # en la bandeja --> la ventana desaparecía sin bandeja y el
             # proceso quedaba zombie (bug real: "solo funciona una vez").
@@ -18597,6 +18672,70 @@ class App(_AppBase):
         elif is_linux():
             self._set_autostart_linux(enabled)
 
+    def _migrate_autostart_identity(self):
+        """Pasa el arranque automático al nombre nuevo, una sola vez.
+
+        Solo actúa si el usuario YA lo tenía puesto: la presencia de la entrada
+        antigua es la señal, así que a quien no lo usara no se le activa nada.
+
+        Se vuelve a crear con `_set_autostart_*(True)` en vez de copiar la
+        entrada vieja tal cual, porque esa apunta al ejecutable con el nombre
+        y la carpeta anteriores -- y tras actualizar puede que ya no exista.
+        Sin esto quedaría además una entrada huérfana lanzando un programa que
+        no está."""
+        if self.config_data.get("_autostart_identity_migrated"):
+            return
+        try:
+            if is_windows():
+                self._migrate_autostart_windows()
+            elif is_macos():
+                self._migrate_autostart_macos()
+            elif is_linux():
+                self._migrate_autostart_linux()
+        except Exception as e:
+            _log.warning("Cambio de nombre: no se pudo migrar el arranque "
+                         "automático: %s", e)
+        self.config_data.set("_autostart_identity_migrated", True)
+        self.config_data.save()
+
+    def _migrate_autostart_windows(self):
+        import winreg
+        ruta = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ruta, 0,
+                            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+            try:
+                winreg.QueryValueEx(key, LEGACY_APP_NAME)
+            except FileNotFoundError:
+                return              # no tenía arranque automático
+            winreg.DeleteValue(key, LEGACY_APP_NAME)
+        self._set_autostart_windows(True)
+        _log.info("Cambio de nombre: arranque automático trasladado a '%s'", APP_NAME)
+
+    def _migrate_autostart_macos(self):
+        import subprocess
+        antiguo = (Path.home() / "Library" / "LaunchAgents" /
+                   f"{self._OLD_MACOS_LAUNCH_AGENT_LABEL}.plist")
+        if not antiguo.exists():
+            return
+        # Descargarlo antes de borrarlo: si no, el agente viejo sigue vivo en
+        # la sesión de launchd hasta el próximo inicio de sesión.
+        subprocess.run(["launchctl", "unload", "-w", str(antiguo)],
+                       capture_output=True)
+        antiguo.unlink()
+        self._set_autostart_macos(True)
+        _log.info("Cambio de nombre: LaunchAgent trasladado a '%s'",
+                  self._MACOS_LAUNCH_AGENT_LABEL)
+
+    def _migrate_autostart_linux(self):
+        antiguo = (Path.home() / ".config" / "autostart" /
+                   self._OLD_LINUX_AUTOSTART_FILENAME)
+        if not antiguo.exists():
+            return
+        antiguo.unlink()
+        self._set_autostart_linux(True)
+        _log.info("Cambio de nombre: arranque automático trasladado a '%s'",
+                  self._LINUX_AUTOSTART_FILENAME)
+
     def _set_autostart_windows(self, enabled: bool):
         try:
             import winreg
@@ -18610,17 +18749,18 @@ class App(_AppBase):
                 else:
                     main_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))
                     exe_cmd = f'"{sys.executable}" "{main_py}" --minimized'
-                winreg.SetValueEx(key, "aRenombrar", 0, winreg.REG_SZ, exe_cmd)
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_cmd)
             else:
                 try:
-                    winreg.DeleteValue(key, "aRenombrar")
+                    winreg.DeleteValue(key, APP_NAME)
                 except FileNotFoundError:
                     pass
             winreg.CloseKey(key)
         except Exception as e:
             self._set_status(f"Error registro: {e}", ERROR_COLOR)
 
-    _MACOS_LAUNCH_AGENT_LABEL = "com.arenombrar.app"
+    _MACOS_LAUNCH_AGENT_LABEL = "com.aibechos.app"
+    _OLD_MACOS_LAUNCH_AGENT_LABEL = "com.arenombrar.app"
 
     def _macos_launch_agent_path(self) -> Path:
         return Path.home() / "Library" / "LaunchAgents" / f"{self._MACOS_LAUNCH_AGENT_LABEL}.plist"
@@ -18657,7 +18797,8 @@ class App(_AppBase):
         except Exception as e:
             self._set_status(f"Error LaunchAgent: {e}", ERROR_COLOR)
 
-    _LINUX_AUTOSTART_FILENAME = "arenombrar-autostart.desktop"
+    _LINUX_AUTOSTART_FILENAME = "aibechos-autostart.desktop"
+    _OLD_LINUX_AUTOSTART_FILENAME = "arenombrar-autostart.desktop"
 
     def _linux_autostart_path(self) -> Path:
         return Path.home() / ".config" / "autostart" / self._LINUX_AUTOSTART_FILENAME
@@ -18679,7 +18820,7 @@ class App(_AppBase):
                 content = (
                     "[Desktop Entry]\n"
                     "Type=Application\n"
-                    "Name=aRenombrar\n"
+                    f"Name={APP_NAME}\n"
                     f"Exec={exec_cmd}\n"
                     "X-GNOME-Autostart-enabled=true\n"
                     "Terminal=false\n"
@@ -19009,12 +19150,12 @@ class App(_AppBase):
         if not pending:
             return
         if len(pending) == 1:
-            self._send_notification("aRenombrar — Subida completada", pending[0])
+            self._send_notification("aIBechos — Subida completada", pending[0])
             return
         preview = ", ".join(pending[:3])
         if len(pending) > 3:
             preview += f" y {len(pending) - 3} más"
-        self._send_notification(f"aRenombrar — {len(pending)} subidas completadas", preview)
+        self._send_notification(f"aIBechos — {len(pending)} subidas completadas", preview)
 
     def _send_notification(self, title: str, msg: str):
         """Envía una notificación de escritorio si está habilitada en config."""
@@ -19650,7 +19791,7 @@ class App(_AppBase):
         import zipfile
         dest = filedialog.asksaveasfilename(
             title="Descargar log completo", defaultextension=".zip",
-            initialfile="logs_arenombrar.zip",
+            initialfile="logs_aibechos.zip",
             filetypes=[("Archivo ZIP", "*.zip"), ("Todos los archivos", "*.*")])
         if not dest:
             return

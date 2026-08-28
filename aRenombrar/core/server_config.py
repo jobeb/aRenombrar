@@ -1,6 +1,6 @@
 """
 Configuración compartida del servidor -- los parámetros que el grupo ha
-decidido que deben ser iguales para cualquier persona que use aRenombrar
+decidido que deben ser iguales para cualquier persona que use aIBechos
 contra el mismo FTP, en vez de tener que configurarlos a mano en cada
 cliente nuevo y mantenerlos sincronizados a ojo entre todos (categorías,
 plantillas de nombre, enlaces, credenciales de TMDB/IA/Plex/Jellyfin...).

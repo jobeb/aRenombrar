@@ -1,5 +1,5 @@
 """
-Kitsu API client -- identifica manga/cómic escaneado para aRenombrar,
+Kitsu API client -- identifica manga/cómic escaneado para aIBechos,
 alternativa a ComicVine/MangaDex/AniList. Sigue la especificación JSON:API
 (cabecera Accept obligatoria), no necesita ninguna API Key para búsquedas de
 solo lectura.

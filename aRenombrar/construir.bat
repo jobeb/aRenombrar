@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo ============================================
-echo   aRenombrar - Construir ejecutable (.exe)
+echo   aIBechos - Construir ejecutable (.exe)
 echo ============================================
 echo.
 
@@ -22,7 +22,7 @@ echo.
 
 :: Limpiar builds anteriores
 echo [2/4] Limpiando builds anteriores...
-if exist dist\aRenombrar rmdir /s /q dist\aRenombrar
+if exist dist\aIBechos rmdir /s /q dist\aIBechos
 if exist build rmdir /s /q build
 echo       OK
 echo.
@@ -41,20 +41,20 @@ echo.
 
 :: Crear acceso directo .lnk en el Escritorio
 echo [4/4] Creando acceso directo en el Escritorio...
-set EXE_PATH=%~dp0dist\aRenombrar\aRenombrar.exe
-set WORK_DIR=%~dp0dist\aRenombrar
+set EXE_PATH=%~dp0dist\aIBechos\aIBechos.exe
+set WORK_DIR=%~dp0dist\aIBechos
 
 powershell -ExecutionPolicy Bypass -Command ^
-  "$s=(New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\aRenombrar.lnk');" ^
+  "$s=(New-Object -COM WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\aIBechos.lnk');" ^
   "$s.TargetPath='%EXE_PATH%';" ^
   "$s.WorkingDirectory='%WORK_DIR%';" ^
-  "$s.Description='aRenombrar - Renombrador de series y peliculas';" ^
+  "$s.Description='aIBechos - Renombrador de series y peliculas';" ^
   "$s.Save()"
 echo       OK
 echo.
 
 echo ============================================
-echo   Listo! Ejecutable en: dist\aRenombrar\
+echo   Listo! Ejecutable en: dist\aIBechos\
 echo   Acceso directo creado en el Escritorio
 echo ============================================
 echo.

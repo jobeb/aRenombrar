@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=aRenombrar
+Name=aIBechos
 Comment=Renombrado y subida de series, películas y anime
-Exec=aRenombrar
-Icon=aRenombrar
+Exec=aIBechos
+Icon=aIBechos
 Terminal=false
 Categories=Utility;

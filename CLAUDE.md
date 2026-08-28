@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-**aRenombrar** is a desktop GUI app for renaming and uploading media files (TV series, movies, anime, and books/comics). It queries TMDB for series/movie metadata, OpenLibrary (primary) with Google Books as automatic backup for ebooks, and ComicVine for comics/manga, generates clean filenames from configurable templates, and uploads via FTP/FTPS. Written in Python with customtkinter. Runs on Windows, macOS, and Linux (see "Platform notes" below).
+**aIBechos** is a desktop GUI app for renaming and uploading media files (TV series, movies, anime, and books/comics). It queries TMDB for series/movie metadata, OpenLibrary (primary) with Google Books as automatic backup for ebooks, and ComicVine for comics/manga, generates clean filenames from configurable templates, and uploads via FTP/FTPS. Written in Python with customtkinter. Runs on Windows, macOS, and Linux (see "Platform notes" below).
 
 ## Running the app
 
@@ -34,8 +34,8 @@ From inside `aRenombrar/`:
 ```bash
 pip install -r requirements.txt
 pyinstaller aRenombrar.spec
-# Windows → dist/aRenombrar/aRenombrar.exe
-# macOS   → dist/aRenombrar.app (BUNDLE block in the spec, only added when built on macOS)
+# Windows → dist/aIBechos/aIBechos.exe
+# macOS   → dist/aIBechos.app (BUNDLE block in the spec, only added when built on macOS)
 ```
 
 The spec bundles `customtkinter`, `PIL`, `tkinterdnd2`, `pystray`, `py7zr`, and `rarfile` assets, and picks the icon by platform (`iconoPrincipal.ico` on Windows, `iconoPrincipal.icns` on macOS — both must be present in `aRenombrar/`; regenerate the `.icns` from `IconoSinFondo.png` with `Image.open(...).save('iconoPrincipal.icns')` if the source art changes, no macOS-only tool needed). `py7zr`/`rarfile` are pure-Python (no binary bundled) — `.rar` extraction still needs `unrar`/`unar`/`bsdtar` installed on the end user's system; if absent, extraction fails with a clear message instead of crashing.
@@ -45,7 +45,7 @@ The spec bundles `customtkinter`, `PIL`, `tkinterdnd2`, `pystray`, `py7zr`, and 
 ```
 aRenombrar/
 ├── main.py          # entry point — creates and starts App
-├── config.py        # Config class, persists to %APPDATA%\aRenombrar\config.json
+├── config.py        # Config class, persists to %APPDATA%\aIBechos\config.json
 ├── core/
 │   ├── api_client.py     # TMDBClient, MediaInfo dataclass, detect_episode()
 │   ├── openlibrary_client.py # OpenLibraryClient — PRIMARY ebook identification, no API key ever needed
@@ -97,9 +97,9 @@ tkinter is not thread-safe. All GUI mutations from worker threads must be schedu
 ### Config and persistence
 
 - Data dir via `core/appdirs.py:app_data_dir()` — the single source of truth for where app files live, used by `config.py`, `gui/app.py`, and `core/auto_watcher.py` alike (they used to each have their own copy of this logic, and only `config.py`'s distinguished macOS from Linux, so macOS installs ended up with files split across two different folders — don't reintroduce a local copy of this logic, import it):
-  - Windows → `%APPDATA%\aRenombrar\`
-  - macOS → `~/Library/Application Support/aRenombrar/`
-  - Linux → `~/.config/aRenombrar/`
+  - Windows → `%APPDATA%\aIBechos\`
+  - macOS → `~/Library/Application Support/aIBechos/`
+  - Linux → `~/.config/aIBechos/`
 - `config.json`, `session.json`, `upload_history.json`, `auto_processed.json`, `auto_watcher.log` all live directly in that folder.
 - The `Config` class merges saved values over `DEFAULTS` in `config.py` — add new settings to `DEFAULTS` first
 - FTP password is stored via `keyring` (Windows Credential Locker / macOS Keychain / whatever `keyring` resolves on Linux), never in `config.json` in plaintext.
@@ -163,7 +163,7 @@ Launches minimized to tray when started with `--minimized` argument (used by the
 ## Platform notes
 
 - **Tray icon (`pystray`)**: on macOS, `Icon.run()` must be called from the main thread (AppKit constraint, not optional) — `gui/app.py:_minimize_to_tray` branches on `core.appdirs.is_macos()` and calls `Icon.run_detached()` directly instead of spawning a background thread like Windows/Linux do. `run_detached()` on the darwin backend doesn't block; it just marks the icon ready and relies on Tk's own already-running Cocoa event loop (same shared `NSApplication` instance) to actually deliver clicks. If you touch tray code, keep that branch — don't unify it back into a single threaded `.run()` call.
-- **Autostart**: `App._set_autostart` dispatches to `_set_autostart_windows` (Registry `HKCU\...\Run`), `_set_autostart_macos` (`~/Library/LaunchAgents/com.arenombrar.app.plist`, loaded with `launchctl load -w`), or `_set_autostart_linux` (`~/.config/autostart/arenombrar-autostart.desktop`, the XDG autostart convention).
+- **Autostart**: `App._set_autostart` dispatches to `_set_autostart_windows` (Registry `HKCU\...\Run`), `_set_autostart_macos` (`~/Library/LaunchAgents/com.aibechos.app.plist`, loaded with `launchctl load -w`), or `_set_autostart_linux` (`~/.config/autostart/aibechos-autostart.desktop`, the XDG autostart convention). `_migrate_autostart_identity` moves an existing entry off the pre-rename identifiers (`com.arenombrar.app` / `arenombrar-autostart.desktop`) once, and only if the user had autostart on — leaving the old one behind would keep launching an executable that no longer exists.
 - **Desktop notifications**: `App._send_notification` tries pystray's tray notification first, then falls back to a platform-specific OS call — PowerShell balloon on Windows, `osascript -e 'display notification ...'` on macOS, `notify-send` on Linux.
 - **Window/dialog icon**: Tk's `iconbitmap()` only accepts `.ico` and only works on Windows; macOS/Linux use `iconphoto()` with a PNG (`IconoSinFondo.png`) instead. See `App.__init__` (loads `self._icon_path` or `self._icon_photo` depending on platform) and `App._apply_icon`.
 - **"Archivo bloqueado" retry in AutoWatcher**: the substring match in `core/auto_watcher.py` (`_LOCKED_FILE_HINTS`) was originally Windows-only (`WinError 32` text). It now also matches common POSIX phrasing (`EBUSY`, "permission denied"), though this scenario is rare on macOS/Linux since POSIX generally allows renaming open files.

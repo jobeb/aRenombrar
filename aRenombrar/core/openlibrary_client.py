@@ -1,6 +1,6 @@
 """
 OpenLibrary API client -- identifica ebooks de texto (pdf, epub, mobi, azw3)
-para aRenombrar, alternativa a Google Books (core/book_client.py). No
+para aIBechos, alternativa a Google Books (core/book_client.py). No
 necesita ninguna API Key en ningún momento (a diferencia de ComicVine, y a
 diferencia de Google Books cuando se agota su cuota anónima compartida) --
 por eso es el proveedor PRINCIPAL para libros de texto desde que Google

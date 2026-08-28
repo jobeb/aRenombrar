@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 # Permite "from core.xxx import ..." al correr pytest desde cualquier carpeta,
-# igual que hace main.py al insertar la raíz de aRenombrar/ en sys.path.
+# igual que hace main.py al insertar la raíz de aIBechos/ en sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Los logs de los tests NO van al %APPDATA% real del usuario.

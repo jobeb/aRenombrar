@@ -52,7 +52,7 @@ def test_ficheros_distintos_no_comparten_handler(data_dir):
 def test_el_banner_de_version_sale_una_vez_por_fichero(data_dir):
     _loggers(3)
     banners = [l for l in (data_dir / "app.log").read_text(encoding="utf-8").splitlines()
-               if "=== aRenombrar v" in l]
+               if "=== aIBechos v" in l]
     assert len(banners) == 1
 
 

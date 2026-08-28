@@ -6,7 +6,7 @@ sabe decir por sí solo (TMDB no sabe qué tienes tú, Plex/Jellyfin no saben
 qué deberías tener).
 
 Solo informa de los huecos -- no descarga ni gestiona nada, ver CLAUDE.md /
-la conversación: aRenombrar organiza y sube contenido que el usuario ya
+la conversación: aIBechos organiza y sube contenido que el usuario ya
 tiene, nunca lo adquiere por su cuenta.
 """
 

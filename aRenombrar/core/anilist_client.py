@@ -1,5 +1,5 @@
 """
-AniList API client -- identifica manga/cómic escaneado para aRenombrar,
+AniList API client -- identifica manga/cómic escaneado para aIBechos,
 alternativa a ComicVine/MangaDex. AniList usa GraphQL en vez de REST (un
 único endpoint POST), no necesita ninguna API Key para consultas de solo
 lectura, y trae sinónimos multi-idioma por serie -- útil cuando el título

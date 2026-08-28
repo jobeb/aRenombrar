@@ -57,7 +57,7 @@ def _processed_db_path() -> Path:
 # recién subidos a mano "reaparecían" como nuevos para AutoWatcher.
 _DB_LOCK = threading.Lock()
 
-_log = get_logger("aRenombrar.auto", "auto_watcher.log", level=logging.DEBUG)
+_log = get_logger("aIBechos.auto", "auto_watcher.log", level=logging.DEBUG)
 
 
 def mark_discarded(path: str) -> bool:

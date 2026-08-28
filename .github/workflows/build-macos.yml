@@ -35,11 +35,11 @@ jobs:
       - name: Empaquetar en DMG
         run: |
           mkdir dmg_root
-          cp -R dist/aRenombrar.app dmg_root/
+          cp -R dist/aIBechos.app dmg_root/
           ln -s /Applications dmg_root/Applications
-          hdiutil create -volname aRenombrar -srcfolder dmg_root -ov -format UDZO "aRenombrar_${{ steps.version.outputs.version }}.dmg"
+          hdiutil create -volname aIBechos -srcfolder dmg_root -ov -format UDZO "aIBechos_${{ steps.version.outputs.version }}.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: aRenombrar-macos
-          path: aRenombrar/aRenombrar_${{ steps.version.outputs.version }}.dmg
+          name: aIBechos-macos
+          path: aRenombrar/aIBechos_${{ steps.version.outputs.version }}.dmg

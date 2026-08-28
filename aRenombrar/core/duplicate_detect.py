@@ -16,7 +16,7 @@ from core.series_match import series_similarity
 
 _MOVIE_DUPLICATE_MIN_RATIO = 0.75
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-_log = get_logger("aRenombrar.duplicate_detect", "app.log")
+_log = get_logger("aIBechos.duplicate_detect", "app.log")
 
 
 def find_duplicate(existing_filenames: list, media_info, current_filename: str) -> Optional[str]:

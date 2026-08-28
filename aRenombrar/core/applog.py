@@ -7,8 +7,8 @@ ai_title_fallback.py) repetía la misma configuración de RotatingFileHandler
 El handler se comparte por FICHERO, no por nombre de logger (ver _handlers).
 Esto no es un detalle de eficiencia: en Windows, RotatingFileHandler rota con
 os.rename, y renombrar un fichero que otro handler tiene abierto falla con
-WinError 32. Como "app.log" lo usan tres loggers distintos (aRenombrar.gui,
-aRenombrar.comicvine, aRenombrar.duplicate_detect), con un handler cada uno la
+WinError 32. Como "app.log" lo usan tres loggers distintos (aIBechos.gui,
+aIBechos.comicvine, aIBechos.duplicate_detect), con un handler cada uno la
 rotación fallaba SIEMPRE en caliente: el error se tragaba en handleError() --
 que en una app gráfica no lo ve nadie -- y a partir de los 2 MB la app dejaba
 de registrar absolutamente todo hasta el siguiente reinicio, que era el único
@@ -54,5 +54,5 @@ def get_logger(name: str, filename: str, level: int = logging.INFO) -> logging.L
     # El banner va una vez por FICHERO, no una por logger: antes app.log
     # arrancaba con la misma línea de versión repetida tres veces.
     if primer_logger_del_fichero:
-        logger.info("=== aRenombrar v%s ===", __version__)
+        logger.info("=== aIBechos v%s ===", __version__)
     return logger

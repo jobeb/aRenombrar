@@ -2,6 +2,7 @@ import json
 
 import config as config_module
 from config import DEFAULTS, Config
+from core.appdirs import APP_NAME, LEGACY_APP_NAME
 
 
 def test_tmdb_api_key_default_is_empty():
@@ -120,7 +121,7 @@ def test_set_many_routes_ftp_password_through_keyring(tmp_path, monkeypatch):
     cfg = Config()
     cfg.set_many({"ftp_host": "ftp.example.com", "ftp_password": "otra_clave"})
 
-    assert fake_kr.get_password("aRenombrar", "ftp_password") == "otra_clave"
+    assert fake_kr.get_password(APP_NAME, "ftp_password") == "otra_clave"
     assert cfg.get("ftp_host") == "ftp.example.com"
 
 
@@ -322,3 +323,61 @@ def test_fresh_install_has_separate_defaults_per_level(tmp_path, monkeypatch):
     assert cfg.get("custom_links_show")[0]["url_template"] == "https://www.themoviedb.org/tv/{tmdb_id}"
     assert "{temporada}" in cfg.get("custom_links_season")[0]["url_template"]
     assert "{episodio}" in cfg.get("custom_links_episode")[0]["url_template"]
+
+
+# ---------------------------------------------- cambio de nombre de la app --
+# Al pasar de "aRenombrar" a "aIBechos", el llavero del sistema sigue teniendo
+# las credenciales guardadas bajo el nombre ANTERIOR. Sin traerlas, el usuario
+# se queda sin contraseña del servidor nada más actualizar.
+
+def test_trae_las_credenciales_guardadas_con_el_nombre_anterior(tmp_path, monkeypatch):
+    cfg_file, fake_kr = _isolated_config(tmp_path, monkeypatch)
+    fake_kr.set_password(LEGACY_APP_NAME, "ftp_password", "la_de_siempre")
+    fake_kr.set_password(LEGACY_APP_NAME, "plex_token", "token_plex")
+
+    cfg = Config()
+
+    assert cfg.get("ftp_password") == "la_de_siempre"
+    assert fake_kr.get_password(APP_NAME, "ftp_password") == "la_de_siempre"
+    assert fake_kr.get_password(APP_NAME, "plex_token") == "token_plex"
+    # Y no se deja el rastro en el nombre antiguo.
+    assert fake_kr.get_password(LEGACY_APP_NAME, "ftp_password") is None
+
+
+def test_las_credenciales_solo_se_traen_una_vez(tmp_path, monkeypatch):
+    """La marca es imprescindible en macOS: el Llavero pide permiso al leer lo
+    guardado por la aplicación anterior, y sin marca volvería a preguntar en
+    CADA arranque a quien dijera que no."""
+    cfg_file, fake_kr = _isolated_config(tmp_path, monkeypatch)
+    fake_kr.set_password(LEGACY_APP_NAME, "ftp_password", "la_de_siempre")
+    Config()
+
+    consultas = []
+    original = fake_kr.get_password
+    fake_kr.get_password = lambda s, k: (consultas.append(s), original(s, k))[1]
+
+    Config()        # simula reabrir la app
+
+    assert LEGACY_APP_NAME not in consultas
+
+
+def test_la_marca_de_migracion_no_viaja_al_exportar(tmp_path, monkeypatch):
+    """Llevarla a otro equipo le haría saltarse una migración que allí no se ha
+    hecho nunca, y ese equipo se quedaría sin contraseña sin motivo aparente."""
+    from config import INTERNAL_FLAGS
+    cfg_file, fake_kr = _isolated_config(tmp_path, monkeypatch)
+    fake_kr.set_password(LEGACY_APP_NAME, "ftp_password", "la_de_siempre")
+    cfg = Config()
+
+    # Se guarda en disco (si no, se repetiría en cada arranque)...
+    guardado = json.loads(cfg_file.read_text(encoding="utf-8"))
+    assert guardado["_keyring_service_migrated"] is True
+    # ...pero está declarada como interna, que es lo que la excluye al exportar.
+    assert "_keyring_service_migrated" in INTERNAL_FLAGS
+
+
+def test_sin_credenciales_antiguas_no_pasa_nada(tmp_path, monkeypatch):
+    cfg_file, fake_kr = _isolated_config(tmp_path, monkeypatch)
+    cfg = Config()
+    assert cfg.get("ftp_password") == ""
+    assert fake_kr.get_password(APP_NAME, "ftp_password") is None

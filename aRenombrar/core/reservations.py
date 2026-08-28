@@ -1,5 +1,5 @@
 """
-Reservas de espacio compartidas entre todos los clientes de aRenombrar que
+Reservas de espacio compartidas entre todos los clientes de aIBechos que
 apuntan al mismo servidor FTP (ver gui/app.py para la sincronización real --
 este módulo solo tiene el mirror local en disco y las funciones puras de
 add/remove/is_reserved/cuota, sin tocar la red). Mismo patrón que
@@ -112,7 +112,7 @@ def fits_in_quota(data: dict, user: str, size_bytes: int, quota_bytes: int = QUO
 
 def is_name_taken(data: dict, name: str, exclude: Optional[str] = None) -> bool:
     """True si *name* ya aparece como dueño de alguna reserva -- para
-    evitar que dos personas distintas usando aRenombrar contra el mismo
+    evitar que dos personas distintas usando aIBechos contra el mismo
     servidor elijan sin querer el mismo "Tu nombre" (ver gui/app.py::
     _resolve_app_user_name_change) y acaben compartiendo cuota o
     bloqueándose mutuamente al intentar liberar una reserva ajena.

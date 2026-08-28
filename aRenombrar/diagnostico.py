@@ -15,7 +15,7 @@ def write(msg):
 log.write_text("", encoding="utf-8")  # limpiar
 try:
     from core.version import __version__
-    write(f"aRenombrar: v{__version__}")
+    write(f"aIBechos: v{__version__}")
 except Exception:
     pass
 write(f"Python: {sys.version}")

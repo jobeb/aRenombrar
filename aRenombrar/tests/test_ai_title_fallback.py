@@ -30,8 +30,8 @@ def _isolated_logger(monkeypatch, tmp_path):
     Windows (ver test_applog_rotation.py), así que se aísla ahí."""
     monkeypatch.setattr(applog, "app_data_dir", lambda: tmp_path)
     monkeypatch.setattr(applog, "_handlers", {})
-    logging.getLogger("aRenombrar.ai_fallback").handlers.clear()
-    aif._log = applog.get_logger("aRenombrar.ai_fallback", "ai_fallback.log")
+    logging.getLogger("aIBechos.ai_fallback").handlers.clear()
+    aif._log = applog.get_logger("aIBechos.ai_fallback", "ai_fallback.log")
     return aif._log
 
 

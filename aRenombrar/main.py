@@ -1,5 +1,5 @@
 """
-aRenombrar — punto de entrada.
+aIBechos — punto de entrada.
 Ejecutar: python main.py
 """
 
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.single_instance import acquire
 from core.applog import get_logger
 
-_log = get_logger("aRenombrar.main", "app.log")
+_log = get_logger("aIBechos.main", "app.log")
 _log.info("Arranque: import core.single_instance/applog       %6.0f ms",
           (_time.perf_counter() - _t_main_start) * 1000)
 
@@ -37,8 +37,8 @@ def _warn_already_running():
     root = tk.Tk()
     root.withdraw()
     messagebox.showwarning(
-        "aRenombrar ya está en ejecución",
-        "Ya hay una instancia de aRenombrar abierta.\n\n"
+        "aIBechos ya está en ejecución",
+        "Ya hay una instancia de aIBechos abierta.\n\n"
         "Búscala en la bandeja del sistema (junto al reloj) si no ves la ventana.")
     root.destroy()
 

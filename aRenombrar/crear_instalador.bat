@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo ============================================
-echo   aRenombrar - Crear instalador Setup.exe
+echo   aIBechos - Crear instalador Setup.exe
 echo ============================================
 echo.
 
@@ -24,7 +24,7 @@ echo.
 
 :: [2] Compilar con PyInstaller usando aRenombrar.spec
 echo [2/4] Compilando a .exe con PyInstaller...
-if exist dist\aRenombrar rmdir /s /q dist\aRenombrar
+if exist dist\aIBechos rmdir /s /q dist\aIBechos
 if exist build rmdir /s /q build
 
 "%PYTHON%" -m PyInstaller --noconfirm aRenombrar.spec
@@ -60,7 +60,7 @@ echo.
 :: (un intento anterior de hacerlo con /DMyAppVersion desde un comando de
 :: Python aparte fallaba en silencio en algunos entornos, dejando la
 :: version vacia y el instalador sin compilar).
-echo [4/4] Generando aRenombrar_Setup.exe...
+echo [4/4] Generando aIBechos_Setup.exe...
 if exist installer_output rmdir /s /q installer_output
 "%ISCC%" setup.iss
 
@@ -74,7 +74,7 @@ echo.
 
 echo ============================================
 echo   Instalador listo en:
-echo   installer_output\aRenombrar_Setup.exe
+echo   installer_output\aIBechos_Setup.exe
 echo ============================================
 echo.
 echo Puedes compartir ese archivo con quien quieras.

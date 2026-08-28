@@ -1,6 +1,6 @@
 """
 MangaDex API client -- identifica manga/cómic escaneado (cbz, cbr) para
-aRenombrar, alternativa a ComicVine cuando su catálogo (mayoritariamente
+aIBechos, alternativa a ComicVine cuando su catálogo (mayoritariamente
 occidental, en inglés) falla con manga. No necesita ninguna API Key para
 buscar. A diferencia de ComicVine, MangaDex suele traer ya títulos
 alternativos en varios idiomas (incluido español -- "es"/"es-la") en el

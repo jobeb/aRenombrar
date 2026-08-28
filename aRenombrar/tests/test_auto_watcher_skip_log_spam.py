@@ -41,7 +41,7 @@ def test_un_archivo_ya_subido_solo_se_registra_una_vez(watcher, caplog):
     key = r"C:\vigilada\serie 1x01.mkv"
     watcher._processed[key] = {"status": "subido"}
 
-    with caplog.at_level(logging.DEBUG, logger="aRenombrar.auto"):
+    with caplog.at_level(logging.DEBUG, logger="aIBechos.auto"):
         for _ in range(50):          # 50 ciclos de escaneo seguidos
             assert watcher._should_process(key, "serie 1x01.mkv") is False
 
@@ -52,7 +52,7 @@ def test_cada_archivo_conserva_su_propia_linea(watcher, caplog):
     for n in (1, 2, 3):
         watcher._processed[rf"C:\vigilada\serie 1x0{n}.mkv"] = {"status": "subido"}
 
-    with caplog.at_level(logging.DEBUG, logger="aRenombrar.auto"):
+    with caplog.at_level(logging.DEBUG, logger="aIBechos.auto"):
         for _ in range(10):
             for n in (1, 2, 3):
                 watcher._should_process(rf"C:\vigilada\serie 1x0{n}.mkv",
@@ -67,7 +67,7 @@ def test_si_cambia_el_motivo_se_vuelve_a_registrar(watcher, caplog):
     key = r"C:\vigilada\serie 1x01.mkv"
     watcher._in_progress.add(key)
 
-    with caplog.at_level(logging.DEBUG, logger="aRenombrar.auto"):
+    with caplog.at_level(logging.DEBUG, logger="aIBechos.auto"):
         watcher._should_process(key, "serie 1x01.mkv")
         watcher._should_process(key, "serie 1x01.mkv")     # mismo motivo, no repite
         watcher._in_progress.discard(key)
