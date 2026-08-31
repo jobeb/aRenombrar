@@ -464,3 +464,138 @@ def test_el_parche_no_se_encadena_sobre_si_mismo():
     for _ in range(5):
         _permitir_nombres_no_utf8()
     assert msg.u is primera
+
+
+# ----------------------------------- repartir un archivo entre conexiones --
+# El servidor limita CADA conexión por separado (~2 MB/s medidos, y le pasa
+# igual al putfo() de paramiko), así que un archivo solo nunca alcanza el
+# límite configurado. Repartirlo sí: 2 -> 3,9 MB/s, 4 -> 6,5, 6 -> 9,2.
+
+def _grande(tmp_path, cliente):
+    local = tmp_path / "peli.mkv"
+    local.write_bytes(b"z" * (cliente.MULTIFLOW_MIN_BYTES + 1024))
+    return local
+
+
+class _RemotoFalso:
+    def set_pipelined(self, v): pass
+    def seek(self, p): pass
+    def write(self, d): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_un_archivo_pequeno_no_abre_conexiones_de_mas(cliente, tmp_path, monkeypatch):
+    """Abrir una conexión son un saludo TCP y una negociación SSH enteros: para
+    un archivo pequeño cuesta más de lo que se gana."""
+    local = tmp_path / "pequeno.mkv"
+    local.write_bytes(b"z" * 1000)
+    llamado = []
+    monkeypatch.setattr(cliente, "_store_stream_multi",
+                        lambda *a, **k: llamado.append(True))
+    ok, _ = cliente.upload_file(str(local), "/datos/series/Bleach", streams=4)
+    assert ok
+    assert llamado == []
+
+
+def test_un_archivo_grande_se_reparte(cliente, tmp_path, monkeypatch):
+    local = _grande(tmp_path, cliente)
+    repartos = []
+    monkeypatch.setattr(cliente, "_store_stream_multi",
+                        lambda *a, **k: repartos.append(a[-1]))
+    ok, _ = cliente.upload_file(str(local), "/datos/series/Bleach", streams=4)
+    assert ok
+    assert repartos == [4]
+
+
+def test_sin_reparto_pedido_va_por_una_sola(cliente, tmp_path, monkeypatch):
+    local = _grande(tmp_path, cliente)
+    llamado = []
+    monkeypatch.setattr(cliente, "_store_stream_multi",
+                        lambda *a, **k: llamado.append(True))
+    ok, _ = cliente.upload_file(str(local), "/datos/series/Bleach")   # streams=1
+    assert ok
+    assert llamado == []
+
+
+def test_el_trabajo_se_reparte_entre_varias_conexiones(cliente, tmp_path, monkeypatch):
+    """Los trozos van en una cola común, no en tramos fijos: con tramos fijos
+    la conexión más rápida terminaba antes y se quedaba parada, y el archivo
+    acababa subiendo por una sola (medido: de 8 MB/s a 3,7 al final)."""
+    import threading
+    import core.sftp_client as mod
+
+    total = 40 * 1024 * 1024
+    local = tmp_path / "peli.mkv"
+    local.write_bytes(b"z" * total)
+    por_hilo = {}
+
+    class _Falso:
+        def connect(self, *a, **k): return True, "ok"
+        def disconnect(self): pass
+        sftp = type("S", (), {"open": lambda s, r, m: _RemotoFalso()})()
+
+    monkeypatch.setattr(mod, "SFTPClient", _Falso)
+
+    def contar(datos):
+        n = threading.current_thread().name
+        por_hilo[n] = por_hilo.get(n, 0) + len(datos)
+
+    cliente._store_stream_multi(str(local), "/x/peli.mkv", 4 * 1024 * 1024,
+                                contar, 0, total, 4)
+    assert sum(por_hilo.values()) == total      # se subió entero
+    assert len(por_hilo) > 1                    # y entre varios
+
+
+def test_si_se_cae_una_conexion_el_archivo_se_sube_igual(cliente, tmp_path, monkeypatch):
+    """Antes, que se cayera UNA conexión tiraba el archivo entero y había que
+    resubirlo desde cero -- bastante más probable usando varias."""
+    import core.sftp_client as mod
+
+    total = 40 * 1024 * 1024
+    local = tmp_path / "peli.mkv"
+    local.write_bytes(b"z" * total)
+    escrito = []
+    caidas = [2]        # las dos primeras conexiones se caen al conectar
+
+    class _Remoto(_RemotoFalso):
+        def write(self, d): escrito.append(len(d))
+
+    class _Falso:
+        def __init__(self):
+            self._caer = caidas[0] > 0
+            if self._caer:
+                caidas[0] -= 1
+        def connect(self, *a, **k):
+            if self._caer:
+                raise OSError("se cayó la conexión")
+            return True, "ok"
+        def disconnect(self): pass
+        @property
+        def sftp(self):
+            return type("S", (), {"open": lambda s, r, m: _Remoto()})()
+
+    monkeypatch.setattr(mod, "SFTPClient", _Falso)
+    cliente._store_stream_multi(str(local), "/x/peli.mkv", 4 * 1024 * 1024,
+                                lambda d: None, 0, total, 4)
+    assert sum(escrito) == total
+
+
+def test_si_no_hay_forma_de_conectar_la_subida_falla(cliente, tmp_path, monkeypatch):
+    """Reintentar está bien, pero no eternamente: si el servidor no está, hay
+    que decirlo en vez de dar por buena una subida que no ha ocurrido."""
+    import core.sftp_client as mod
+
+    total = 40 * 1024 * 1024
+    local = tmp_path / "peli.mkv"
+    local.write_bytes(b"z" * total)
+
+    class _SiempreCae:
+        def connect(self, *a, **k):
+            raise OSError("servidor caído")
+        def disconnect(self): pass
+
+    monkeypatch.setattr(mod, "SFTPClient", _SiempreCae)
+    with pytest.raises(OSError):
+        cliente._store_stream_multi(str(local), "/x/peli.mkv", 4 * 1024 * 1024,
+                                    lambda d: None, 0, total, 4)

@@ -86,6 +86,12 @@ DEFAULTS = {
     # confirmación, a diferencia de solo identificar.
     "auto_extract_archives": False,
     "ftp_parallel": 1,
+    # Cuántas conexiones se reparten UN MISMO archivo. El servidor limita cada
+    # conexión por separado (~2 MB/s medidos), así que con una sola no se llega
+    # al límite de velocidad configurado por muy alto que esté. Es un
+    # presupuesto total, no por archivo: si se suben varios a la vez, se
+    # reparte entre ellos (ver App._streams_for_upload). Solo aplica a SFTP.
+    "ftp_upload_streams": 4,
     "ftp_speed_limit": 0,
     "ftp_retries": 3,
     "desktop_notifications": True,
@@ -294,7 +300,30 @@ DEFAULTS = {
     "amule_password": "",
     # Red de búsqueda elegida en la pestaña Descargas ("Kad"/"Global"/"Local")
     # -- se persiste para que no vuelva a Kad al reiniciar.
-    "amule_search_type": "Kad",
+"amule_search_type": "Kad",
+    # Template de búsqueda en aMule por serie (dict {nombre_TMDB: template}).
+    # Solo para cuando la búsqueda automática no da resultados: el usuario ayuda
+    # proporcionando un template que sí encuentra. El template se usa tal cual
+    # para construir la query de los capítulos que faltan (gui/app.py).
+    # Vars: {serie}, {temporada}, {temporada:02d}, {episodio}, {episodio:02d}, {año}
+    # Ej: {"That Time I Got Reincarnated as a Slime": "Slime {temporada}x{episodio:02d}"}
+    # Si el template no contiene {temporada}/{episodio}, se añade " {temporada}x{episodio:02d}" solo.
+    "series_search_patterns": {},
+    # Sistema de reintentos inteligentes para archivos que fallan continuamente
+    # (por ejemplo, en emule o cuando TMDB no tiene el título).
+    # Si está activado, el watcher esperará un tiempo creciente antes de volver
+    # a intentar un archivo que antes falló, en lugar de reprocesarlo en cada ciclo.
+    "unstuck_enabled": False,
+    "unstuck_max_retries": 5,                          # Máximo nº de reintentos antes de darse por vencido
+    "unstuck_backoff_base_minutes": 30,              # Base del backoff exponencial (minutos)
+    "unstuck_backoff_max_minutes": 480,              # Backoff máximo (8 horas)
+    "unstuck_file_ttl_minutes": 1440,                # TTL (minutos) antes de reconsiderar un archivo "atrapado"
+    # Estado del sistema Unstuck para aMule (descargas colgadas):
+    # {tmdb_id_str: {season_str: {ep_str: {primary_hash, primary_started_ts, primary_last_bytes, primary_last_progress_ts,
+    #                                      alt_hash, alt_started_ts, alt_last_bytes, alt_last_progress_ts,
+    #                                      stuck_tries, last_alt_ts}}}}
+    # Se gestiona desde gui/app.py y core/unstuck.py; no tocar a mano.
+    "missing_ep_auto_downloads": {},
 }
 
 

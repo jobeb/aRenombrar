@@ -647,7 +647,32 @@ class AutoWatcher:
                 # película "Amadeus (1984)".
                 results = self.tmdb.search_multi(detected["title"], prefer_type=media_type)
                 if not results:
-                    # Intentar búsqueda específica
+                    # Intentar búsqueda alternativa con template por serie
+                    from core.amule_search import build_amule_query
+                    series_patterns = self.config.get("series_search_patterns")
+                    if series_patterns and detected["title"] in series_patterns:
+                        alt_query = build_amule_query(
+                            detected["title"],
+                            season,
+                            episode,
+                            templates=series_patterns,
+                            prefers_castellano=True
+                        )
+                        if alt_query and alt_query != detected["title"]:
+                            _log.debug("Usando query alternativa del patrón de serie: '%s'", alt_query)
+                            # Usar el template para TMDB search
+                            if media_type == "tv":
+                                raw = self.tmdb.search_tv(alt_query)
+                                results = [dict(r, media_type="tv") for r in raw]
+                            else:
+                                raw = self.tmdb.search_movie(alt_query)
+                                results = [dict(r, media_type="movie") for r in raw]
+                            if results:
+                                _log.debug("Query alternativa exitosa (patrón de serie)")
+                            else:
+                                _log.debug("Query alternativa falló (patrón de serie)")
+
+                    # Intentar búsqueda específica (original)
                     if media_type == "tv":
                         raw = self.tmdb.search_tv(detected["title"])
                         results = [dict(r, media_type="tv") for r in raw]

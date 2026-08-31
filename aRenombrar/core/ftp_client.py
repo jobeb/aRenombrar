@@ -10,6 +10,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Callable
 
+from core.speed_ewma import SpeedEWMA
+
+#: Constante de tiempo del suavizado de la velocidad mostrada, en segundos.
+#: 2 s deja la cifra quieta sin dejar de reaccionar a un cambio de verdad.
+_SPEED_SMOOTHING_TAU = 2.0
+
 
 class FTPClient:
     def __init__(self):
@@ -476,7 +482,7 @@ class FTPClient:
     # ---------------------------------------------------------------------
 
     def _store_stream(self, fileobj, remote_file: str, blocksize: int,
-                      callback, resume_offset: int = 0):
+                      callback, resume_offset: int = 0, streams: int = 1):
         """Vuelca *fileobj* (ya posicionado) en el archivo remoto, llamando a
         *callback* con cada bloque enviado."""
         if resume_offset > 0:
@@ -501,6 +507,7 @@ class FTPClient:
         speed_limit_kbs: int = 0,
         try_resume: bool = False,
         remote_filename: Optional[str] = None,
+        streams: int = 1,
     ) -> tuple[bool, str]:
         """
         Sube un archivo al servidor FTP.
@@ -511,6 +518,10 @@ class FTPClient:
         remote_filename: nombre a usar en el servidor si debe ser distinto al
           nombre del archivo local (p.ej. "renombrar en destino" sin haber
           renombrado en origen). Por defecto, el nombre del archivo local.
+        streams: cuántas conexiones se reparten ESTE archivo. Solo lo aprovecha
+          SFTP (ver core/sftp_client.py); por FTP se ignora. El servidor limita
+          cada conexión por separado (~2 MB/s medidos), así que con una sola no
+          se llega al límite de velocidad configurado por muy alto que esté.
         Retorna: (ok, msg) donde msg puede ser 'cancelado' o 'saltado'.
         """
         if not self.is_connected():
@@ -545,6 +556,10 @@ class FTPClient:
         t_window = [time.monotonic()]
         sent_window = [0]
         speed_last = [0.0]
+        # La velocidad que se enseña va suavizada: la cruda de cada tramo da
+        # botes (y encima engaña: pesaba igual un tramo corto con ráfaga que
+        # uno largo) -- ver core/speed_ewma.py.
+        speed_media = SpeedEWMA(_SPEED_SMOOTHING_TAU)
 
         # speed_limit_kbs puede ser int o callable que devuelve KB/s
         def _get_speed_limit() -> int:
@@ -555,7 +570,13 @@ class FTPClient:
             except Exception:
                 return 0
 
-        BLOCKSIZE = 4 * 1024 * 1024   # 4 MB — menos callbacks Python = más throughput
+        # 256 KB y no 4 MB: con el archivo repartido entre varias conexiones,
+        # un bloque grande hace que los avisos de progreso lleguen muy
+        # espaciados y a trompicones, y la velocidad mostrada oscila aunque la
+        # real sea estable (medido: saltos del 57 % de la media con 4 MB
+        # frente al 22 % con 256 KB). El caudal no se resiente: lo marca el
+        # servidor, no el número de llamadas de Python.
+        BLOCKSIZE = 256 * 1024
         REPORT_INTERVAL = 0.4
 
         class _Cancelled(Exception):
@@ -612,7 +633,8 @@ class FTPClient:
             now = time.monotonic()
             window_elapsed = now - t_window[0]
             if window_elapsed >= REPORT_INTERVAL:
-                speed_last[0] = (sent[0] - sent_window[0]) / window_elapsed
+                speed_last[0] = speed_media.update(
+                    (sent[0] - sent_window[0]) / window_elapsed, now)
                 t_window[0] = now
                 sent_window[0] = sent[0]
                 if progress_cb:
@@ -639,7 +661,8 @@ class FTPClient:
                 with open(local_path, "rb") as f:
                     if resume_offset > 0:
                         f.seek(resume_offset)
-                    self._store_stream(f, remote_file, BLOCKSIZE, callback, resume_offset)
+                    self._store_stream(f, remote_file, BLOCKSIZE, callback,
+                                       resume_offset, streams)
             finally:
                 # Restaurar timeout original (o 30 s como valor seguro)
                 try:

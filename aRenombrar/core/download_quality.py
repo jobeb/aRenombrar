@@ -239,6 +239,13 @@ def _same_series_title(query: str, name: str) -> bool:
         return True
     q = re.sub(r"\[[^\]]*\]", " ", q)
     n = re.sub(r"\[[^\]]*\]", " ", n)
+    # Alias corto del usuario (ej. "Slime" para "That Time I Got Reincarnated as a Slime"):
+    # series_similarity estricto 0.90 falla porque "Slime" solo es sufijo, no prefijo.
+    # Si la versión normalizada corta está contenida en la larga, aceptar.
+    qn = normalize_series_name(q)
+    nn = normalize_series_name(n)
+    if len(qn) >= 3 and len(nn) >= 3 and (qn in nn or nn in qn):
+        return True
     return series_similarity(q, n, strict=True, allow_annotation=True) >= 0.90
 
 

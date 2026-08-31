@@ -549,16 +549,23 @@ def test_spanish_title_words_not_flagged_as_italian():
 
 # ---- Misma serie, no solo misma numeración (real: "Lucky" eligió "Lucky Luke") ----
 
-def test_episode_match_requires_same_series_title():
-    """El autocompletado de "Lucky" lanzó "Lucky 1x01" y aMule devolvió
-    "Lucky Luke 1x01 El solitario...": misma numeración, pero OTRA serie cuyo
-    título es un prefijo de la consulta. Con el +50 de episodio y el +5 de
-    overlap ("lucky" en común) ganaba igual. Ahora se exige que la parte de la
-    SERIE coincida (modo estricto) y el capítulo de otra serie se excluye."""
+def test_un_nombre_corto_contenido_en_otro_se_acepta():
+    """DECISIÓN CONSCIENTE del usuario (2026-08-31), con su contrapartida.
+
+    Para poder pedir series por un alias corto ("Slime" en vez de "That Time I
+    Got Reincarnated as a Slime"), _same_series_title acepta un nombre
+    normalizado contenido en el otro. El precio es que vuelve a colar el caso
+    que este test vigilaba: pedir "Lucky" acepta "Lucky Luke", que es OTRA
+    serie con la misma numeración.
+
+    Afecta también al autocompletado AUTOMÁTICO (_auto_complete_pass ->
+    _auto_amule_download_series -> best_result), no solo a la búsqueda manual,
+    así que una serie de nombre corto puede completarse sola con capítulos de
+    otra. Se deja así a petición expresa; si algún día molesta, la salida es
+    una lista de alias explícita en vez de aceptar cualquier subcadena."""
     luke = _r(1, "Lucky Luke 1x01 El solitario (Spanish French Subs) WEB-DL 1080p x264-EAC3.mkv",
               size="1200 MB", sources=15, complete=True)
-    assert score_download(luke, "Lucky 1x01") == 0.0
-    assert best_result([luke], "Lucky 1x01") is None
+    assert score_download(luke, "Lucky 1x01") > 0.0
 
 
 def test_same_series_with_annotation_still_matches():
@@ -579,13 +586,16 @@ def test_bracket_group_prefix_does_not_break_series_match():
     assert score_download(r, "Resident Alien 4x04") > 0.0
 
 
-def test_best_result_picks_real_series_over_prefix_other_series():
-    """Con "Lucky 1x01" pedido, un "Lucky Luke 1x01 1080p español" NO debe
-    ganar al "Lucky 1x01 720p" aunque tenga mejor calidad/fuentes."""
+def test_entre_dos_candidatos_manda_la_calidad():
+    """Contrapartida de aceptar nombres contenidos (ver el test de arriba): con
+    "Lucky 1x01" pedido, "Lucky Luke" ya no queda descartado por ser otra
+    serie, así que gana el de mejor calidad y más fuentes aunque no sea la
+    serie pedida. Queda escrito para que se vea el efecto real de la decisión,
+    no como comportamiento deseable."""
     luke = _r(1, "Lucky Luke 1x01 El solitario (Spanish French Subs) WEB-DL 1080p x264-EAC3.mkv",
               size="1200 MB", sources=15, complete=True)
     real = _r(2, "Lucky 1x01 720p WEB-DL x264 Castellano.mkv",
               size="600 MB", sources=3, complete=False)
     best = best_result([luke, real], "Lucky 1x01")
     assert best is not None
-    assert best.number == 2
+    assert best.number == 1

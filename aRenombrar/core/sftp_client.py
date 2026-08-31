@@ -22,12 +22,18 @@ tiene por qué pagar su carga al arrancar la aplicación.
 """
 
 import io
+import os
 import stat as stat_mod
+import threading
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Callable
 
+from core.applog import get_logger
 from core.ftp_client import FTPClient
+
+_log = get_logger("aIBechos.sftp", "app.log")
 
 
 #: Puerto estándar de SSH/SFTP (el de FTP es el 21).
@@ -326,8 +332,173 @@ class SFTPClient(FTPClient):
 
     # ------------------------------------------------ enviar / recibir ------
 
+    #: A partir de este tamaño compensa repartir un archivo entre conexiones.
+    #: Por debajo, abrirlas cuesta más de lo que se gana.
+    MULTIFLOW_MIN_BYTES = 16 * 1024 * 1024
+
+    #: Tamaño de cada trozo de la cola de trabajo. Pequeño para que todas las
+    #: conexiones acaben a la vez, pero no tanto que ir a por trabajo se note.
+    CHUNK_BYTES = 8 * 1024 * 1024
+
+    #: Reintentos de un trozo cuya conexión se cayó, antes de darlo por perdido.
+    CHUNK_MAX_ATTEMPTS = 3
+
     def _store_stream(self, fileobj, remote_file: str, blocksize: int,
-                      callback, resume_offset: int = 0):
+                      callback, resume_offset: int = 0, streams: int = 1):
+        """Manda el archivo, por una conexión o repartido entre varias.
+
+        Repartirlo es lo único que sube de verdad la velocidad con un archivo
+        solo: medido contra el servidor, CADA conexión se queda clavada en ~2
+        MB/s (da igual el tamaño de bloque, y le pasa igual al putfo() del
+        propio paramiko), pero varias suman casi linealmente: 2 -> 3,9 MB/s,
+        4 -> 6,5, 6 -> 9,2. El cuello no es la línea ni la ventana SSH (con 98
+        ms de latencia darían para 20 MB/s): es un límite por conexión."""
+        ruta_local = getattr(fileobj, "name", None)
+        total = None
+        if ruta_local:
+            try:
+                total = os.path.getsize(ruta_local)
+            except OSError:
+                total = None
+        if (streams > 1 and ruta_local and total is not None
+                and total - resume_offset >= self.MULTIFLOW_MIN_BYTES):
+            self._store_stream_multi(ruta_local, remote_file, blocksize, callback,
+                                     resume_offset, total, streams)
+            return
+        self._store_stream_single(fileobj, remote_file, blocksize, callback,
+                                  resume_offset)
+
+    def _store_stream_multi(self, ruta_local: str, remote_file: str, blocksize: int,
+                            callback, desde: int, total: int, streams: int):
+        """Reparte el archivo entre varias conexiones, por trozos.
+
+        Todas escriben en el MISMO archivo remoto, cada una colocada en su
+        trozo (seek): es lo que hacen los gestores de descargas, y en SFTP vale
+        porque se puede escribir en cualquier posición.
+
+        Los trozos van en una cola común y no en tramos fijos por conexión: con
+        tramos fijos, la conexión más rápida terminaba antes y se quedaba
+        parada, así que el archivo acababa subiendo por una sola y la velocidad
+        se desplomaba al final (medido: empezaba a 8 MB/s y acababa a 3,7)."""
+        # Dejar el archivo creado antes de repartir: los trozos lo abren para
+        # escribir en su sitio, y ninguno debe truncarlo.
+        with self.sftp.open(remote_file, "r+b" if desde > 0 else "wb"):
+            pass
+
+        trozos = deque()
+        posicion = desde
+        while posicion < total:
+            siguiente = min(posicion + self.CHUNK_BYTES, total)
+            trozos.append((posicion, siguiente))
+            posicion = siguiente
+
+        reparto = threading.Lock()
+        parar = threading.Event()
+        fallos = []
+        intentos = {}
+        ultimo_error = []
+
+        def siguiente_trozo():
+            with reparto:
+                return trozos.popleft() if trozos else None
+
+        def reencolar(trozo) -> bool:
+            """Devuelve el trozo a la cola para que lo coja otra conexión.
+
+            Sin esto, que se cayera UNA conexión tiraba el archivo entero y
+            había que resubirlo desde cero -- bastante más probable usando
+            varias. Los trozos son independientes, así que reintentar uno no
+            molesta a los demás."""
+            with reparto:
+                intentos[trozo] = intentos.get(trozo, 1) + 1
+                if intentos[trozo] > self.CHUNK_MAX_ATTEMPTS:
+                    return False
+                trozos.appendleft(trozo)
+                return True
+
+        def quedan_trozos() -> bool:
+            with reparto:
+                return bool(trozos)
+
+        def trabajar():
+            """Un hilo: abre su conexión y va cogiendo trozos. Si se cae,
+            devuelve lo que tuviera a medias y lo reintenta con otra."""
+            for _ in range(self.CHUNK_MAX_ATTEMPTS):
+                if parar.is_set() or not quedan_trozos():
+                    return
+                if _con_una_conexion():
+                    return
+
+        def _con_una_conexion() -> bool:
+            """True si terminó; False si se cayó y conviene reintentar."""
+            cliente = None
+            # Solo el trozo de ESTE hilo: reencolar los de los demás (que los
+            # están subiendo ahora mismo) duplicaría el trabajo.
+            en_curso = [None]
+            try:
+                cliente = SFTPClient()
+                ok, msg = cliente.connect(self.host, self.port, self.user,
+                                          self.password)
+                if not ok:
+                    raise IOError(msg)
+                with open(ruta_local, "rb") as local, \
+                        cliente.sftp.open(remote_file, "r+b") as remoto:
+                    remoto.set_pipelined(True)
+                    while not parar.is_set():
+                        trozo = siguiente_trozo()
+                        if trozo is None:
+                            break
+                        en_curso[0] = trozo
+                        inicio, fin = trozo
+                        local.seek(inicio)
+                        remoto.seek(inicio)
+                        queda = fin - inicio
+                        while queda > 0 and not parar.is_set():
+                            datos = local.read(min(blocksize, queda))
+                            if not datos:
+                                break
+                            remoto.write(datos)
+                            queda -= len(datos)
+                            callback(datos)
+                        if queda <= 0:
+                            en_curso[0] = None
+                return True
+            except (OSError, EOFError) as e:
+                if en_curso[0] is None or reencolar(en_curso[0]):
+                    _log.warning("Subida repartida: una conexión se cayó (%s); "
+                                 "su trabajo vuelve a la cola", e)
+                    ultimo_error.append(e)
+                    return False
+                parar.set()
+                fallos.append(e)
+            except BaseException as e:
+                # Cancelar/saltar, que el callback lanza a propósito: se para
+                # todo y se relanza en el hilo principal, que sabe
+                # distinguirlas (ver FTPClient.upload_file).
+                parar.set()
+                fallos.append(e)
+            finally:
+                if cliente is not None:
+                    cliente.disconnect()
+            return True
+
+        hilos = [threading.Thread(target=trabajar, daemon=True)
+                 for _ in range(streams)]
+        for h in hilos:
+            h.start()
+        for h in hilos:
+            h.join()
+        if fallos:
+            raise fallos[0]
+        # Si se agotaron los reintentos sin que nadie pudiera conectar, queda
+        # trabajo sin hacer: hay que decirlo con el error de verdad, o la
+        # subida se daría por buena sin haber subido nada.
+        if trozos:
+            raise (ultimo_error[-1] if ultimo_error
+                   else IOError("no se pudo subir el archivo entero"))
+
+    def _store_stream_single(self, fileobj, remote_file: str, blocksize: int,
+                             callback, resume_offset: int = 0):
         """Vuelca *fileobj* en el archivo remoto llamando a *callback* por
         bloque -- el mismo callback que usa el cliente FTP, que es quien
         aplica el límite de velocidad y va informando del progreso.

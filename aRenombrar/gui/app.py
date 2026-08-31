@@ -47,6 +47,7 @@ from core.renamer import (build_new_name, rename_file, is_video_file, is_book_fi
                            is_comic_file, get_extension, build_name_for_media_info, is_archive_file)
 from core.ftp_client import _ftp_safe, sizes_by_top_level_folder, files_by_top_level_folder
 from core import shared_data
+from core.speed_ewma import SpeedEWMA
 from core.amule_client import AmuleSearchResult
 from core.ec_client import EcClient, EcConnectionError, EcAuthError, EcProtocolError
 from core.auto_watcher import AutoWatcher
@@ -54,6 +55,7 @@ from core.series_match import best_match, match_names_exclusively, normalize_ser
 from core import remote_presence as rp
 from core import auto_complete_state
 from core.download_quality import best_result
+from core.amule_search import build_amule_query, build_amule_season_query
 
 # Parecido mínimo para dar dos carpetas del FTP por la MISMA serie al
 # comprobar qué episodios ya están en el servidor (ver _match_ftp_present).
@@ -107,6 +109,13 @@ SELECTED_ROW_COLOR = ("#c8e6d0", "#204a34")   # (modo claro, modo oscuro) — fi
 
 #: Cómo se llama cada protocolo en la pestaña de conexión. FTPS es FTP con
 #: TLS (mismo protocolo, cifrado); SFTP es SSH y no tiene nada que ver.
+TOOLTIP_CONEXIONES_POR_ARCHIVO = (
+    "El servidor limita cada conexión por separado, así que un archivo solo no "
+    "llega al límite de velocidad por muy alto que esté. Repartirlo entre varias "
+    "lo acelera: medido contra el servidor, 1 conexión da 2 MB/s y 4 dan 6,5.\n"
+    "Es un total: si se suben varios archivos a la vez, se reparte entre ellos."
+)
+
 PROTOCOL_LABELS = {
     "ftp":  "FTP",
     "ftps": "FTPS (FTP con TLS)",
@@ -864,8 +873,19 @@ class FileEntry:
 
     def to_dict(self) -> dict:
         status = self.status
-        if status in ("buscando", "subiendo", "auto", "en_cola"):
+        # Persistir progreso de subida a medias para que al reabrir la app
+        # la barra no fluctúe 0%→45%→0% (ver issue barra fluctuante). Antes se
+        # demotaba subiendo/en_cola→pendiente y se perdía ftp_progress, así que
+        # _begin_ftp_upload reseteaba a 0% y el resume a 45% alternaba cada 2 s
+        # con los "Reintento…" que reaplicaban el 0% guardado.
+        ftp_progress = float(getattr(self, "ftp_progress", 0.0) or 0.0)
+        if status in ("buscando", "auto"):
             status = "pendiente"
+        elif status in ("subiendo", "en_cola"):
+            # Conservar como en_cola con progreso para que al reiniciar se vea
+            # "En cola 45%" y no "pendiente 0%" y el siguiente upload no
+            # parpadee. El usuario puede re-lanzar sin duplicar.
+            status = "en_cola"
         return {
             "path":       self.path,
             "new_name":   self.new_name,
@@ -886,6 +906,7 @@ class FileEntry:
             # mostrar en su lugar (el caché en memoria no sobrevive un
             # reinicio si no se persiste).
             "last_known_size_bytes": self._last_known_size_bytes,
+            "ftp_progress": ftp_progress,
         }
 
     @classmethod
@@ -907,6 +928,14 @@ class FileEntry:
         entry._last_known_size_bytes = d.get("last_known_size_bytes")
         if entry._last_known_size_bytes is not None:
             entry._last_known_size_text = _fmt_size(entry._last_known_size_bytes)
+        # Restaurar progreso de subida previa (ver to_dict: evita fluctuación 0%↔45%)
+        try:
+            entry.ftp_progress = float(d.get("ftp_progress", 0.0) or 0.0)
+        except Exception:
+            entry.ftp_progress = 0.0
+        entry.ftp_progress = max(0.0, min(1.0, entry.ftp_progress))
+        if entry.status == "en_cola" and entry.ftp_progress > 0:
+            entry.ftp_status = f"{entry.ftp_progress*100:.0f}% (pendiente de reanudar)"
         mi = d.get("media_info")
         if mi:
             from core.api_client import MediaInfo
@@ -1118,6 +1147,10 @@ class App(_AppBase):
         # automático — "Subidas simultáneas" en Ajustes limita el total real,
         # no cada origen por separado (ver core/upload_slots.py).
         self._upload_slots = UploadSlotManager(self.config_data)
+        # Velocidad total de la barra de estado, suavizada (ver
+        # _update_status_bar). Constante más corta que la de cada archivo: aquí
+        # solo hay que limar el desacompasamiento entre ellos.
+        self._total_speed_media = SpeedEWMA(tau=1.0)
 
         ctk.set_appearance_mode(self.config_data.get("appearance", "dark"))
         ctk.set_default_color_theme(self.config_data.get("color_theme", "blue"))
@@ -1960,8 +1993,15 @@ class App(_AppBase):
             # fila, cuánto se está aprovechando de verdad el ancho de banda
             # disponible en conjunto.
             total_speed = sum(e.ftp_speed for e in self.files if e.status == "subiendo")
+            # Cada sumando ya viene suavizado, pero sus lecturas no van
+            # acompasadas entre sí y el total todavía da escalones al sumarlas.
+            # Una segunda pasada corta lo deja quieto.
             if total_speed > 0:
+                total_speed = self._total_speed_media.update(
+                    total_speed, _time.monotonic())
                 parts.append(f"Subiendo: {_fmt_speed(total_speed)}")
+            else:
+                self._total_speed_media.reset()   # que la próxima no arrastre
             self._status_bar_left.configure(text="   ·   ".join(parts))
 
         # El texto de la derecha refleja la selección de la vista ACTIVA
@@ -2473,23 +2513,19 @@ class App(_AppBase):
 
         right_fr = ctk.CTkFrame(table_header, fg_color="transparent")
         right_fr.grid(row=0, column=2, sticky="e")
-        # Derecha: Subir todo, Renombrar, Limpiar (pack right en orden inverso al visual)
-        upload_all_btn = ctk.CTkButton(right_fr, text="Subir todo", command=self._upload_all_ftp,
-                      width=100)
-        attach_tooltip(upload_all_btn, lambda: "Subir al servidor todos los archivos de la lista, "
+        # Derecha: Subir todo/seleccionados, Limpiar/seleccionados (pack right inverso)
+        # Renombrar eliminado: Asignar ya renombra (ver build_new_name), no tiene sentido duplicado.
+        self._upload_all_btn = ctk.CTkButton(right_fr, text="Subir todo", command=self._on_header_upload_clicked,
+                      width=130)
+        attach_tooltip(self._upload_all_btn, lambda: "Subir al servidor todos los archivos de la lista, "
                        "cada uno a la carpeta de su columna \"Destino\". Respeta el límite de "
                        "subidas simultáneas y el renombrado configurados en Ajustes.")
-        upload_all_btn.pack(side="right", padx=(4, 12), pady=8)
-        rename_all_btn = ctk.CTkButton(right_fr, text="Renombrar", command=self._rename_all,
-                      width=100)
-        attach_tooltip(rename_all_btn, lambda: "Renombrar los archivos EN LOCAL con el nombre de "
-                       "la columna \"Nombre nuevo\". No sube nada.")
-        rename_all_btn.pack(side="right", padx=4, pady=8)
-        clear_files_btn = ctk.CTkButton(right_fr, text="Limpiar", command=self._clear_files,
-                      fg_color="transparent", border_width=1, width=80)
-        attach_tooltip(clear_files_btn, lambda: "Vaciar la lista. Los archivos siguen en tu disco "
+        self._upload_all_btn.pack(side="right", padx=(4, 12), pady=8)
+        self._clear_files_btn = ctk.CTkButton(right_fr, text="Limpiar", command=self._on_header_clear_clicked,
+                      fg_color="transparent", border_width=1, width=110)
+        attach_tooltip(self._clear_files_btn, lambda: "Vaciar la lista. Los archivos siguen en tu disco "
                        "y en el historial: solo desaparecen de esta tabla.")
-        clear_files_btn.pack(side="right", padx=4, pady=8)
+        self._clear_files_btn.pack(side="right", padx=4, pady=8)
 
         # Fuentes compartidas por las columnas truncadas — se reutilizan tanto para
         # dibujar el texto como para medirlo en _fit_text, así ambos ancho coinciden.
@@ -2941,15 +2977,15 @@ class App(_AppBase):
         # afecta a la búsqueda MANUAL de este panel -- ni la identificación
         # automática al añadir archivos ni el Modo Automático la usan.
         self._SEARCH_PROVIDER_LABELS = {
-            "auto": "Auto", "openlibrary": "OpenLibrary", "google_books": "GoogleBooks",
+            "tmdb": "TMDB", "openlibrary": "OpenLibrary", "google_books": "GoogleBooks",
             "comicvine": "ComicVine", "mangadex": "MangaDex", "anilist": "AniList", "kitsu": "Kitsu",
         }
-        self._search_provider_override = "auto"
+        self._search_provider_override = "tmdb"
         self._search_provider_menu = ctk.CTkOptionMenu(
             search_top, values=list(self._SEARCH_PROVIDER_LABELS.values()),
             command=self._on_search_provider_changed, width=239, height=22,
             font=ctk.CTkFont(size=11))
-        self._search_provider_menu.set("Auto")
+        self._search_provider_menu.set("TMDB")
         self._search_provider_menu.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         # Un único campo hace de buscador y de desplegable de resultados:
         # se escribe el título y se pulsa Enter/"Buscar", y el propio campo
@@ -5384,6 +5420,21 @@ class App(_AppBase):
             return
         threading.Thread(target=self._scan_missing_episodes, daemon=True).start()
 
+    def _streams_for_upload(self) -> int:
+        """Cuántas conexiones puede repartirse cada archivo.
+
+        El ajuste es un presupuesto TOTAL, no por archivo: si se suben varios a
+        la vez ya hay paralelismo entre ellos y no conviene multiplicarlo --
+        abrir veinte sesiones SSH de golpe es buena forma de que el servidor
+        empiece a rechazarlas. Con un solo archivo, que es cuando la velocidad
+        se queda corta, se usan todas."""
+        if str(self.config_data.get("ftp_protocol", "ftp")).lower() != "sftp":
+            return 1        # por FTP no hay nada que repartir
+        presupuesto = int(self.config_data.get("ftp_upload_streams", 4) or 1)
+        a_la_vez = max(1, min(getattr(self, "_upload_batch_size", 1),
+                              int(self.config_data.get("ftp_parallel", 1) or 1)))
+        return max(1, presupuesto // a_la_vez)
+
     def _start_ftp_upload(self, entries):
         if self._upload_running:
             self._set_status("Ya hay una subida en progreso", WARNING_COLOR)
@@ -5391,6 +5442,9 @@ class App(_AppBase):
         if not self.config_data.get("ftp_host", ""):
             self._set_status("Configura el servidor FTP en la pestania FTP", WARNING_COLOR)
             return
+        # Cuántos archivos lleva la tanda: decide si cada uno puede repartirse
+        # entre varias conexiones (ver _streams_for_upload).
+        self._upload_batch_size = len(entries)
         if self._missing_ep_scanning:
             # La subida es lo prioritario: un escaneo completo hace muchas
             # llamadas seguidas a TMDB, y compartirlas con la identificación
@@ -5420,11 +5474,14 @@ class App(_AppBase):
         # Refrescar en cada tanda por si han cambiado carpetas en el servidor
         self._series_folder_cache.clear()
         self._ftp_dir_cache.clear()
-        # Resetear columnas FTP de los archivos en cola
+        # Resetear columnas FTP de los archivos en cola — pero si ya trae progreso
+        # guardado (reanudado tras cerrar a medias), conservarlo para no fluctuar 0%↔45%
         for entry in entries:
-            entry.ftp_progress = 0.0
+            if not getattr(entry, "ftp_progress", 0):
+                entry.ftp_progress = 0.0
             entry.ftp_speed    = 0.0
-            entry.ftp_status   = "En espera"
+            if not getattr(entry, "ftp_status", "") or entry.ftp_status.startswith("0%"):
+                entry.ftp_status   = "En espera"
             entry.status       = "en_cola"
             self._update_row(entry)
         self._refresh_ftp_columns()
@@ -5932,6 +5989,7 @@ class App(_AppBase):
                 speed_limit_kbs=speed_kbs,
                 try_resume=not force_overwrite,
                 remote_filename=remote_filename,
+                streams=self._streams_for_upload(),
             )
         finally:
             self._upload_slots.release()
@@ -6610,6 +6668,50 @@ class App(_AppBase):
             e.grid(row=i, column=1, padx=10, pady=6, sticky="ew")
             self._amule_entries[key] = e
 
+        # ── Unstuck: desatascar descargas colgadas (tiempo+avance) → alternativa ──
+        ro = 5
+        ctk.CTkLabel(amule_fr, text="Desatasco automático de descargas colgadas en aMule",
+                     font=self._cfg_font_subtitle).grid(row=ro, column=0, columnspan=2, pady=(14, 2), sticky="w", padx=10)
+        ro += 1
+        ctk.CTkLabel(amule_fr,
+                     text="Si una descarga lleva tiempo sin avanzar (0 fuentes, velocidad 0 o % estancado), "
+                          "busca otra fuente alternativa para el mismo capítulo. Cuando una de las dos termina, "
+                          "cancela automáticamente la otra. Si no encuentra alternativa, espera cada vez más (backoff).",
+                     font=self._cfg_font_desc, text_color=PENDING_COLOR, wraplength=600).grid(
+            row=ro, column=0, columnspan=2, pady=(0, 6), sticky="w", padx=10)
+        ro += 1
+        self._unstuck_switch = ctk.CTkSwitch(amule_fr, text="Activar desatasco automático (tiempo + avance → alternativa)")
+        if self.config_data.get("unstuck_enabled"):
+            self._unstuck_switch.select()
+        self._unstuck_switch.grid(row=ro, column=0, columnspan=2, pady=6, sticky="w", padx=10)
+        attach_tooltip(self._unstuck_switch, lambda: "Cuando está activo, el autocompletado vigila cada descarga.\n"
+                       "Si lleva tiempo sin crecer en bytes/fuentes, lanza una búsqueda alternativa\n"
+                       "(mismo capítulo con otro hash/search Kad↔Global). Si cualquiera termina, borra la otra.")
+        ro += 1
+        # Fila compacta con 4 entries numéricos + tooltips
+        unstuck_fr = ctk.CTkFrame(amule_fr, fg_color="transparent")
+        unstuck_fr.grid(row=ro, column=0, columnspan=2, sticky="ew", padx=10, pady=6)
+        for col in range(8):
+            unstuck_fr.grid_columnconfigure(col, weight=1)
+        def _mk_num(parent, label, tip, key, default, width=60):
+            lbl = ctk.CTkLabel(parent, text=label, font=ctk.CTkFont(size=11))
+            lbl.pack(side="left", padx=(0, 4))
+            attach_tooltip(lbl, lambda t=tip: t)
+            en = ctk.CTkEntry(parent, width=width)
+            en.insert(0, str(self.config_data.get(key, default)))
+            en.pack(side="left", padx=(0, 12))
+            attach_tooltip(en, lambda t=tip: t)
+            return en
+        self._unstuck_max_retries_entry = _mk_num(unstuck_fr, "Intentos máx.:",
+            "Cuántas veces como máximo se buscará una alternativa para el mismo capítulo.", "unstuck_max_retries", 5, width=50)
+        self._unstuck_backoff_base_entry = _mk_num(unstuck_fr, "Espera inicial (min):",
+            "Espera base del backoff: 1º reintento espera esto, 2º el doble, 3º el cuádruple…", "unstuck_backoff_base_minutes", 30, width=50)
+        self._unstuck_backoff_max_entry = _mk_num(unstuck_fr, "Espera máxima (min):",
+            "Tope del backoff: aunque falle muchas veces no esperará más que esto.", "unstuck_backoff_max_minutes", 480, width=60)
+        self._unstuck_ttl_entry = _mk_num(unstuck_fr, "Sin avance (min):",
+            "Minutos sin avance (bytes/fuentes estancados) y con la descarga ya en marcha\n"
+            "necesarios para considerarla atascada y lanzar la alternativa.", "unstuck_file_ttl_minutes", 1440, width=60)
+
     def _current_protocol_label(self) -> str:
         guardado = self.config_data.get("ftp_protocol", "ftp")
         if str(guardado).lower() == "sftp":
@@ -6679,11 +6781,24 @@ class App(_AppBase):
         self._ftp_parallel_combo.set(str(self.config_data.get("ftp_parallel", 1)))
         self._ftp_parallel_combo.grid(row=6, column=1, sticky="w", padx=10, pady=6)
 
+        # Conexiones por archivo (solo SFTP)
+        ctk.CTkLabel(conn, text="Conexiones por archivo:").grid(
+            row=7, column=0, sticky="e", padx=10, pady=6)
+        streams_fr = ctk.CTkFrame(conn, fg_color="transparent")
+        streams_fr.grid(row=7, column=1, sticky="w", padx=10, pady=6)
+        self._ftp_streams_combo = ctk.CTkComboBox(
+            streams_fr, values=["1", "2", "4", "6", "8"], width=80, state="readonly")
+        self._ftp_streams_combo.set(str(self.config_data.get("ftp_upload_streams", 4)))
+        self._ftp_streams_combo.pack(side="left")
+        ctk.CTkLabel(streams_fr, text="  (solo SFTP)", text_color=PENDING_COLOR,
+                     font=self._cfg_font_desc).pack(side="left", padx=(4, 0))
+        attach_tooltip(self._ftp_streams_combo, TOOLTIP_CONEXIONES_POR_ARCHIVO)
+
         # Límite de velocidad
         ctk.CTkLabel(conn, text="Límite de velocidad (MB/s):").grid(
-            row=7, column=0, sticky="e", padx=10, pady=6)
+            row=8, column=0, sticky="e", padx=10, pady=6)
         spd_fr = ctk.CTkFrame(conn, fg_color="transparent")
-        spd_fr.grid(row=7, column=1, sticky="w", padx=10, pady=6)
+        spd_fr.grid(row=8, column=1, sticky="w", padx=10, pady=6)
         self._ftp_speed_entry = ctk.CTkEntry(spd_fr, width=100)
         self._ftp_speed_entry.insert(0, str(self.config_data.get("ftp_speed_limit", 0)))
         self._ftp_speed_entry.pack(side="left")
@@ -6692,10 +6807,10 @@ class App(_AppBase):
 
         # Reintentos automáticos
         ctk.CTkLabel(conn, text="Reintentos en error:").grid(
-            row=8, column=0, sticky="e", padx=10, pady=6)
+            row=9, column=0, sticky="e", padx=10, pady=6)
         self._ftp_retries_entry = ctk.CTkEntry(conn, width=80)
         self._ftp_retries_entry.insert(0, str(self.config_data.get("ftp_retries", 3)))
-        self._ftp_retries_entry.grid(row=8, column=1, sticky="w", padx=10, pady=6)
+        self._ftp_retries_entry.grid(row=9, column=1, sticky="w", padx=10, pady=6)
 
         # Carpeta compartida donde viven favoritos/reservas/configuración
         # de servidor -- una CARPETA, no un archivo (ver _shared_data_path):
@@ -6704,11 +6819,11 @@ class App(_AppBase):
         # aIBechos_config_servidor.json). Vacío = las 3 funciones solo
         # locales, sin sincronizar.
         ctk.CTkLabel(conn, text="Carpeta compartida (datos):").grid(
-            row=9, column=0, sticky="e", padx=10, pady=6)
+            row=10, column=0, sticky="e", padx=10, pady=6)
         self._shared_data_ftp_path_entry = ctk.CTkEntry(
             conn, width=200, placeholder_text="/datos2/aIBechos")
         self._shared_data_ftp_path_entry.insert(0, str(self.config_data.get("shared_data_ftp_path", "")))
-        self._shared_data_ftp_path_entry.grid(row=9, column=1, padx=10, pady=6, sticky="ew")
+        self._shared_data_ftp_path_entry.grid(row=10, column=1, padx=10, pady=6, sticky="ew")
 
         # Nombre de esta persona -- identifica su cuota de reservas (ver
         # core/reservations.py, tamaño configurable en Servidor ->
@@ -6716,20 +6831,20 @@ class App(_AppBase):
         # Solo hace falta si se van a usar reservas; favoritos no lo
         # necesita (es un concepto sin dueño, compartido por todos).
         ctk.CTkLabel(conn, text="Tu nombre (reservas):").grid(
-            row=10, column=0, sticky="e", padx=10, pady=6)
+            row=11, column=0, sticky="e", padx=10, pady=6)
         self._app_user_name_entry = ctk.CTkEntry(
             conn, width=200, placeholder_text="Para repartir la cuota de reservas por persona")
         self._app_user_name_entry.insert(0, str(self.config_data.get("app_user_name", "")))
-        self._app_user_name_entry.grid(row=10, column=1, padx=10, pady=6, sticky="ew")
+        self._app_user_name_entry.grid(row=11, column=1, padx=10, pady=6, sticky="ew")
 
         bf = ctk.CTkFrame(conn, fg_color="transparent")
-        bf.grid(row=11, column=0, columnspan=2, pady=10)
+        bf.grid(row=12, column=0, columnspan=2, pady=10)
         test_ftp_btn = ctk.CTkButton(bf, text="Probar conexión", command=self._test_ftp)
         attach_tooltip(test_ftp_btn, lambda: "Conectar al FTP con los datos de arriba para "
                        "comprobar que funcionan. No guarda nada ni sube nada.")
         test_ftp_btn.pack(side="left", padx=4)
         self._ftp_status = ctk.CTkLabel(conn, text="", text_color=PENDING_COLOR)
-        self._ftp_status.grid(row=12, column=0, columnspan=2, pady=4)
+        self._ftp_status.grid(row=13, column=0, columnspan=2, pady=4)
 
     def _build_server_publish_header(self, parent):
         """Cabecera fija de la super-pestaña "🌐 Servidor" (ver
@@ -9725,6 +9840,7 @@ class App(_AppBase):
             ColumnSpec("fav", "", width=28),
             ColumnSpec("lock", "", width=28),
             ColumnSpec("auto", "", width=28),
+            ColumnSpec("force", "", width=28),
             ColumnSpec("name", "Serie", expand=True, resizable=True, sortable=True),
             ColumnSpec("premiere", "Estreno", width=80, sortable=True),
             ColumnSpec("summary", "Episodios que faltan", width=sw0.get("summary", 180), min_width=100,
@@ -11155,12 +11271,26 @@ class App(_AppBase):
         attach_tooltip(auto_btn, lambda tid=tmdb_id: self._auto_btn_tooltip(tid))
         self._missing_ep_auto_widgets[tmdb_id] = auto_btn
 
+        c = _cell("force")
+        force_btn = ctk.CTkLabel(
+            c, text="⤢" if auto_active else "", cursor="hand2" if auto_active else "",
+            text_color=ACCENT if auto_active else PENDING_COLOR)
+        force_btn.pack(fill="both", expand=True)
+        if auto_active:
+            force_btn.bind("<Button-1>", lambda ev, tid=tmdb_id: self._force_search_missing_series(tid))
+            attach_tooltip(force_btn, lambda: "Forzar búsqueda ahora: ignora espera de reintento y grace 24h solo de este capítulo, si está descargando busca alternativa (Unstuck)")
+        else:
+            attach_tooltip(force_btn, lambda: "Activa el rayo ⚡ para poder forzar búsqueda")
+
         name_color = PENDING_COLOR if r.get("ignored") else None
         c = _cell("name")
         name_lbl = ctk.CTkLabel(c, text=r["name"], font=self._missing_ep_name_font,
                                 anchor="w", text_color=name_color, cursor="hand2")
         name_lbl.pack(fill="both", expand=True)
         name_lbl.bind("<Button-1>", lambda e, tid=tmdb_id, row=r: self._on_missing_ep_name_click(tid, row))
+        # Clic derecho → configurar template aMule por serie (misma feature que en Archivos)
+        name_lbl.bind("<Button-3>", lambda e, sn=r["name"]: self._show_missing_ep_series_menu(e, sn))
+        auto_btn.bind("<Button-3>", lambda e, sn=r["name"]: self._show_missing_ep_series_menu(e, sn))
 
         c = _cell("premiere")
         premiere_lbl = ctk.CTkLabel(c, text=_fmt_air_date(r.get("first_air_date")),
@@ -11495,13 +11625,18 @@ class App(_AppBase):
                            "Ignorar toda la temporada (no contará como faltante)" if not season_ignored
                            else "Restaurar temporada (volver a contarla como faltante)")
             season_ign_btn.pack(side="left", padx=(6, 0))
-            season_search_query = f"{r['name']} {season}x"
+            season_search_query = build_amule_season_query(r['name'], season,
+                                                         self.config_data.get("series_search_patterns", {}) or {},
+                                                         prefers_castellano=self._series_prefers_castellano(r['name']))
             season_amule_btn = ctk.CTkButton(header_fr, text="🔍", width=28, height=22,
                           fg_color=ICON_AMULE, hover_color="#693a99",
                           command=lambda sq=season_search_query, sn=r['name']:
                           self._search_missing_ep_on_amule(sq, sn))
             attach_tooltip(season_amule_btn, lambda: "Buscar esta temporada en aMule (abre la pestaña Descargas)")
             season_amule_btn.pack(side="left", padx=(4, 0))
+            # Clic derecho en cabecera de temporada → configurar template aMule por serie
+            for _w in (header_fr, toggle_btn, season_amule_btn):
+                _w.bind("<Button-3>", lambda e, sn=r["name"]: self._show_missing_ep_series_menu(e, sn))
             season_vars = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season}
             for link in season_links:
                 template = link.get("url_template", "")
@@ -11587,7 +11722,9 @@ class App(_AppBase):
             # "Star Wars: ... 1x09" devuelve varios. best_result igualmente
             # exige temporada×episodio (ver core/download_quality.py), así
             # que el título sobra para acertar el capítulo.
-            ep_amule_query = f"{r['name']} {season}x{ep:02d}"
+            ep_amule_query = build_amule_query(r['name'], season, ep,
+                                                    templates=self.config_data.get("series_search_patterns", {}) or {},
+                                                    prefers_castellano=self._series_prefers_castellano(r['name']))
             dl_btn = ctk.CTkButton(episodes_fr, text="⬇", width=28, height=22,
                                    fg_color=ICON_DL_IDLE, hover_color=ICON_DL_BUSY)
             dl_btn.configure(command=lambda sq=ep_amule_query, b=dl_btn:
@@ -11619,6 +11756,9 @@ class App(_AppBase):
                           fg_color=ICON_AMULE, hover_color="#693a99",
                           command=lambda sq=ep_amule_query, sn=r["name"]:
                           self._search_missing_ep_on_amule(sq, sn))
+            # Clic derecho en botones aMule → configurar template por serie
+            for _w in (amule_btn, dl_btn):
+                _w.bind("<Button-3>", lambda e, sn=r["name"]: self._show_missing_ep_series_menu(e, sn))
             attach_tooltip(amule_btn, lambda: "Buscar este episodio en aMule (abre la pestaña Descargas)")
             amule_btn.grid(row=ep_row, column=btn_col, padx=(4, 0), pady=1)
             variables = {"serie": r["name"], "tmdb_id": tmdb_id, "temporada": season,
@@ -11862,6 +12002,36 @@ class App(_AppBase):
                     entry.pop(str(season), None)
             self.config_data.set("missing_ep_auto_retries", retries)
 
+    # ── Unstuck: descargas atascadas (tiempo+avance) → alternativa ──────────────
+    def _unstuck_map(self) -> dict:
+        return dict(self.config_data.get("missing_ep_auto_downloads") or {})
+
+    def _unstuck_get_rec(self, tmdb_id: int, season: int, episode: int) -> dict | None:
+        m = self._unstuck_map()
+        return ((m.get(str(tmdb_id)) or {}).get(str(season)) or {}).get(str(episode))
+
+    def _unstuck_set_rec(self, tmdb_id: int, season: int, episode: int, rec: dict):
+        m = self._unstuck_map()
+        m.setdefault(str(tmdb_id), {}).setdefault(str(season), {})[str(episode)] = rec
+        self.config_data.set("missing_ep_auto_downloads", m)
+        self.config_data.save()
+
+    def _unstuck_clear_rec(self, tmdb_id: int, season: int, episode: int):
+        m = self._unstuck_map()
+        s = m.get(str(tmdb_id))
+        if not s:
+            return
+        e = s.get(str(season))
+        if not e:
+            return
+        e.pop(str(episode), None)
+        if not e:
+            s.pop(str(season), None)
+        if not s:
+            m.pop(str(tmdb_id), None)
+        self.config_data.set("missing_ep_auto_downloads", m)
+        self.config_data.save()
+
     def _auto_retry_wait_for(self, tries: int) -> float:
         """Segundos de espera para un episodio con *tries* intentos fallidos
         (backoff exponencial, tope RETRY_MAX_S)."""
@@ -11975,6 +12145,76 @@ class App(_AppBase):
                     lbl.destroy()
                 except Exception:
                     pass
+            # Si el rayo se quitó enseguida por error (1 s), cancelar
+            # cualquier descarga que la pasada inmediata ya hubiera lanzado
+            # para esa serie y limpiar checked/reintentos recientes (60 s) —
+            # si no, Los Simpson intentaría descargar cientos de capítulos
+            # durante horas con backoff.
+            try:
+                now = _time.time()
+                grace = 90  # segundos: clic por error
+                # Cancelar partfiles recientes en aMule
+                umap = self._unstuck_map().get(str(tmdb_id), {})
+                for s_str, eps in list(umap.items()):
+                    for ep_str, rec in list(eps.items()):
+                        started = float(rec.get("primary_started_ts", 0) or rec.get("started_ts", 0) or 0)
+                        if started and (now - started) <= grace:
+                            for hk in (rec.get("primary_hash"), rec.get("alt_hash")):
+                                if hk:
+                                    try:
+                                        with self._amule_ec_lock:
+                                            ec = EcClient(host=self.config_data.get("amule_host", "localhost"),
+                                                          port=self.config_data.get("amule_port", 4712),
+                                                          password=self.config_data.get("amule_password", ""),
+                                                          timeout=6.0)
+                                            ec.connect()
+                                            ec.cancel_download(hk)
+                                            ec.close()
+                                        _log.info("Autocompletado: cancelada descarga reciente %s %sx%s (rayo quitado)", tmdb_id, s_str, ep_str)
+                                    except Exception:
+                                        pass
+                # Limpiar checked recientes (solo los de esta racha por error)
+                cmap = self._auto_checked_map()
+                changed_c = False
+                if str(tmdb_id) in cmap:
+                    for s_str, eps in list(cmap[str(tmdb_id)].items()):
+                        eps = dict(eps) if isinstance(eps, dict) else {}
+                        for ep_str, ts in list(eps.items()):
+                            try:
+                                if isinstance(ts, (int, float)) and (now - float(ts)) <= grace:
+                                    # es dict {season:{ep:epoch}} — borrar solo ese ep
+                                    if auto_complete_state.unset_checked(cmap, tmdb_id, int(s_str), int(ep_str)):
+                                        changed_c = True
+                            except Exception:
+                                pass
+                    if changed_c:
+                        self.config_data.set("missing_ep_auto_checked", cmap)
+                # Limpiar reintentos recientes de esta serie (si acababan de fallar)
+                rmap = self._auto_retry_map()
+                if str(tmdb_id) in rmap:
+                    changed_r = False
+                    for s_str, eps in list(rmap[str(tmdb_id)].items()):
+                        for ep_str, rec2 in list(eps.items()):
+                            try:
+                                if (now - float(rec2.get("ts", 0))) <= grace:
+                                    eps.pop(ep_str, None)
+                                    changed_r = True
+                            except Exception:
+                                pass
+                        if not eps:
+                            rmap[str(tmdb_id)].pop(s_str, None)
+                    if changed_r:
+                        if not rmap[str(tmdb_id)]:
+                            rmap.pop(str(tmdb_id), None)
+                        self.config_data.set("missing_ep_auto_retries", rmap)
+                # Limpiar unstuck de la serie
+                if str(tmdb_id) in self._unstuck_map():
+                    m = self._unstuck_map()
+                    m.pop(str(tmdb_id), None)
+                    self.config_data.set("missing_ep_auto_downloads", m)
+                self.config_data.save()
+            except Exception:
+                _log.exception("Autocompletado: fallo limpiando serie %s tras quitar rayo", tmdb_id)
         name = ""
         row = self._missing_ep_results and next(
             (r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
@@ -11992,6 +12232,60 @@ class App(_AppBase):
             SUCCESS_COLOR if new_state else PENDING_COLOR)
         if new_state:
             threading.Thread(target=self._auto_complete_pass, daemon=True).start()
+
+    def _force_search_missing_series(self, tmdb_id: int):
+        """Fuerza búsqueda de los capítulos que faltan de una serie con ⚡ activo:
+        ignora espera de reintento y grace 24h solo de los capítulos forzados,
+        y si hay capítulos descargando activa Unstuck (busca alternativas)."""
+        if str(tmdb_id) not in self._auto_complete_series():
+            self._set_status("Activa el rayo ⚡ primero para forzar búsqueda", WARNING_COLOR)
+            return
+        self._set_status(f"Forzando búsqueda para serie {tmdb_id}…", PENDING_COLOR)
+        def _worker():
+            try:
+                # Reusar la pasada individual pero limpiando grace/backoff de los faltantes
+                row = next((r for r in self._missing_ep_results if r.get("tmdb_id") == tmdb_id), None)
+                if row is None:
+                    from core.missing_episodes_cache import load_cache
+                    cached = dict(load_cache()).get(str(tmdb_id))
+                    if cached:
+                        row = {"tmdb_id": tmdb_id, "name": cached.get("name", ""), "source": cached.get("source"),
+                               "server_id": cached.get("server_id"), "folder_name": cached.get("folder_name")}
+                if row is None:
+                    self.after(0, lambda: self._set_status("Serie no encontrada en caché", WARNING_COLOR))
+                    return
+                # Obtener fresh faltantes (ya cruza FTP)
+                try:
+                    fresh_results, _ = self._rescan_single_series_worker(row)
+                except Exception as e:
+                    # El mensaje se captura POR VALOR: al salir del except,
+                    # Python borra `e`, y la lambda se ejecuta después.
+                    self.after(0, lambda msg=str(e): self._set_status(
+                        f"Rescan falló: {msg}", ERROR_COLOR))
+                    return
+                if not fresh_results:
+                    self.after(0, lambda: self._set_status("Serie ya completa, nada que forzar", SUCCESS_COLOR))
+                    return
+                fresh = fresh_results[0]
+                # Limpiar grace/backoff solo de los que faltan (no toda la serie)
+                for season, eps in fresh.get("missing", {}).items():
+                    for ep in eps:
+                        self._unset_auto_checked_episode(tmdb_id, int(season), int(ep))
+                        self._clear_auto_retry_episode(tmdb_id, int(season), int(ep))
+                        # Resetear last_alt_ts para que Unstuck pueda lanzar alternativa enseguida
+                        rec = self._unstuck_get_rec(tmdb_id, int(season), int(ep))
+                        if rec:
+                            rec.pop("last_alt_ts", None)
+                            self._unstuck_set_rec(tmdb_id, int(season), int(ep), rec)
+                self.config_data.save()
+                # Lanzar pasada forzada (reusa lógica con unstuck ya cableado)
+                self._auto_complete_series_single(tmdb_id)
+                self.after(0, lambda: self._set_status(f"Búsqueda forzada lanzada para {fresh.get('name', tmdb_id)}", SUCCESS_COLOR))
+            except Exception as e:
+                _log.exception("Forzar búsqueda falló para %s", tmdb_id)
+                self.after(0, lambda msg=str(e): self._set_status(
+                    f"Forzar falló: {msg}", ERROR_COLOR))
+        threading.Thread(target=_worker, daemon=True).start()
 
     @staticmethod
     def _entry_series_tmdb_id(entry):
@@ -12046,6 +12340,12 @@ class App(_AppBase):
             return
         _log.info("Autocompletado: pasada sobre %d serie(s)", len(series))
         for tmdb_id_str in series:
+            # Si el usuario quitó el rayo mientras la pasada ya estaba en curso
+            # (p. ej. clic por error en Los Simpson y 1 s después lo quita), no
+            # procesar esa serie — evita lanzar cientos de descargas durante horas.
+            if tmdb_id_str not in self._auto_complete_series():
+                _log.info("Autocompletado: serie %s ya no está en auto, se omite (rayo quitado)", tmdb_id_str)
+                continue
             try:
                 self._auto_complete_series_single(int(tmdb_id_str))
             except Exception:
@@ -12160,8 +12460,22 @@ class App(_AppBase):
             if not expected:
                 _log.info("Autocompletado: '%s' sin episodios emitidos (o sin datos de TMDB)", rec.get("title"))
                 return
-            fresh = {"name": rec.get("title", ""), "missing": expected}
             series_name = rec.get("title", "")
+            # Cruce FTP también para recomendadas: si ya está en el FTP (copiada a mano,
+            # o subida previa sin pasar por Jellyfin/Plex) no debe re-descargarse entera.
+            # Antes se construía fresh = {missing: expected} sin cruce y X-Men '97
+            # se re-descargaba completa aunque ya estuviera en /datos2/series/X-Men '97/.
+            tmp = {"name": series_name, "expected_episodes": expected, "missing": dict(expected),
+                   "folder_name": rec.get("folder_name"), "tmdb_id": tmdb_id}
+            try:
+                tmp = self._cross_check_single_result_with_ftp(tmp)
+            except Exception:
+                _log.exception("Autocompletado: cruce FTP para recomendada '%s' falló, se usa missing sin filtrar", series_name)
+            fresh_missing = tmp.get("missing", expected)
+            if not fresh_missing:
+                _log.info("Autocompletado: '%s' ya completa en FTP, no se descarga", series_name)
+                return
+            fresh = {"name": series_name, "missing": fresh_missing}
 
         checked = (self._auto_checked_map().get(str(tmdb_id)) or {})
         retries = (self._auto_retry_map().get(str(tmdb_id)) or {})
@@ -12202,20 +12516,146 @@ class App(_AppBase):
         if not to_download:
             return
 
+        # ── Unstuck: pre-cargar cola aMule una vez por pasada para medir avance ──
+        _q_cache: dict[str, dict] = {}
+        if self.config_data.get("unstuck_enabled"):
+            try:
+                with self._amule_ec_lock:
+                    ec_q = EcClient(host=self.config_data.get("amule_host", "localhost"),
+                                    port=self.config_data.get("amule_port", 4712),
+                                    password=self.config_data.get("amule_password", ""),
+                                    timeout=6.0)
+                    ec_q.connect()
+                    for it in ec_q.get_download_queue():
+                        _q_cache[it["hash_hex"]] = it
+                    ec_q.close()
+            except Exception:
+                _q_cache = {}
+
         _log.info("Autocompletado: '%s' -> %d capítulo(s) nuevos por descargar",
                   series_name, len(to_download))
         for season, episode in to_download:
+            if str(tmdb_id) not in self._auto_complete_series():
+                _log.info("Autocompletado: serie %s deshabilitada durante la tanda, abortando", tmdb_id)
+                break
+            # ── Unstuck: si la descarga primaria está atascada (tiempo+avance) → alternativa
+            if self.config_data.get("unstuck_enabled"):
+                from core import unstuck as _usk
+                rec = self._unstuck_get_rec(tmdb_id, season, episode)
+                if rec and rec.get("primary_hash"):
+                    # Construir queue_info para should_try_alternative
+                    ph = rec.get("primary_hash", "")
+                    ah = rec.get("alt_hash", "")
+                    q_primary = _q_cache.get(ph) if ph else None
+                    q_alt = _q_cache.get(ah) if ah else None
+                    # Actualizar bytes si hay cola real
+                    now2 = _time.time()
+                    if q_primary and q_primary.get("size_done") is not None:
+                        rec = _usk.mark_progress(rec, "primary", int(q_primary["size_done"]), now2)
+                    if q_alt and q_alt.get("size_done") is not None:
+                        rec = _usk.mark_progress(rec, "alt", int(q_alt["size_done"]), now2)
+                    # Comprobar si alguna completó al 100% → borrar la otra (bidireccional)
+                    # percent 100 o desaparición de cola + episodio ya no en missing se maneja abajo
+                    for which in ("primary", "alt"):
+                        qi = q_primary if which == "primary" else q_alt
+                        if qi and qi.get("percent", 0) >= 99.5:
+                            other = "alt" if which == "primary" else "primary"
+                            other_hash = rec.get(f"{other}_hash")
+                            if other_hash and other_hash in _q_cache:
+                                try:
+                                    with self._amule_ec_lock:
+                                        ec2 = EcClient(host=self.config_data.get("amule_host", "localhost"),
+                                                       port=self.config_data.get("amule_port", 4712),
+                                                       password=self.config_data.get("amule_password", ""),
+                                                       timeout=6.0)
+                                        ec2.connect()
+                                        ec2.cancel_download(other_hash)
+                                        ec2.close()
+                                    _log.info("Unstuck: %s completó (%.1f%%), borrada la otra %s para %s %dx%02d",
+                                              which, qi["percent"], other, series_name, season, episode)
+                                except Exception:
+                                    pass
+                            # Limpiar rec alt si ya completó primaria (o viceversa)
+                            if which == "primary" and rec.get("alt_hash"):
+                                rec.pop("alt_hash", None); rec.pop("alt_started_ts", None)
+                            if which == "alt" and rec.get("primary_hash"):
+                                # alt completó → borrar primaria, promoción a primaria
+                                try:
+                                    with self._amule_ec_lock:
+                                        ec2 = EcClient(host=self.config_data.get("amule_host", "localhost"),
+                                                       port=self.config_data.get("amule_port", 4712),
+                                                       password=self.config_data.get("amule_password", ""),
+                                                       timeout=6.0)
+                                        ec2.connect()
+                                        ec2.cancel_download(ph)
+                                        ec2.close()
+                                except Exception:
+                                    pass
+                                # alt pasa a ser la primaria efectiva
+                                rec["primary_hash"] = rec.pop("alt_hash")
+                                rec["primary_started_ts"] = rec.pop("alt_started_ts", now2)
+                                rec["primary_last_bytes"] = rec.pop("alt_last_bytes", 0)
+                                rec["primary_last_progress_ts"] = rec.pop("alt_last_progress_ts", now2)
+                            self._unstuck_set_rec(tmdb_id, season, episode, rec)
+                            # No lanzar otra descarga este ciclo, ya hay una completa
+                            continue
+                    # ¿Atascado? → lanzar alternativa con backoff creciente
+                    cfg_u = {"unstuck_enabled": True,
+                             "unstuck_backoff_base_minutes": self.config_data.get("unstuck_backoff_base_minutes", 30),
+                             "unstuck_backoff_max_minutes": self.config_data.get("unstuck_backoff_max_minutes", 480),
+                             "unstuck_max_retries": self.config_data.get("unstuck_max_retries", 5),
+                             "unstuck_file_ttl_minutes": self.config_data.get("unstuck_file_ttl_minutes", 1440)}
+                    qi = {"primary": q_primary, "alt": q_alt}
+                    if _usk.should_try_alternative(rec, qi, _time.time(), cfg_u):
+                        # Alternativa: mismo template pero search_type distinto (Kad↔Global) para variedad
+                        orig_st = self.config_data.get("amule_search_type", "Kad")
+                        alt_st = "Global" if (orig_st or "").lower() == "kad" else "Kad"
+                        alt_query = _usk.next_alternative_query(series_name, season, episode,
+                                                                self.config_data.get("series_search_patterns", {}) or {})
+                        ok2, why2, h2 = self._auto_amule_download_series(alt_query, search_type=alt_st)
+                        rec["stuck_tries"] = int(rec.get("stuck_tries", 0) or 0) + 1
+                        rec["last_alt_ts"] = _time.time()
+                        if ok2 and h2:
+                            rec["alt_hash"] = h2
+                            rec["alt_started_ts"] = _time.time()
+                            rec["alt_last_bytes"] = 0
+                            rec["alt_last_progress_ts"] = _time.time()
+                            rec["alt_query"] = alt_query
+                            _log.info("Unstuck: alternativa lanzada para %s %dx%02d → '%s' (hash %s, intento %d)",
+                                      series_name, season, episode, alt_query, h2[:8], rec["stuck_tries"])
+                        else:
+                            _log.info("Unstuck: alternativa no encontrada para %s %dx%02d (%s)", series_name, season, episode, why2)
+                        self._unstuck_set_rec(tmdb_id, season, episode, rec)
+                        continue
+                    # Si no toca alternativa y sigue atascado pero en backoff, saltar este episodio
+                    if rec.get("primary_hash") and _q_cache.get(rec["primary_hash"]) is not None:
+                        # Hay primaria y no toca alternativa → no relanzar primaria
+                        continue
+            # ── Fin Unstuck
+
             # Igual que el botón manual: se busca SIN el título del episodio
             # (incluirlo recorta los resultados de aMule -- ver
             # _build_missing_ep_season_episode_rows). best_result ya exige
             # temporada×episodio, el título no hace falta.
-            query = f"{series_name} {season}x{episode:02d}"
-            ok, why = self._auto_amule_download_series(query)
+            query = build_amule_query(series_name, season, episode,
+                                      templates=self.config_data.get("series_search_patterns", {}) or {},
+                                      prefers_castellano=self._series_prefers_castellano(series_name))
+            ok, why, h = self._auto_amule_download_series(query)
             if ok:
                 # Éxito: queda "checked" (no se vuelve a reintentar) y se
-                # borra cualquier reintento previo.
+                # borra cualquier reintento previo. Además se registra en
+                # Unstuck como descarga primaria para medir tiempo+avance.
                 self._set_auto_checked_episode(tmdb_id, season, episode)
                 self._clear_auto_retry_episode(tmdb_id, season, episode)
+                if self.config_data.get("unstuck_enabled") and h:
+                    rec = self._unstuck_get_rec(tmdb_id, season, episode) or {}
+                    rec["primary_hash"] = h
+                    rec["primary_started_ts"] = _time.time()
+                    rec["primary_last_bytes"] = 0
+                    rec["primary_last_progress_ts"] = _time.time()
+                    rec["primary_query"] = query
+                    rec.setdefault("stuck_tries", 0)
+                    self._unstuck_set_rec(tmdb_id, season, episode, rec)
                 _log.info("Autocompletado: descarga lanzada para '%s'", query)
             else:
                 # Fallo (sin candidato, aMule caído...): NO se marca checked.
@@ -12224,6 +12664,36 @@ class App(_AppBase):
                 # espaciado (ver _AUTO_RETRY_*).
                 self._set_auto_retry_episode(tmdb_id, season, episode)
                 _log.info("Autocompletado: '%s' no se pudo descargar (%s)", query, why)
+
+        # ── Unstuck: limpiar recs de episodios ya completados (ya no faltan) → borrar la descarga que quedó colgada
+        if self.config_data.get("unstuck_enabled"):
+            try:
+                fresh_missing = fresh.get("missing", {}) if 'fresh' in locals() else {}
+                still_missing = {(s, ep) for s, eps in fresh_missing.items() for ep in eps}
+                umap = self._unstuck_map().get(str(tmdb_id), {})
+                for s_str, eps in list(umap.items()):
+                    for ep_str, rec in list(eps.items()):
+                        key = (int(s_str), int(ep_str))
+                        if key not in still_missing:
+                            # Episodio ya no falta → una de las dos descargas completó y el archivo ya está en FTP
+                            # Borrar la que siga en cola (si queda) y limpiar rec
+                            for hk in (rec.get("primary_hash"), rec.get("alt_hash")):
+                                if hk and hk in _q_cache:
+                                    try:
+                                        with self._amule_ec_lock:
+                                            ec3 = EcClient(host=self.config_data.get("amule_host", "localhost"),
+                                                           port=self.config_data.get("amule_port", 4712),
+                                                           password=self.config_data.get("amule_password", ""),
+                                                           timeout=6.0)
+                                            ec3.connect()
+                                            ec3.cancel_download(hk)
+                                            ec3.close()
+                                        _log.info("Unstuck: episodio %dx%02d ya completo, borrada descarga residual %s", key[0], key[1], hk[:8])
+                                    except Exception:
+                                        pass
+                            self._unstuck_clear_rec(tmdb_id, int(s_str), int(ep_str))
+            except Exception:
+                pass
 
     def _auto_episode_in_history(self, history_remote_paths: set, series_name: str,
                                  season: int, episode: int) -> bool:
@@ -12248,9 +12718,10 @@ class App(_AppBase):
                     return True
         return False
 
-    def _auto_amule_download_series(self, query: str):
+    def _auto_amule_download_series(self, query: str, search_type: str | None = None):
         """Busca *query* en aMule y descarga el mejor candidato (mismo
-        criterio best_result que el botón manual). Devuelve (ok, motivo). No
+        criterio best_result que el botón manual). Devuelve (ok, motivo, hash_hex).
+        hash_hex es el MD4 hex del partfile descargado (o "" si falla). No
         toca la sesión/pestaña Descargas (crea la suya y la cierra)."""
         ec = EcClient(
             host=self.config_data.get("amule_host", "localhost"),
@@ -12265,8 +12736,8 @@ class App(_AppBase):
                 try:
                     ec.connect()
                 except (EcConnectionError, EcAuthError, OSError):
-                    return False, "aMule no disponible"
-                st = self.config_data.get("amule_search_type", "Kad")
+                    return False, "aMule no disponible", ""
+                st = search_type or self.config_data.get("amule_search_type", "Kad")
                 best = None
                 last = None
                 try:
@@ -12279,9 +12750,18 @@ class App(_AppBase):
                                 break
                             last = best
                     if best is None:
-                        return False, "sin candidato que cumpla el umbral"
+                        return False, "sin candidato que cumpla el umbral", ""
                     ok, _raw = ec.download(best)
-                    return (True, "") if ok else (False, "aMule rechazó la descarga")
+                    h = ""
+                    if ok:
+                        try:
+                            import binascii
+                            raw = getattr(best, "_ec_hash", None)
+                            if raw and len(raw) == 16:
+                                h = binascii.hexlify(raw).decode("ascii").lower()
+                        except Exception:
+                            h = ""
+                    return (True, "", h) if ok else (False, "aMule rechazó la descarga", "")
                 except (EcProtocolError, OSError) as e:
                     # Conectar al puerto EC no garantiza que aMule esté
                     # conectado a la red: con eD2k caído, iter_search lanza
@@ -12291,7 +12771,7 @@ class App(_AppBase):
                     # por pasada en el log (visto de verdad: 5 trazas cada 30
                     # minutos durante días). Devolverlo como fallo normal deja
                     # el episodio en el backoff, que es lo que toca.
-                    return False, f"aMule: {e}"
+                    return False, f"aMule: {e}", ""
         finally:
             try:
                 ec.close()
@@ -15277,6 +15757,7 @@ class App(_AppBase):
             _set_entry(entry, self.config_data.get(key, ""))
         self._protocol_combo.set(self._current_protocol_label())
         self._ftp_parallel_combo.set(str(self.config_data.get("ftp_parallel", 1)))
+        self._ftp_streams_combo.set(str(self.config_data.get("ftp_upload_streams", 4)))
         _set_entry(self._ftp_speed_entry, self.config_data.get("ftp_speed_limit", 0))
         _set_entry(self._ftp_retries_entry, self.config_data.get("ftp_retries", 3))
         _set_entry(self._reservation_quota_entry, self.config_data.get("reservation_quota_gb", 100))
@@ -16552,10 +17033,96 @@ class App(_AppBase):
         self._assign_and_upload_btn.configure(
             text=f"Asignar y subir ({n})" if n > 1 else "Asignar y subir")
         self._update_select_all_button_label()
+        self._update_header_upload_clear_labels()
 
     def _update_select_all_button_label(self):
         all_selected = bool(self.files) and len(self._current_selection()) == len(self.files)
         self._select_all_btn.configure(text="Deseleccionar todos" if all_selected else "Seleccionar todos")
+
+    def _update_header_upload_clear_labels(self):
+        """Subir todo → Subir seleccionados (N) y Limpiar → Limpiar seleccionados (N)."""
+        try:
+            n = len(self._current_selection())
+            if hasattr(self, "_upload_all_btn") and self._upload_all_btn.winfo_exists():
+                self._upload_all_btn.configure(text=f"Subir seleccionados ({n})" if n > 1 else "Subir todo")
+            if hasattr(self, "_clear_files_btn") and self._clear_files_btn.winfo_exists():
+                self._clear_files_btn.configure(text=f"Limpiar seleccionados ({n})" if n > 1 else "Limpiar")
+        except Exception:
+            pass
+
+    def _on_header_upload_clicked(self):
+        n = len(self._current_selection())
+        if n > 1:
+            self._upload_selected_ftp()
+        else:
+            self._upload_all_ftp()
+
+    def _on_header_clear_clicked(self):
+        n = len(self._current_selection())
+        if n > 1:
+            # Limpiar solo la selección (no toda la lista)
+            sel_ids = {id(e) for e in self._current_selection()}
+            # Si hay subida en curso con elementos seleccionados, respetar diálogo igual que _clear_files
+            if self._upload_running or self._watcher is not None:
+                pendientes = [e for e in self._current_selection() if e.status != "subido"]
+                if pendientes and len(pendientes) == n:
+                    # Todos pendientes → mismo diálogo que Limpiar, pero solo para selección
+                    self._clear_files_selected()
+                    return
+            self.files = [e for e in self.files if id(e) not in sel_ids]
+            # Quitar de selección y refrescar
+            self._multi_selected = {e for e in self._multi_selected if id(e) not in sel_ids}
+            if self._selected_entry and id(self._selected_entry) in sel_ids:
+                self._selected_entry = None
+                # Elegir nuevo ancla si queda alguno
+                if self.files:
+                    self._selected_entry = self.files[0]
+                    self._multi_selected.discard(self._selected_entry)
+            self._refresh_table()
+            self._update_assign_button_label()
+            if self._selected_entry:
+                self._update_detail(self._selected_entry)
+            else:
+                self._clear_detail()
+        else:
+            self._clear_files()
+
+    def _clear_files_selected(self):
+        """Diálogo de confirmación para limpiar solo la selección (n>1)."""
+        pendientes = [e for e in self._current_selection() if e.status != "subido"]
+        if not pendientes:
+            # Solo subidos → quitar directo sin diálogo (igual que _clear_files sin pendientes)
+            sel_ids = {id(e) for e in self._current_selection()}
+            self.files = [e for e in self.files if id(e) not in sel_ids]
+            self._multi_selected = {e for e in self._multi_selected if id(e) not in sel_ids}
+            if self._selected_entry and id(self._selected_entry) in sel_ids:
+                self._selected_entry = None
+            self._refresh_table()
+            self._update_assign_button_label()
+            return
+        dlg = _ClearDialog(self, len(pendientes))
+        if dlg.result == "solo_subidos":
+            # Quitar solo los subidos de la selección
+            sel_subidos = {id(e) for e in self._current_selection() if e.status == "subido"}
+            self.files = [e for e in self.files if id(e) not in sel_subidos]
+        elif dlg.result == "todo":
+            if self._upload_running:
+                self._upload_cancel.set()
+            sel_ids = {id(e) for e in self._current_selection()}
+            self.files = [e for e in self.files if id(e) not in sel_ids]
+        else:
+            return
+        sel_ids = {id(e) for e in self._current_selection()} if dlg.result == "todo" else set()
+        # Recalcular selección restante
+        remaining_ids = {id(e) for e in self.files}
+        self._multi_selected = {e for e in self._multi_selected if id(e) in remaining_ids}
+        if self._selected_entry and self._selected_entry not in self.files:
+            self._selected_entry = self.files[0] if self.files else None
+            if self._selected_entry:
+                self._multi_selected.discard(self._selected_entry)
+        self._refresh_table()
+        self._clear_detail() if not self._selected_entry else self._update_detail(self._selected_entry)
+        self._update_assign_button_label()
 
     def _toggle_select_all(self):
         """Marca (o desmarca, si ya estaban todos) TODOS los archivos de
@@ -16599,33 +17166,22 @@ class App(_AppBase):
         self._tmdb_results = []
         self._results_kind = "tmdb"
         self._previewed_result_idx = -1
-        # El selector manual de proveedor NO se resetea al cambiar de
-        # archivo -- persiste tal cual el usuario lo dejó (ver
-        # self._search_provider_override/_on_search_provider_changed), para
-        # no tener que volver a elegir MangaDex/AniList/etc. en cada
-        # capítulo al identificar una colección grande uno a uno.
-        if self._search_provider_override != "auto":
-            label = self._SEARCH_PROVIDER_LABELS.get(self._search_provider_override, "Auto")
-        else:
-            # La etiqueta debe reflejar el servicio real que va a usarse --
-            # "Buscar en TMDB" no tiene sentido para un libro/cómic (ver
-            # _search_source_name).
-            label = self._search_source_name(entry)
+        # El selector manual de proveedor persiste tal cual el usuario lo dejó
+        # (ver self._search_provider_override/_on_search_provider_changed), para
+        # no tener que volver a elegir TMDB/MangaDex/etc. en cada capítulo.
+        # Migración: si quedó "auto" guardado de versión anterior, pasa a "tmdb".
+        if self._search_provider_override == "auto":
+            self._search_provider_override = "tmdb"
+            self._search_provider_menu.set("TMDB")
+        label = self._SEARCH_PROVIDER_LABELS.get(self._search_provider_override, "TMDB")
         self._search_label.configure(text=f"Buscar en {label}:")
         self._update_search_lang_hint(entry)
 
     def _effective_search_provider(self, entry) -> str:
-        """Proveedor que se usaría de verdad ahora mismo para *entry*: el
-        override manual del selector si no es "auto" (ver
-        self._search_provider_override), si no lo que tocaría por defecto
-        según el tipo de archivo -- mismo criterio que _manual_search_worker."""
-        if self._search_provider_override != "auto":
-            return self._search_provider_override
-        if entry is not None and entry.is_comic:
-            return "comicvine"
-        if entry is not None and entry.is_book:
-            return "openlibrary"
-        return "tmdb"
+        """Proveedor que se usaría de verdad ahora mismo: el del selector."""
+        if self._search_provider_override == "auto":
+            return "tmdb"
+        return self._search_provider_override
 
     def _update_search_lang_hint(self, entry):
         """Muestra/oculta la bandera de "busca en inglés" y el botón de
@@ -16651,13 +17207,11 @@ class App(_AppBase):
         guarda el proveedor elegido, actualiza la etiqueta/bandera/botón de
         IA, y relanza la búsqueda ya en marcha (si hay texto y archivo
         seleccionado) para que el cambio surta efecto sin un clic extra."""
-        key = next((k for k, v in self._SEARCH_PROVIDER_LABELS.items() if v == choice), "auto")
+        key = next((k for k, v in self._SEARCH_PROVIDER_LABELS.items() if v == choice), "tmdb")
         self._search_provider_override = key
-        entry = self._selected_entry
-        label = choice if key != "auto" else self._search_source_name(entry)
-        self._search_label.configure(text=f"Buscar en {label}:")
-        self._update_search_lang_hint(entry)
-        if entry is not None and self._result_combo.get().strip():
+        self._search_label.configure(text=f"Buscar en {choice}:")
+        self._update_search_lang_hint(self._selected_entry)
+        if self._selected_entry is not None and self._result_combo.get().strip():
             self._manual_search()
 
     # --------------------------------------------------------- TMDB search
@@ -16923,11 +17477,11 @@ class App(_AppBase):
         is_book_only = bool(entry and entry.is_book and not entry.is_comic)
         override = self._search_provider_override
         try:
-            # Selector forzado a un proveedor concreto (no "Auto"): una sola
-            # llamada directa, sin ningún encadenado de apoyo -- forzar
-            # significa forzar, y sin restricción de tipo de archivo (ver
-            # plan: se permite p.ej. AniList en un .epub a propósito).
-            if override == "openlibrary":
+            # Lista simple: TMDB/OpenLibrary/GoogleBooks/ComicVine/MangaDex/AniList/Kitsu
+            if override == "tmdb":
+                self._results_kind = "tmdb"
+                results = self.tmdb.search_multi(query)
+            elif override == "openlibrary":
                 self._results_kind = "openlibrary"
                 results = self.openlibrary_client.search_volumes(query)
             elif override == "google_books":
@@ -18141,14 +18695,41 @@ class App(_AppBase):
         if not ready:
             self._set_status("No hay archivos listos para subir", WARNING_COLOR)
             return
-        self._start_ftp_upload(ready)
+        self._enqueue_or_start(ready)
 
     def _upload_selected_ftp(self):
-        entry = self._selected_entry
-        if not entry or not entry.media_info:
-            self._set_status("Selecciona un archivo con informacion de TMDB", WARNING_COLOR)
+        # Soporta multi-selección (Ctrl/Shift) igual que Asignar
+        targets = [e for e in self._current_selection() if e.media_info and e.status in ("listo", "renombrado")]
+        if not targets:
+            # Fallback al ancla si la selección no tiene listos pero el ancla sí
+            entry = self._selected_entry
+            if entry and entry.media_info and entry.status in ("listo", "renombrado"):
+                targets = [entry]
+        if not targets:
+            self._set_status("Selecciona un archivo con informacion de TMDB en estado listo", WARNING_COLOR)
             return
-        self._start_ftp_upload([entry])
+        self._enqueue_or_start(targets)
+
+    def _enqueue_or_start(self, entries: list):
+        """Encola si ya hay subida en curso, si no inicia nueva tanda."""
+        if self._upload_running:
+            added = 0
+            for e in entries:
+                if e not in self._upload_queue and e.status in ("listo", "renombrado"):
+                    self._upload_queue.append(e)
+                    e.ftp_progress = 0.0
+                    e.ftp_speed = 0.0
+                    e.ftp_status = "En espera"
+                    e.status = "en_cola"
+                    self._update_row(e)
+                    added += 1
+            if added:
+                self.after(0, self._refresh_ftp_columns)
+                self._set_status(f"Encolados {added} archivo(s) — se subirán al terminar la tanda actual", PENDING_COLOR)
+            else:
+                self._set_status("Ya en cola o no está en listo", WARNING_COLOR)
+            return
+        self._start_ftp_upload(entries)
 
     def _test_ftp(self):
         host = self._ftp_entries["ftp_host"].get().strip()
@@ -18362,6 +18943,10 @@ class App(_AppBase):
         except ValueError:
             parallel = 1
         try:
+            streams = max(1, min(8, int(self._ftp_streams_combo.get() or 4)))
+        except ValueError:
+            streams = 4
+        try:
             speed = max(0.0, float(self._ftp_speed_entry.get().replace(",", ".") or 0))
         except ValueError:
             speed = 0.0
@@ -18373,6 +18958,22 @@ class App(_AppBase):
             quota_gb = max(1, int(self._reservation_quota_entry.get().strip() or 100))
         except ValueError:
             quota_gb = 100
+        try:
+            unstuck_max = max(1, min(20, int(self._unstuck_max_retries_entry.get().strip() or 5)))
+        except ValueError:
+            unstuck_max = 5
+        try:
+            unstuck_base = max(5, min(1440, int(self._unstuck_backoff_base_entry.get().strip() or 30)))
+        except ValueError:
+            unstuck_base = 30
+        try:
+            unstuck_maxmin = max(30, min(10080, int(self._unstuck_backoff_max_entry.get().strip() or 480)))
+        except ValueError:
+            unstuck_maxmin = 480
+        try:
+            unstuck_ttl = max(30, min(10080, int(self._unstuck_ttl_entry.get().strip() or 1440)))
+        except ValueError:
+            unstuck_ttl = 1440
 
         for mt in self._CATEGORY_TYPES:
             self._sync_category_widgets_to_data(mt)
@@ -18396,6 +18997,7 @@ class App(_AppBase):
             "ftp_protocol":    self._selected_protocol()[0],
             "ftp_use_tls":     self._selected_protocol()[1],
             "ftp_parallel":    parallel,
+            "ftp_upload_streams": streams,
             "ftp_speed_limit": speed,
             "ftp_retries":     retries,
             "shared_data_ftp_path": self._shared_data_ftp_path_entry.get().strip(),
@@ -18459,6 +19061,12 @@ class App(_AppBase):
             "amule_host":     self._amule_entries["amule_host"].get().strip(),
             "amule_port":     int(self._amule_entries["amule_port"].get() or 4712),
             "amule_password": self._amule_entries["amule_password"].get(),
+
+            "unstuck_enabled":              self._unstuck_switch.get() in (True, "1", 1),
+            "unstuck_max_retries":          unstuck_max,
+            "unstuck_backoff_base_minutes": unstuck_base,
+            "unstuck_backoff_max_minutes":  unstuck_maxmin,
+            "unstuck_file_ttl_minutes":     unstuck_ttl,
         }
 
     def _settings_dirty(self) -> bool:
@@ -19015,6 +19623,146 @@ class App(_AppBase):
         ph = self.winfo_rooty() + self.winfo_height() // 2
         dlg.geometry(f"+{pw - dlg.winfo_reqwidth()//2}+{ph - dlg.winfo_reqheight()//2}")
 
+    def _configure_amule_template(self, series_name: str):
+        """Diálogo para configurar el template de búsqueda en aMule para una serie.
+
+        Se abre desde el menú contextual (clic derecho) de cualquier fila
+        donde aparece una serie con botón ⚡, y desde Archivos. El template
+        se guarda en config.json -> series_search_patterns[series_name] y se
+        usa en todas las búsquedas aMule posteriores para esa serie
+        (ver core/amule_search.py::build_amule_query).
+        """
+        series_name = (series_name or "").strip()
+        if not series_name:
+            return
+        templates = dict(self.config_data.get("series_search_patterns", {}) or {})
+        # Búsqueda exacta primero, fallback case-insensitive
+        current = templates.get(series_name)
+        if current is None:
+            low = series_name.strip().lower()
+            for k, v in templates.items():
+                if k.strip().lower() == low:
+                    current = v
+                    series_name = k  # conservar clave original
+                    break
+
+        dlg = ctk.CTkToplevel(self)
+        self._apply_icon(dlg)
+        dlg.title("Template aMule por serie")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+
+        ctk.CTkLabel(dlg, text=f"Serie: {series_name}",
+                     font=ctk.CTkFont(size=12, weight="bold"), wraplength=420,
+                     justify="left").pack(padx=20, pady=(20, 4), anchor="w")
+        # Preview con valores de ejemplo
+        preview_var = ctk.StringVar(value="")
+        def _update_preview(*_):
+            tmpl = tmpl_entry.get().strip() if 'tmpl_entry' in locals() else (current or "")
+            if not tmpl:
+                tmpl = f"{series_name} {{temporada}}x{{episodio:02d}}"
+            try:
+                from core.amule_search import build_amule_query
+                q = build_amule_query(series_name, 2, 1, templates={series_name: tmpl})
+                preview_var.set(f"Vista previa (2x01): {q}")
+            except Exception:
+                preview_var.set("")
+        ctk.CTkLabel(dlg, text="Template de búsqueda en aMule:",
+                     font=ctk.CTkFont(size=11), anchor="w").pack(padx=20, pady=(8, 0), fill="x")
+        tmpl_entry = ctk.CTkEntry(dlg, width=420)
+        tmpl_entry.insert(0, current or "")
+        tmpl_entry.pack(padx=20, pady=(0, 4))
+        tmpl_entry.bind("<KeyRelease>", _update_preview)
+        ctk.CTkLabel(dlg, text="Vars: {serie} {temporada} {temporada:02d} {episodio} {episodio:02d} {año}\n"
+                               "Si no usas {temporada}/{episodio}, se añade \" {temporada}x{episodio:02d}\" solo.\n"
+                               "Ej: \"Slime {temporada}x{episodio:02d}\" → \"Slime 2x01\"",
+                     font=ctk.CTkFont(size=10), text_color=PENDING_COLOR,
+                     justify="left", wraplength=420).pack(padx=20, pady=(0, 4), anchor="w")
+        ctk.CTkLabel(dlg, textvariable=preview_var, font=ctk.CTkFont(size=10),
+                     text_color=ACCENT, wraplength=420, justify="left").pack(padx=20, pady=(0, 8), anchor="w")
+        _update_preview()
+
+        def _save():
+            new_tmpl = tmpl_entry.get().strip()
+            pats = dict(self.config_data.get("series_search_patterns", {}) or {})
+            # Normalizar: si había clave con distinta capitalización, borrarla
+            low = series_name.strip().lower()
+            for k in list(pats.keys()):
+                if k.strip().lower() == low and k != series_name:
+                    del pats[k]
+            if not new_tmpl:
+                pats.pop(series_name, None)
+            else:
+                pats[series_name] = new_tmpl
+            self.config_data.set("series_search_patterns", pats)
+            self.config_data.save()
+            dlg.destroy()
+
+        def _clear():
+            pats = dict(self.config_data.get("series_search_patterns", {}) or {})
+            pats.pop(series_name, None)
+            # también borrar variantes case-insensitive
+            low = series_name.strip().lower()
+            for k in list(pats.keys()):
+                if k.strip().lower() == low:
+                    pats.pop(k, None)
+            self.config_data.set("series_search_patterns", pats)
+            self.config_data.save()
+            dlg.destroy()
+
+        bf = ctk.CTkFrame(dlg, fg_color="transparent")
+        bf.pack(padx=20, pady=(4, 20))
+        ctk.CTkButton(bf, text="Guardar", command=_save, width=100,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER).pack(side="left", padx=4)
+        ctk.CTkButton(bf, text="Borrar", command=_clear, width=90,
+                      fg_color="#8a3a3a", hover_color="#a33a3a").pack(side="left", padx=4)
+        ctk.CTkButton(bf, text="Cancelar", command=dlg.destroy, width=90,
+                      fg_color="transparent", border_width=1).pack(side="left", padx=4)
+
+        dlg.update_idletasks()
+        pw = self.winfo_rootx() + self.winfo_width() // 2
+        ph = self.winfo_rooty() + self.winfo_height() // 2
+        dlg.geometry(f"+{pw - dlg.winfo_reqwidth()//2}+{ph - dlg.winfo_reqheight()//2}")
+
+    def _series_prefers_castellano(self, series_name: str) -> bool:
+        """Si algún archivo de la lista para esa serie contiene 'castellano' en el nombre,
+        la búsqueda aMule debe priorizarlo (ver build_amule_query prefers_castellano)."""
+        low_series = (series_name or "").strip().lower()
+        for e in getattr(self, "files", []):
+            # Identidad de serie: media_info.title o detected title
+            e_series = ""
+            if getattr(e, "media_info", None) and getattr(e.media_info, "title", ""):
+                e_series = e.media_info.title
+            elif getattr(e, "detected", None):
+                e_series = (e.detected or {}).get("title", "")
+            if e_series.strip().lower() == low_series:
+                if "castellano" in (getattr(e, "name", "") or "").lower():
+                    return True
+        # Fallback: si el propio series_name ya trae castellano (template con castellano), no duplicar
+        return False
+
+    def _show_missing_ep_series_menu(self, event, series_name: str):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="🔍 Template aMule por serie…",
+                         command=lambda s=series_name: self._configure_amule_template(s))
+        # Mostrar también el template actual si existe
+        pats = self.config_data.get("series_search_patterns", {}) or {}
+        cur = pats.get(series_name)
+        if cur is None:
+            low = series_name.strip().lower()
+            for k, v in pats.items():
+                if k.strip().lower() == low:
+                    cur = v
+                    break
+        if cur:
+            menu.add_separator()
+            menu.add_command(label=f"Actual: {cur[:42]}…", state="disabled")
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def _show_row_menu(self, event, entry):
         # Seleccionar la fila al abrir el menú -- si no, es fácil pulsar
         # con el botón derecho sobre una fila distinta a la que se tenía
@@ -19059,6 +19807,17 @@ class App(_AppBase):
                          command=lambda: self._edit_detected(entry))
         menu.add_command(label="✎  Editar carpeta de destino…",
                          command=lambda: self._edit_remote_dir(entry))
+        # Template aMule por serie — aparece para cualquier entrada que tenga
+        # identidad de serie (media_info o detected title). El usuario lo usa
+        # cuando la búsqueda automática en aMule no da resultados.
+        def _series_name_for_entry(e):
+            if e.media_info and getattr(e.media_info, "title", ""):
+                return e.media_info.title
+            return (e.detected or {}).get("title", "") or e.name
+        _sn = _series_name_for_entry(entry)
+        if _sn and _sn.strip():
+            menu.add_command(label="🔍 Template aMule por serie…",
+                             command=lambda s=_sn: self._configure_amule_template(s))
         menu.add_separator()
 
         # -- Archivo --

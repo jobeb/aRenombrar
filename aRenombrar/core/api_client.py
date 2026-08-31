@@ -518,7 +518,8 @@ def _find_junk_start(text: str, extra_junk_terms: Optional[list] = None) -> int:
 
 def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
                     is_book: bool = False, is_comic: bool = False,
-                    folder_hint: str = "") -> dict:
+                    folder_hint: str = "",
+                    series_pattern: Optional[str] = None) -> dict:
     """
     Extrae de un nombre de archivo: season, episode, título limpio, tipo.
 
@@ -527,7 +528,7 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
     (core/ai_title_fallback.py) para probar si limpian el título antes de
     aprenderlos de verdad vía core/learned_terms.py.
 
-    folder_hint: nombre de la carpeta que contiene el archivo -- SOLO se usa
+folder_hint: nombre de la carpeta que contiene el archivo -- SOLO se usa
     (is_book/is_comic) cuando el propio nombre de archivo no deja ningún
     título aprovechable, p.ej. escaneos de manga/cómic numerados a secas
     ("01.cbr", "Capitulo 05.cbr") donde el nombre de la serie está puesto en
@@ -537,7 +538,14 @@ def detect_episode(filename: str, extra_junk_terms: Optional[list] = None,
     título de verdad, ese gana siempre. Ignorado para vídeo (is_book=False)
     -- ahí el propio nombre de archivo casi siempre trae el título.
 
-    is_book: el llamador (gui/app.py, vía core.renamer.is_book_file) ya
+    series_pattern: Patrón de búsqueda personalizado para esta serie.
+    Si se proporciona, se usará para generar una consulta de búsqueda más
+    efectiva en TMDB en lugar del título detectado. El formato esperado es
+    un patrón tipo "2x01" o "1x01" que se aplicará al título limpio.
+    Ejemplo: para "That Time I Got Reincarnated as a Slime", un patrón
+    "Slime #Épisode" generaría la búsqueda "Slime 2x01" en TMDB.
+
+is_book: el llamador (gui/app.py, vía core.renamer.is_book_file) ya
     sabe por la extensión que esto es un libro/cómic, no un vídeo -- en
     ese caso se evita POR COMPLETO la cadena EPISODE_PATTERNS (pensada
     para nombres de episodio de TV/anime) y se devuelve media_type="libro"

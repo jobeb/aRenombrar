@@ -69,6 +69,9 @@ EC_OP_STRINGS = 0x06
 EC_OP_SEARCH_START = 0x26
 EC_OP_SEARCH_RESULTS = 0x28
 EC_OP_DOWNLOAD_SEARCH_RESULT = 0x2A
+EC_OP_GET_DLOAD_QUEUE = 0x31
+EC_OP_DLOAD_QUEUE = 0x32
+EC_OP_PARTFILE_REMOVE = 0x2B
 EC_OP_AUTH_SALT = 0x4F
 EC_OP_AUTH_PASSWD = 0x50
 
@@ -85,9 +88,13 @@ EC_TAG_SERVER_VERSION = 0x050B
 EC_TAG_PARTFILE = 0x0300
 EC_TAG_PARTFILE_NAME = 0x0301
 EC_TAG_PARTFILE_SIZE_FULL = 0x0303
+EC_TAG_PARTFILE_SIZE_DONE = 0x0305
+EC_TAG_PARTFILE_SIZE_XFER = 0x0306
+EC_TAG_PARTFILE_SPEED = 0x0302
 EC_TAG_PARTFILE_SOURCE_COUNT = 0x030A
 EC_TAG_PARTFILE_SOURCE_COUNT_XFER = 0x030D
 EC_TAG_PARTFILE_STATUS = 0x0308
+EC_TAG_PARTFILE_PRIO = 0x0309
 EC_TAG_PARTFILE_CAT = 0x030F
 EC_TAG_PARTFILE_HASH = 0x031E
 
@@ -556,6 +563,75 @@ class EcClient:
         if opcode == EC_OP_STRINGS:
             return True, ""
         return True, ""
+
+    def get_download_queue(self) -> list[dict]:
+        """Lista de descargas en cola de aMule vía EC.
+
+        Cada elemento: {hash_hex, name, size_done, size_full, percent, speed, sources, status}
+        Si el servidor no soporta la operación o no hay cola, devuelve [] sin lanzar.
+        """
+        try:
+            self._send_packet(EC_OP_GET_DLOAD_QUEUE, [])
+            opcode, tags = self._recv_packet()
+            if opcode not in (EC_OP_DLOAD_QUEUE, EC_OP_STRINGS):
+                return []
+            out = []
+            for t in tags:
+                if t.get("tag") != EC_TAG_PARTFILE:
+                    continue
+                kids = {c.get("tag"): c for c in t.get("children", [])}
+                h = kids.get(EC_TAG_PARTFILE_HASH)
+                raw = h.get("value") if h else None
+                if not raw or not isinstance(raw, (bytes, bytearray)) or len(raw) != 16:
+                    continue
+                import binascii
+                hhex = binascii.hexlify(raw).decode("ascii").lower()
+                name_t = kids.get(EC_TAG_PARTFILE_NAME)
+                name = name_t.get("value", "") if name_t else ""
+                sd = kids.get(EC_TAG_PARTFILE_SIZE_DONE)
+                sf = kids.get(EC_TAG_PARTFILE_SIZE_FULL)
+                size_done = int(sd.get("value", 0) or 0) if sd else 0
+                size_full = int(sf.get("value", 0) or 0) if sf else 0
+                pct = (size_done / size_full * 100.0) if size_full else 0.0
+                sp_t = kids.get(EC_TAG_PARTFILE_SPEED)
+                speed = int(sp_t.get("value", 0) or 0) if sp_t else 0
+                sc_t = kids.get(EC_TAG_PARTFILE_SOURCE_COUNT)
+                sources = int(sc_t.get("value", 0) or 0) if sc_t else 0
+                st_t = kids.get(EC_TAG_PARTFILE_STATUS)
+                status = int(st_t.get("value", 0) or 0) if st_t else 0
+                out.append({
+                    "hash_hex": hhex,
+                    "name": name,
+                    "size_done": size_done,
+                    "size_full": size_full,
+                    "percent": pct,
+                    "speed": speed,
+                    "sources": sources,
+                    "status": status,
+                    "raw_hash": raw,
+                })
+            return out
+        except Exception:
+            return []
+
+    def cancel_download(self, hash_hex: str) -> Tuple[bool, str]:
+        """Cancela/elimina una descarga por hash MD4 hex (32 chars)."""
+        if not hash_hex or len(hash_hex) != 32:
+            return False, "hash inválido"
+        try:
+            import binascii
+            raw = binascii.unhexlify(hash_hex)
+        except Exception:
+            return False, "hash no es hex válido"
+        try:
+            partfile = _make_tag(EC_TAG_PARTFILE, EC_TAGTYPE_HASH16, raw)
+            self._send_packet(EC_OP_PARTFILE_REMOVE, [partfile])
+            opcode, tags = self._recv_packet()
+            if opcode == EC_OP_FAILED:
+                return False, self._extract_error(tags) or "aMule rechazó el borrado"
+            return True, ""
+        except Exception as e:
+            return False, str(e)
 
 
 # Re-export para los tests y para quien quiera el tipo sin importar amule_client
