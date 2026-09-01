@@ -265,6 +265,20 @@ class TableView(ctk.CTkFrame):
         for seq in list(self._SCROLL_KEYS) + ["Home", "End"]:
             self.body.bind_all(f"<{seq}>", self._on_scroll_key, add="+")
 
+    def destroy(self):
+        try:
+            for seq in list(self._SCROLL_KEYS) + ["Home", "End"]:
+                try:
+                    self.body.unbind_all(f"<{seq}>")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            super().destroy()
+        except Exception:
+            pass
+
     def _scroll_canvas(self):
         """El canvas que de verdad hace scroll (el de self.body).
 
@@ -288,12 +302,36 @@ class TableView(ctk.CTkFrame):
         canvas = self._scroll_canvas()
         if canvas is None:
             return
+        # La tabla que debe reaccionar a flechas se elige por posición del
+        # ratón (como la rueda), pero si el puntero no está sobre ninguna
+        # tabla y YA hay una fila activa en esta, también se acepta: permite
+        # seguir moviéndose con flechas tras hacer clic en una fila y mover el
+        # ratón fuera, y cubre el caso donde el foco lo tiene un Entry de la
+        # ficha de detalle. Sin este fallback las flechas solo funcionaban con
+        # el ratón físicamente encima de la lista.
         try:
             under_mouse = self.winfo_containing(event.x_root, event.y_root)
         except Exception:
-            return
-        if under_mouse is None or not self._is_inside(under_mouse, canvas):
-            return
+            under_mouse = None
+        mouse_inside = under_mouse is not None and self._is_inside(under_mouse, canvas)
+        has_active = self._active_row is not None and self._active_row.winfo_exists()
+        if not mouse_inside and not has_active:
+            # Primera pulsación sin fila activa y con ratón fuera: permitir
+            # si la tabla está realmente visible. Así
+            # Recomendado/Episodios/Descargar/Liberar/Protegidos responden a
+            # flechas nada más entrar a la pestaña, sin exigir ratón encima.
+            if not self._row_frames():
+                return
+            try:
+                if not self._is_viewable():
+                    return
+                try:
+                    if not canvas.winfo_viewable() and not canvas.winfo_ismapped():
+                        return
+                except Exception:
+                    pass
+            except Exception:
+                return
         # Quien manda es la posición del ratón, NO el foco. Comprobar el foco
         # rompía la función entera: en la aplicación real casi siempre lo tiene
         # algún cuadro de texto (un buscador, la ficha de detalle...), así que
@@ -342,6 +380,65 @@ class TableView(ctk.CTkFrame):
     # descubren solas mirando los hijos del cuerpo de la tabla, así que quien
     # las construye (gui/app.py) no tiene que registrar nada.
 
+    def _is_viewable(self) -> bool:
+        """¿Esta TableView está realmente visible? winfo_viewable falla en
+        CTkTabview porque la pestaña oculta se hace con grid_remove y el
+        TableView queda no-mapped pero winfo_viewable puede seguir dando True
+        en algunos contenedores anidados. Se comprueba la cadena de padres y,
+        si está dentro de un CTkTabview, que su pestaña sea la seleccionada."""
+        try:
+            cur = self
+            tabview = None
+            # Buscar CTkTabview ancestro
+            while cur is not None:
+                try:
+                    if cur.__class__.__name__ == "CTkTabview":
+                        tabview = cur
+                        break
+                except Exception:
+                    pass
+                cur = getattr(cur, "master", None)
+                if cur is self:
+                    break
+            if tabview is not None:
+                try:
+                    selected = tabview.get() if hasattr(tabview, "get") else None
+                    # El TableView está dentro de tabview.tab("Nombre")
+                    # Si no podemos determinar, caer al check de ismapped
+                    if selected:
+                        # Buscar si este TableView cuelga de la pestaña seleccionada
+                        # Recorre padres y ve si alguno es el frame de la pestaña seleccionada
+                        try:
+                            tab_frame = tabview.tab(selected) if hasattr(tabview, "tab") else None
+                        except Exception:
+                            tab_frame = None
+                        if tab_frame is not None:
+                            cur2 = self
+                            while cur2 is not None and cur2 is not tabview:
+                                if cur2 is tab_frame:
+                                    # Está dentro de la pestaña seleccionada -> viewable si mapped
+                                    return bool(self.winfo_ismapped())
+                                cur2 = getattr(cur2, "master", None)
+                            # Está dentro de tabview pero NO en la pestaña seleccionada -> oculto
+                            return False
+                except Exception:
+                    pass
+            cur = self
+            while cur is not None:
+                try:
+                    if not cur.winfo_exists():
+                        return False
+                    if not cur.winfo_ismapped():
+                        return False
+                except Exception:
+                    return False
+                cur = getattr(cur, "master", None)
+                if cur is self:
+                    break
+            return True
+        except Exception:
+            return False
+
     def _row_frames(self) -> list:
         """Los frames de fila, en el orden en que se ven.
 
@@ -349,8 +446,34 @@ class TableView(ctk.CTkFrame):
         sueltas (el "no hay nada que mostrar", separadores...), y colarlas
         como filas dejaba un hueco por el que el resaltado desaparecía."""
         try:
-            return [w for w in self.body.pack_slaves()
+            rows = [w for w in self.body.pack_slaves()
                     if isinstance(w, ctk.CTkFrame)]
+            if rows:
+                return rows
+            # Fallback para CTkScrollableFrame cuyo pack_slaves no lista el
+            # inner frame en algunas versiones / cuando hay viewable raro:
+            # buscar recursivamente cualquier CTkFrame descendiente con filas
+            found = []
+            try:
+                stack = list(self.body.winfo_children())
+                while stack:
+                    w = stack.pop(0)
+                    if isinstance(w, ctk.CTkFrame):
+                        # Heurística: un row tiene fg_color distinto de transparente
+                        # y contiene celdas; evitar header_frame que está fuera de body
+                        try:
+                            if w.master is self.body or w.master is getattr(self.body, "_parent_frame", None):
+                                found.append(w)
+                        except Exception:
+                            found.append(w)
+                    try:
+                        stack.extend(w.winfo_children())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Si encontramos algo, devolverlo; si no, lo original
+            return found if found else rows
         except Exception:
             return []
 
@@ -405,14 +528,14 @@ class TableView(ctk.CTkFrame):
     def _row_is_clickable(self, frame) -> bool:
         """¿La fila responde al clic con su propia selección?
 
-        Se comprueba una vez por tabla. Las listas que ya gestionan selección
-        (Archivos y compañía) enganchan <Button-1> en el frame de la fila, y
-        ahí es donde vive TODO lo que hay que hacer al seleccionar: resaltarla,
-        cargar el panel de detalles de la derecha, actualizar la barra de
-        estado... Repetir eso aquí sería duplicarlo y quedarse corto."""
-        if self._rows_clickable is None:
-            self._rows_clickable = self._click_target(frame) is not None
-        return self._rows_clickable
+        Antes se cacheaba el resultado del primer frame inspeccionado para toda
+        la tabla (self._rows_clickable). Eso dejaba flechas en solo-azul si el
+        primer frame consultado era un placeholder sin binding o una fila aún
+        sin construir: todas las filas siguientes quedaban marcadas como no
+        clicables. Ahora se evalúa por frame en cada activación, buscando
+        también en descendientes (Recomendado/Episodios solo enganchan el
+        clic en el nombre, no en el frame)."""
+        return self._click_target(frame) is not None
 
     @staticmethod
     def _click_target(frame):
@@ -422,11 +545,45 @@ class TableView(ctk.CTkFrame):
         CTkCanvas con el que el frame se dibuja el fondo (`_canvas`), así que
         preguntarle al frame por sus bindings devuelve None y generar el
         evento sobre él no dispara nada -- parecía que las listas no tenían
-        selección cuando todas la tienen."""
-        canvas = getattr(frame, "_canvas", None)
+        selección cuando todas la tienen.
+
+        Para Recomendado/Episodios/Descargas el clic está en el `name_lbl`
+        hijo, no en el frame de la fila. Se busca recursivamente el primer
+        descendiente con <Button-1> para que las flechas funcionen igual en
+        todas las pestañas sin tener que tocar cada builder."""
+        def _has_click(w):
+            try:
+                c = getattr(w, "_canvas", None)
+                if c is not None and c.bind("<Button-1>"):
+                    return c
+                if hasattr(w, "bind") and w.bind("<Button-1>"):
+                    return w
+            except Exception:
+                pass
+            return None
+
+        hit = _has_click(frame)
+        if hit is not None:
+            return hit
+        # BFS por descendientes: prioriza el frame de la fila si lo tiene,
+        # si no el primer label clicable (name). Evita coger ★/🔒/⚡ antes
+        # que el nombre buscando en anchura.
         try:
-            if canvas is not None and canvas.bind("<Button-1>"):
-                return canvas
+            queue = list(getattr(frame, "winfo_children", lambda: [])())
+            # Incluir nietos de header_row/cells
+            visited = set()
+            while queue:
+                w = queue.pop(0)
+                if id(w) in visited:
+                    continue
+                visited.add(id(w))
+                hit = _has_click(w)
+                if hit is not None:
+                    return hit
+                try:
+                    queue.extend(w.winfo_children())
+                except Exception:
+                    pass
         except Exception:
             pass
         return None
@@ -451,6 +608,21 @@ class TableView(ctk.CTkFrame):
         if anterior is not None and anterior is not frame:
             self._highlight_row(anterior, False)
         self._highlight_row(frame, True)
+
+    def set_active_row(self, frame):
+        """Sincroniza la navegación por teclado con la selección hecha a
+        ratón. Llamar desde gui/app.py tras seleccionar una fila con clic
+        para que la siguiente flecha parta de ahí (antes partía de 0)."""
+        try:
+            rows = self._row_frames()
+            if frame in rows:
+                self._active_row = frame
+                self._active_index = rows.index(frame)
+            elif frame is not None and frame.winfo_exists():
+                # Frame ya destruido por repaginado: guardar índice
+                self._active_row = frame
+        except Exception:
+            self._active_row = frame
 
     def _move_active_row(self, canvas, rows: list, keysym: str):
         actual = rows.index(self._active_row) if self._active_row in rows else None

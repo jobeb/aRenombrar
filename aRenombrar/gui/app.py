@@ -9339,6 +9339,10 @@ class App(_AppBase):
         row_fr = ctk.CTkFrame(self._movies_table.body,
                               fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
         row_fr.pack(fill="x", pady=3, padx=2)
+        # Hace la fila entera clicable para flechas (TableView._click_target
+        # busca el frame; sin esto solo el nombre era clicable y flechas
+        # caían en azul).
+        row_fr.bind("<Button-1>", lambda e, row=r: self._show_movie_poster(row))
 
         header_row = ctk.CTkFrame(row_fr, fg_color="transparent")
         header_row.pack(fill="x")
@@ -9464,8 +9468,8 @@ class App(_AppBase):
         search_btn = ctk.CTkButton(
             c, text="🔍", height=24, font=self._movies_icon_font,
             fg_color=ICON_AMULE, hover_color="#693a99",
-            command=lambda mq=movie_query, title=r["title"]:
-            self._search_missing_ep_on_amule(mq, title))
+            command=lambda mq=movie_query, title=r["title"], y=movie_year, im=not is_tv:
+            self._search_missing_ep_on_amule(mq, title, expected_year=y, is_movie=im))
         attach_tooltip(search_btn, lambda: "Buscar en aMule (abre la pestaña Descargas)")
         search_btn.pack(fill="both", expand=True)
 
@@ -9539,9 +9543,17 @@ class App(_AppBase):
         from core.missing_movies_cache import cache_key
         sel_key = cache_key(r.get("media_type", "movie"), r["tmdb_id"])
         self._movies_selected_tmdb_id = sel_key
+        active_fr = None
         for key, widgets in self._movies_row_widgets.items():
             widgets["row_fr"].configure(
                 fg_color=SELECTED_ROW_COLOR if key == sel_key else ("gray95", "gray17"))
+            if key == sel_key:
+                active_fr = widgets["row_fr"]
+        if active_fr is not None:
+            try:
+                self._movies_table.set_active_row(active_fr)
+            except Exception:
+                pass
         self._set_textbox_text(self._movies_detail_title, r.get("title", ""))
         tipo = "📺 Serie" if r.get("media_type") == "tv" else "🎬 Película"
         meta = " · ".join(x for x in [
@@ -11064,9 +11076,16 @@ class App(_AppBase):
 
         missing = r["missing"]
         if not show_ignored and (r.get("ignored_seasons") or r.get("ignored_episodes")):
+            orig_missing = missing
             missing = apply_ignored_filter(missing, r.get("ignored_seasons"), r.get("ignored_episodes"))
-            if not missing and not r.get("unknown_seasons"):
-                return None
+            if not missing:
+                # Si todos los huecos quedaron ignorados, ocultar la serie
+                # aunque tenga unknown_seasons (Caleidoscopio: un único episodio
+                # ignorado dejaba la cabecera visible sin capítulos).
+                if orig_missing:
+                    return None
+                if not r.get("unknown_seasons"):
+                    return None
 
         if self._missing_ep_hide_no_dub_var.get():
             # _missing_ep_dub_filtered recorta sobre r["missing"] tal cual
@@ -11201,6 +11220,7 @@ class App(_AppBase):
         row_fr = ctk.CTkFrame(self._missing_ep_table.body,
                               fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
         row_fr.pack(fill="x", pady=3, padx=2)
+        row_fr.bind("<Button-1>", lambda e, tid=tmdb_id, row=r: self._on_missing_ep_name_click(tid, row))
 
         header_row = ctk.CTkFrame(row_fr, fg_color="transparent")
         header_row.pack(fill="x")
@@ -11805,7 +11825,8 @@ class App(_AppBase):
         self.clipboard_append(text)
         self._set_status(f"Copiado: {text}", SUCCESS_COLOR)
 
-    def _search_missing_ep_on_amule(self, filename: str, series_name: str):
+    def _search_missing_ep_on_amule(self, filename: str, series_name: str,
+                                      expected_year: int = None, is_movie: bool = False):
         ec = EcClient(
             host=self.config_data.get("amule_host", "localhost"),
             port=self.config_data.get("amule_port", 4712),
@@ -11822,10 +11843,15 @@ class App(_AppBase):
                 "Revisa los ajustes en Configuración -> General.",
                 parent=self)
             return
-        self._show_amule_search_results(filename, series_name)
+        self._show_amule_search_results(filename, series_name,
+                                      expected_year=expected_year, is_movie=is_movie)
 
-    def _show_amule_search_results(self, filename: str, series_name: str):
+    def _show_amule_search_results(self, filename: str, series_name: str,
+                                     expected_year: int = None, is_movie: bool = False):
         self._show_view("downloads")
+        self._downloads_expected_year = expected_year
+        self._downloads_is_movie = bool(is_movie)
+        self._downloads_query_for_year = filename
         self._downloads_search_var.set(filename)
         self._downloads_do_search()
 
@@ -12916,6 +12942,20 @@ class App(_AppBase):
 
         self._downloads_results = []
         self._downloads_page = 0
+        # Contexto de año para puntuar descargas de películas: cuando la
+        # búsqueda viene de la pestaña Películas (🔍 sobre "Muy lejos de aquí"
+        # 2023) best_result debe penalizar el 2025. Se guarda aquí para que
+        # _downloads_rebuild_page pueda pasarlo a best_result; búsquedas
+        # manuales sin contexto dejan expected_year=None (sin castigo).
+        self._downloads_expected_year = None
+        self._downloads_is_movie = False
+        self._downloads_query_for_year = ""
+        # Híbrido A+D: coalescencia y diff estable para no recrear la tabla
+        # cada 3s durante la búsqueda en vivo. Ver _downloads_display_results.
+        self._downloads_pending_display_id = None
+        self._downloads_pending_results = None
+        self._downloads_last_sort_key = None
+        self._downloads_last_sort_asc = None
         # Como las demás tablas: el número de resultados POR PÁGINA se
         # ajusta solo al alto real de la tabla (redimensionar la ventana),
         # en vez de fijarse en un número arbitrario que hacía aparecer la
@@ -12979,6 +13019,12 @@ class App(_AppBase):
         self._downloads_type_menu.configure(state="disabled")
         self._downloads_file_type_menu.configure(state="disabled")
         query = self._downloads_search_var.get().strip()
+        # Búsqueda manual directa en Descargas (usuario teclea y pulsa
+        # Buscar): si la query ya no coincide con la que traía año de
+        # Películas, limpiar el contexto de año para no penalizar mal.
+        if query != self._downloads_query_for_year:
+            self._downloads_expected_year = None
+            self._downloads_is_movie = False
         if not query:
             self._downloads_status_lbl.configure(text="Introduce un término de búsqueda",
                                                   text_color=ERROR_COLOR)
@@ -12993,6 +13039,14 @@ class App(_AppBase):
         # llegue el primer sondeo con datos): no se debe seguir viendo los
         # resultados de la búsqueda previa mientras la nueva arranca (la
         # conexión EC puede tardar en devolver el primer lote).
+        # Cancelar coalescencia pendiente de la búsqueda anterior
+        if self._downloads_pending_display_id is not None:
+            try:
+                self.after_cancel(self._downloads_pending_display_id)
+            except Exception:
+                pass
+            self._downloads_pending_display_id = None
+            self._downloads_pending_results = None
         self._downloads_results = []
         self._downloads_page = 0
         self._downloads_selected = None   # la búsqueda nueva deselecciona el resultado previo
@@ -13058,6 +13112,7 @@ class App(_AppBase):
                     # intervalo.
                     for results in ec.iter_search(
                             query, search_type=st, file_type=ft,
+                            poll_interval=5.0, max_duration=60.0,
                             wake_event=self._downloads_wake):
                         if token != self._downloads_search_token:
                             return
@@ -13117,6 +13172,17 @@ class App(_AppBase):
         self._downloads_file_type_menu.configure(state="normal")
 
     def _downloads_finish_search(self):
+        # Flush coalescencia pendiente antes de cerrar
+        if self._downloads_pending_display_id is not None:
+            try:
+                self.after_cancel(self._downloads_pending_display_id)
+            except Exception:
+                pass
+            self._downloads_pending_display_id = None
+            pending = self._downloads_pending_results
+            self._downloads_pending_results = None
+            if pending is not None:
+                self._downloads_apply_display(pending, live=True)
         self._downloads_enable_search_controls()
         n = len(self._downloads_results)
         if n:
@@ -13130,27 +13196,87 @@ class App(_AppBase):
     def _downloads_truncate(text: str, max_len: int = 100) -> str:
         return text if len(text) <= max_len else text[:max_len - 3] + "..."
 
-    def _downloads_display_results(self, results: list, live: bool = False):
-        """live=True viene de una búsqueda que aún sigue sondeando
-        (EcClient.iter_search): se pinta la lista acumulada sin tocar el
-        estado de la búsqueda (el orden manual elegido, la página y el
-        texto "Buscando..." se mantienen; el texto final lo pone
-        _downloads_finish_search). live=False es la llamada clásica de una
-        sola pasada."""
-        # NO machacar una lista poblada con un sondeo vacío a mitad de una
-        # búsqueda: aMule puede devolver momentáneamente "results" sin datos
-        # (el separador de la salida aún no ha salido, o el parse se queda
-        # sin filas) mientras la búsqueda sigue corriendo -- si pudiéramos
-        # sobrescribir, la tabla quedaría en blanco de repente en medio de
-        # una búsqueda con resultados ya mostrados, y no se recuperaría
-        # hasta la siguiente actualización (y a veces ni siquiera al
-        # terminar, porque el último sondeo puede llegar vacío). Se conserva
-        # la última lista con datos.
-        if live and not results and self._downloads_results:
-            _log.info("Descargas: sondeo en vivo sin datos, se conserva la lista de %d resultado(s) mostrada hasta ahora",
-                      len(self._downloads_results))
-            return
-        self._downloads_results = results
+    @staticmethod
+    def _downloads_key(r) -> str:
+        """Clave estable entre sondeos para diff: hash aMule si existe, si no
+        name|size. Así la selección por clave sobrevive a objetos nuevos."""
+        try:
+            h = getattr(r, "hash", None) or getattr(r, "ed2k_hash", None)
+            if h:
+                return str(h)
+        except Exception:
+            pass
+        try:
+            return f"{getattr(r, 'name', '')}|{getattr(r, 'size_human', '')}"
+        except Exception:
+            return str(id(r))
+
+    def _is_same_results(self, new_results) -> bool:
+        """¿La nueva lista trae exactamente los mismos elementos (por clave) y
+        mismos sources/complete? Evita rebuild si no hay cambio real."""
+        if len(new_results) != len(self._downloads_results):
+            return False
+        try:
+            old_keys = [self._downloads_key(r) for r in self._downloads_results]
+            new_keys = [self._downloads_key(r) for r in new_results]
+            if old_keys != new_keys:
+                return False
+            for a, b in zip(self._downloads_results, new_results):
+                if getattr(a, "sources", None) != getattr(b, "sources", None):
+                    return False
+                if getattr(a, "complete", None) != getattr(b, "complete", None):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _flush_pending_display(self):
+        self._downloads_pending_display_id = None
+        pending = self._downloads_pending_results
+        self._downloads_pending_results = None
+        if pending is not None:
+            self._downloads_apply_display(pending, live=True)
+
+    def _downloads_apply_display(self, results: list, live: bool = False):
+        """Aplica results con diff estable, preservando selección y scroll."""
+        # Preservar selección por clave y scroll
+        selected_key = self._downloads_key(self._downloads_selected) if self._downloads_selected else None
+        yview = None
+        try:
+            yview = self._downloads_table_body._parent_canvas.yview()[0]
+        except Exception:
+            pass
+        # Merge: reutilizar objetos viejos para claves existentes (preserva is)
+        if live and self._downloads_results:
+            old_by_key = {self._downloads_key(r): r for r in self._downloads_results}
+            merged = []
+            for nr in results:
+                k = self._downloads_key(nr)
+                if k in old_by_key:
+                    old = old_by_key[k]
+                    # Actualizar campos mutables sin cambiar identidad
+                    try:
+                        old.sources = getattr(nr, "sources", old.sources)
+                        old.complete = getattr(nr, "complete", old.complete)
+                        if hasattr(nr, "size_human"):
+                            old.size_human = nr.size_human
+                    except Exception:
+                        pass
+                    merged.append(old)
+                else:
+                    merged.append(nr)
+            self._downloads_results = merged
+        else:
+            self._downloads_results = results
+        # Restaurar selección por clave
+        if selected_key:
+            for r in self._downloads_results:
+                if self._downloads_key(r) == selected_key:
+                    self._downloads_selected = r
+                    break
+            else:
+                # Clave ya no existe (filtrado fuera) -> mantener objeto viejo no es útil
+                pass
         if not live:
             self._downloads_page = 0
             if not results:
@@ -13159,12 +13285,48 @@ class App(_AppBase):
             else:
                 self._downloads_status_lbl.configure(
                     text=f"{len(results)} resultado(s) encontrado(s)", text_color=SUCCESS_COLOR)
-        # Se mantiene y se RE-APLICA el orden elegido (persistido o pulsado):
-        # una búsqueda nueva o un sondeo en vivo trae la lista en el orden
-        # natural de aMule, así que aquí se vuelve a ordenar con la columna
-        # guardada en vez de exigir volver a pulsar la cabecera.
-        self._downloads_apply_sort()
+        # Solo reordenar si el usuario cambió columna/dirección (no cada poll)
+        if self._downloads_sort_key:
+            if (self._downloads_sort_key != self._downloads_last_sort_key or
+                    self._downloads_sort_asc != self._downloads_last_sort_asc):
+                self._downloads_apply_sort()
+                self._downloads_last_sort_key = self._downloads_sort_key
+                self._downloads_last_sort_asc = self._downloads_sort_asc
+            # si no cambió, mantener orden actual (no resort)
         self._downloads_rebuild_page()
+        # Restaurar scroll
+        if yview is not None:
+            try:
+                self._downloads_table_body._parent_canvas.yview_moveto(yview)
+            except Exception:
+                pass
+
+    def _downloads_display_results(self, results: list, live: bool = False):
+        """live=True viene de una búsqueda que aún sigue sondeando
+        (EcClient.iter_search): se pinta la lista acumulada sin tocar el
+        estado de la búsqueda (el orden manual elegido, la página y el
+        texto "Buscando..." se mantienen; el texto final lo pone
+        _downloads_finish_search). live=False es la llamada clásica de una
+        sola pasada. Híbrido A+D: coalescencia 300ms + diff estable."""
+        if live and not results and self._downloads_results:
+            _log.info("Descargas: sondeo en vivo sin datos, se conserva la lista de %d resultado(s) mostrada hasta ahora",
+                      len(self._downloads_results))
+            return
+        if live:
+            # Evitar rebuild si no hay cambio real (misma clave/sources)
+            if self._is_same_results(results):
+                return
+            # Coalescencia 300ms: si llegan varios polls seguidos, solo pinta el último
+            if self._downloads_pending_display_id is not None:
+                try:
+                    self.after_cancel(self._downloads_pending_display_id)
+                except Exception:
+                    pass
+            self._downloads_pending_results = results
+            self._downloads_pending_display_id = self.after(300, self._flush_pending_display)
+            return
+        # live=False: aplicar de inmediato sin coalescencia
+        self._downloads_apply_display(results, live=False)
 
     def _downloads_apply_sort(self):
         """Reaplica a self._downloads_results el orden de columna elegido
@@ -13213,14 +13375,20 @@ class App(_AppBase):
         # El mejor candidato de TODA la búsqueda (no solo de esta página):
         # se pinta así cuando le toca aparecer en esta página. El resto de
         # filas queda del color normal para que el recomendado salte a la
-        # vista. Ver core/download_quality.py.
-        best_candidate = best_result(results, self._downloads_search_var.get())
+        # vista. Ver core/download_quality.py. Si la búsqueda vino de
+        # Películas se pasa expected_year/is_movie para evitar
+        # "Muy Lejos 2025" cuando se pidió "Muy lejos de aquí 2023".
+        best_candidate = best_result(
+            results, self._downloads_search_var.get(),
+            expected_year=self._downloads_expected_year,
+            is_movie=self._downloads_is_movie)
         rows_rendered = 0
         for res in results[start:end]:
             rows_rendered += 1
             row_bg = DOWNLOAD_BEST_ROW_COLOR if res is best_candidate else ("gray95", "gray17")
             row_fr = ctk.CTkFrame(self._downloads_table_body, fg_color=row_bg)
             row_fr.pack(fill="x", pady=2, padx=2)
+            row_fr.bind("<Button-1>", lambda e, r=res: self._show_downloads_result(r))
             # Resaltado de la fila pulsada (ver _show_downloads_result): si la
             # búsqueda se repinta (nueva página/orden) se mantiene la fila del
             # resultado que estaba seleccionado, si aún está en esta página.
@@ -13311,6 +13479,8 @@ class App(_AppBase):
         self._downloads_table.set_sort_indicator(self._downloads_sort_key, self._downloads_sort_asc)
         self._save_table_sort("descargar", self._downloads_sort_key, self._downloads_sort_asc)
         self._downloads_apply_sort()
+        self._downloads_last_sort_key = self._downloads_sort_key
+        self._downloads_last_sort_asc = self._downloads_sort_asc
         self._downloads_page = 0   # el orden nuevo se ve desde el principio
         self._downloads_rebuild_page()
 
@@ -13456,9 +13626,17 @@ class App(_AppBase):
         (póster, categoría, clasificación, sinopsis) se pide en un hilo y se
         aplica cuando llega. Mismo patrón que _show_movie_poster."""
         self._downloads_selected = res
+        active_fr = None
         for key, widgets in self._downloads_row_widgets.items():
             widgets["row_fr"].configure(
                 fg_color=SELECTED_ROW_COLOR if key == id(res) else ("gray95", "gray17"))
+            if key == id(res):
+                active_fr = widgets["row_fr"]
+        if active_fr is not None:
+            try:
+                self._downloads_table.set_active_row(active_fr)
+            except Exception:
+                pass
         self._downloads_poster_label.configure(image=None, text="…")
         self._downloads_poster_token = object()
         token = self._downloads_poster_token
@@ -13724,9 +13902,17 @@ class App(_AppBase):
     def _show_missing_ep_poster(self, r: dict):
         self._missing_ep_current_row = r
         self._missing_ep_selected_tmdb_id = r["tmdb_id"]
+        active_fr = None
         for tid, widgets in self._missing_ep_row_widgets.items():
             widgets["row_fr"].configure(
                 fg_color=SELECTED_ROW_COLOR if tid == r["tmdb_id"] else ("gray95", "gray17"))
+            if tid == r["tmdb_id"]:
+                active_fr = widgets["row_fr"]
+        if active_fr is not None:
+            try:
+                self._missing_ep_table.set_active_row(active_fr)
+            except Exception:
+                pass
         self._update_status_bar()
         self._set_textbox_text(self._missing_ep_detail_title, r["name"])
         self._set_textbox_text(self._missing_ep_detail_meta, "")
@@ -16951,11 +17137,18 @@ class App(_AppBase):
     def _select_entry(self, entry):
         prev = self._selected_entry
         self._selected_entry = entry
+        active_frame = None
         for row in self._file_rows:
             if row["entry"] is prev:
                 row["frame"].configure(fg_color="transparent")
             if row["entry"] is entry:
                 row["frame"].configure(fg_color=SELECTED_ROW_COLOR)
+                active_frame = row["frame"]
+        if active_frame is not None:
+            try:
+                self._file_table.set_active_row(active_frame)
+            except Exception:
+                pass
         if entry is not prev:
             self._reset_search_panel(entry)
         self._update_detail(entry)
@@ -17052,6 +17245,15 @@ class App(_AppBase):
 
     def _on_header_upload_clicked(self):
         n = len(self._current_selection())
+        try:
+            from core.appdirs import app_data_dir
+            from pathlib import Path
+            import time as _time
+            _log_path = Path(app_data_dir()) / "upload_debug.log"
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} _on_header_upload_clicked n={n} files={len(self.files)} sel_ids={[id(e) for e in self._current_selection()]} statuses={[(e.name[:20], e.status, bool(e.media_info)) for e in self._current_selection()]} upload_running={self._upload_running}\n")
+        except Exception:
+            pass
         if n > 1:
             self._upload_selected_ftp()
         else:
@@ -18699,14 +18901,34 @@ class App(_AppBase):
 
     def _upload_selected_ftp(self):
         # Soporta multi-selección (Ctrl/Shift) igual que Asignar
-        targets = [e for e in self._current_selection() if e.media_info and e.status in ("listo", "renombrado")]
+        sel = self._current_selection()
+        targets = [e for e in sel if e.media_info and e.status in ("listo", "renombrado")]
+        # Log detallado para depurar "no subió nada"
+        try:
+            from core.appdirs import app_data_dir
+            from pathlib import Path
+            import time as _time
+            _log_path = Path(app_data_dir()) / "upload_debug.log"
+            with open(_log_path, "a", encoding="utf-8") as _f:
+                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} _upload_selected n_sel={len(sel)} n_targets={len(targets)} sel_status={[(e.name[:25], e.status, bool(e.media_info)) for e in sel]}\n")
+        except Exception:
+            pass
         if not targets:
             # Fallback al ancla si la selección no tiene listos pero el ancla sí
             entry = self._selected_entry
             if entry and entry.media_info and entry.status in ("listo", "renombrado"):
                 targets = [entry]
         if not targets:
-            self._set_status("Selecciona un archivo con informacion de TMDB en estado listo", WARNING_COLOR)
+            # Mensaje más informativo: cuántos tenían media_info y en qué estado estaban
+            n_con_info = sum(1 for e in sel if e.media_info)
+            estados = {}
+            for e in sel:
+                estados[e.status] = estados.get(e.status, 0) + 1
+            detalle = ", ".join(f"{k}:{v}" for k, v in estados.items()) if estados else "sin selección"
+            if n_con_info == 0:
+                self._set_status("Ningún archivo seleccionado tiene información TMDB asignada — usa Asignar primero", WARNING_COLOR)
+            else:
+                self._set_status(f"Ningún seleccionado en estado listo/renombrado ({detalle}) — revisa Asignar", WARNING_COLOR)
             return
         self._enqueue_or_start(targets)
 
@@ -21464,7 +21686,7 @@ class App(_AppBase):
         row = ctk.CTkFrame(self._cleanup_table.body,
                            fg_color=SELECTED_ROW_COLOR if is_selected else ("gray95", "gray17"))
         row.pack(fill="x", pady=3, padx=2)
-        row.pack(fill="x", pady=3, padx=2)
+        row.bind("<Button-1>", lambda e, it=item: self._show_cleanup_poster(it))
         self._cleanup_row_widgets.append((item, row))
 
         # Celdas con recorte (ver TableView.cell). Esta tabla tiene la fila
@@ -21649,8 +21871,16 @@ class App(_AppBase):
         TMDB en el panel lateral -- mismo patrón que
         _show_missing_ep_poster en Episodios."""
         self._cleanup_selected_item = item
+        active_fr = None
         for it, row in self._cleanup_row_widgets:
             row.configure(fg_color=SELECTED_ROW_COLOR if it is item else ("gray95", "gray17"))
+            if it is item:
+                active_fr = row
+        if active_fr is not None:
+            try:
+                self._cleanup_table.set_active_row(active_fr)
+            except Exception:
+                pass
         self._update_status_bar()
         self._set_textbox_text(self._cleanup_detail_title,
                                f"{item.name} ({item.year})" if item.year else item.name)
@@ -22346,9 +22576,17 @@ class App(_AppBase):
         de TMDB (póster, categoría, clasificación, sinopsis) se pide en un
         hilo y se aplica cuando llega. Mismo patrón que _show_movie_poster."""
         self._protected_selected = key
+        active_fr = None
         for k, widgets in self._protected_row_widgets.items():
             widgets["row_fr"].configure(
                 fg_color=SELECTED_ROW_COLOR if k == key else ("gray95", "gray17"))
+            if k == key:
+                active_fr = widgets["row_fr"]
+        if active_fr is not None:
+            try:
+                self._protected_table.set_active_row(active_fr)
+            except Exception:
+                pass
         self._protected_poster_label.configure(image=None, text="…")
         self._protected_poster_token = object()
         token = self._protected_poster_token
@@ -22459,6 +22697,7 @@ class App(_AppBase):
         cw = self._protected_table.col_width
         row = ctk.CTkFrame(self._protected_table.body, fg_color=("gray95", "gray17"))
         row.pack(fill="x", pady=3, padx=2)
+        row.bind("<Button-1>", lambda e, k=key, en=entry: self._show_protected_ficha(k, en))
         # Resaltado de la fila pulsada (ver _show_protected_ficha): si se
         # repinta la página (cambio de tamaño/página) se mantiene el resaltado
         # de la reserva que estaba seleccionada, si sigue en esta página.
