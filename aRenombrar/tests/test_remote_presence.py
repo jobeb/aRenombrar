@@ -153,8 +153,8 @@ def test_solo_en_local_no_se_ofrece_borrado_remoto():
     assert removal_options(True, "") == [QUITAR_LISTA, QUITAR_Y_LOCAL]
 
 
-def test_sin_archivo_en_disco_solo_se_puede_quitar_de_la_lista():
-    assert removal_options(False, REMOTO) == [QUITAR_LISTA]
+def test_sin_archivo_en_disco_se_puede_borrar_del_servidor():
+    assert removal_options(False, REMOTO) == [QUITAR_LISTA, QUITAR_LOCAL_Y_REMOTO]
 
 
 def test_una_ruta_local_en_el_campo_remoto_no_habilita_el_borrado_remoto():

@@ -476,13 +476,15 @@ def test_italian_detected_variants():
 
 
 def test_vos_still_eligible_when_only_option():
-    """La penalización no EXCLUYE V.O.S. del todo (a diferencia del porno): si
-    solo hay un V.O.S. correcto del capítulo, sigue pudiendo elegirse y
-    pasar el umbral (best_result no devuelve None)."""
+    """V.O.S. se EXCLUYE del todo por petición del usuario (como el porno):
+    aunque sea lo único disponible, no se elige (best_result None). Ver
+    is_vos_content / is_french_content para VOSTFR."""
     results = [_r(1, "Serie 2x04 VOSE 1080p WEB-DL x264.mkv", sources=9, complete=True)]
     best = best_result(results, "Serie 2x04")
-    assert best is not None
-    assert best.number == 1
+    assert best is None
+    # Caso real VOSTFR también excluido
+    r2 = _r(1, "Tensei Shitara Slime Datta Ken 4x10 VOSTFR Web (by OtakuNashi).ts", sources=9, complete=True)
+    assert best_result([r2], "Tensei Shitara Slime Datta Ken 4x10") is None
 
 
 def test_vos_and_ita_unrelated_words_not_penalized():

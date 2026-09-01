@@ -113,17 +113,19 @@ def removal_options(local_exists: bool, remote_path: str) -> list:
     Quitar de la lista se ofrece siempre: no destruye nada y es lo único
     que tiene sentido cuando el archivo ya no está en ninguna parte.
 
-    Borrar en local solo si el archivo sigue en disco, y borrar también en
-    el servidor solo si además se sabe dónde está allí -- ofrecer un
-    borrado remoto sin ruta fiable acabaría mandando basura al FTP (ver
+    Borrar en local solo si el archivo sigue en disco. Borrar también en
+    el servidor solo si se sabe dónde está allí -- ofrecer un borrado
+    remoto sin ruta fiable acabaría mandando basura al FTP (ver
     looks_like_remote_path: casi la mitad del historial guardaba la ruta
-    local en el campo del servidor).
+    local en el campo del servidor). El borrado remoto se ofrece incluso
+    si el archivo ya no está en local (subido y luego borrado/movido),
+    para que "ya subido" no se quede huérfano en el servidor.
     """
     opciones = [QUITAR_LISTA]
     if local_exists:
         opciones.append(QUITAR_Y_LOCAL)
-        if looks_like_remote_path(remote_path):
-            opciones.append(QUITAR_LOCAL_Y_REMOTO)
+    if looks_like_remote_path(remote_path):
+        opciones.append(QUITAR_LOCAL_Y_REMOTO)
     return opciones
 
 

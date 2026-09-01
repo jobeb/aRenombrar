@@ -49,16 +49,18 @@ _CAT_RE = re.compile(
 _PORN_RE = re.compile(
     r"\b(?:xxx|porn|porno|hardcore|milf|hentai|onlyfans|bondage|jav|"
     r"creampie|gangbang|bigboobs|bigtits)\b", re.IGNORECASE)
-# V.O.S. / VOSE / VOSI / "versión original subtitulada": audio en el idioma
-# ORIGINAL con subtítulos, SIN doblaje en español. El usuario prioriza el
-# castellano, así que un release V.O.S. se penaliza fuerte para que el doblaje
-# gane siempre que exista (pero sin excluirlo del todo: si no hay release
-# doblado, sigue siendo un capítulo válido que puede pasar el umbral). "vosc"
-# (V.O.S. en catalán) ya lo penaliza _CAT_RE; este patrón también le cae
-# encima, sin problema.
+# V.O.S. / VOSE / VOSI / VOSTFR / "versión original subtitulada": audio en el
+# idioma ORIGINAL con subtítulos, SIN doblaje en español. El usuario ha pedido
+# exclusión total (no solo penalizar): un release V.O.S./VOSTFR nunca debe ser
+# elegido ni descargado, aunque sea lo único disponible — igual que el porno
+# o el italiano sin español. Ver is_vos_content() / is_french_content().
 _VOS_RE = re.compile(
     r"(?:v\.?o\.?s(?:e|i)?(?:[_-]?es)?\b|vers[ií]on\s+original(?:\s+subtitulad[oa])?\b)",
     re.IGNORECASE)
+# Francés: VOSTFR/VOSTA/VF y marcadores de idioma francés. Se excluye igual
+# que VOS (ver is_french_content). Cubre "Tensei Shitara Slime Datta Ken
+# 4xXX VOSTFR Web (by OtakuNashi).ts".
+_FRA_RE = re.compile(r"\b(?:vostfr|vosta|vosta-fr|vf\b|french|français|francais)\b", re.IGNORECASE)
 # Italiano (ITA/Italiano/Italiana): ver is_italian_only() -- si el release es
 # italiano y no trae NINGÚN rastro de español, se EXCLUYE (como el porno); si
 # además lleva español (dual ENG-SPA, "Spanish subs"...), solo se penaliza.
@@ -181,6 +183,36 @@ def is_italian_only(name: str) -> bool:
     # ...o título traducido al italiano (>=2 palabras-función inequívocas):
     # cubre nombres que no llevan el token ITA pero sí el título en italiano.
     return len(_ITA_TITLE_RE.findall(name)) >= 2
+
+
+def is_vos_content(name: str) -> bool:
+    """True si el nombre delata V.O.S. (versión original subtitulada) sin
+    doblaje: se excluye siempre (ver score_download/best_result), igual que
+    el porno. Cubre VOS/VOSE/VOSI y 'versión original subtitulada'. Solo se
+    considera VOS si no hay rastro de español (dual con castellano se
+    mantiene como emergencia, igual que is_italian_only / is_french_only)."""
+    if not name or _LANG_RE.search(name):
+        return False
+    return bool(_VOS_RE.search(name))
+
+
+def is_french_content(name: str) -> bool:
+    """True si el nombre delata contenido en francés / VOSTFR sin español:
+    se excluye. Cubre VOSTFR/VOSTA/VF/French. Caso real: 'Tensei Shitara
+    Slime Datta Ken 4xXX VOSTFR Web (by OtakuNashi).ts'. Un dual
+    'Spanish French Subs' no se excluye (tiene castellano)."""
+    if not name or _LANG_RE.search(name):
+        return False
+    return bool(_FRA_RE.search(name))
+
+
+# Aliases para compatibilidad con best_result (is_*_only)
+def is_vos_only(name: str) -> bool:
+    return is_vos_content(name)
+
+
+def is_french_only(name: str) -> bool:
+    return is_french_content(name)
 
 
 def _title_words(text: str) -> set:
@@ -320,6 +352,10 @@ def score_download(result: AmuleSearchResult,
     # Italiano sin español tampoco (ver is_italian_only).
     if is_italian_only(name):
         return 0.0
+    # V.O.S. y francés (VOSTFR) excluidos del todo por petición del usuario:
+    # nunca se destacan/descargan, aunque sea lo único disponible.
+    if is_vos_content(name) or is_french_content(name):
+        return 0.0
     # El botón ⬇ de Películas pide UNA PELÍCULA (is_movie, query = solo el
     # título, sin numeración). Un resultado con numeración de capítulo
     # (SxxExx/NxNN) es un capítulo de una serie, NO la película: se excluye
@@ -404,13 +440,8 @@ def score_download(result: AmuleSearchResult,
     # más de lo que puede sumar calidad+fuentes+idioma para que nunca gane.
     if _CAT_RE.search(name):
         score -= 60.0
-    # V.O.S. (original + subtítulos, sin doblaje): penalización fuerte para
-    # que el doblaje en castellano gane siempre que exista, sin excluir el
-    # resultado del todo (si solo hay V.O.S., sigue siendo un capítulo válido
-    # y puede pasar el umbral).
-    if _VOS_RE.search(name):
-        score -= 60.0
-    # Italiano: mismo tratamiento que V.O.S., priorizar el castellano.
+    # Italiano: penalización cuando trae español (dual) — si es solo italiano
+    # ya se excluyó arriba. Mantiene -60 para que no gane a castellano.
     if _ITA_RE.search(name):
         score -= 60.0
 
@@ -526,6 +557,8 @@ def best_result(results: list, query: str = "", expected_year: int = None,
     candidates = [r for r in results
                   if not is_adult_content(r.name)
                   and not is_italian_only(r.name)
+                  and not is_vos_content(r.name)
+                  and not is_french_content(r.name)
                   and not (is_movie and _parse_season_episode(r.name) is not None)]
     if not candidates:
         return None

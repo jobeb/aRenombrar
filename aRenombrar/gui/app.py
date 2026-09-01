@@ -17245,15 +17245,6 @@ class App(_AppBase):
 
     def _on_header_upload_clicked(self):
         n = len(self._current_selection())
-        try:
-            from core.appdirs import app_data_dir
-            from pathlib import Path
-            import time as _time
-            _log_path = Path(app_data_dir()) / "upload_debug.log"
-            with open(_log_path, "a", encoding="utf-8") as _f:
-                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} _on_header_upload_clicked n={n} files={len(self.files)} sel_ids={[id(e) for e in self._current_selection()]} statuses={[(e.name[:20], e.status, bool(e.media_info)) for e in self._current_selection()]} upload_running={self._upload_running}\n")
-        except Exception:
-            pass
         if n > 1:
             self._upload_selected_ftp()
         else:
@@ -18903,16 +18894,6 @@ class App(_AppBase):
         # Soporta multi-selección (Ctrl/Shift) igual que Asignar
         sel = self._current_selection()
         targets = [e for e in sel if e.media_info and e.status in ("listo", "renombrado")]
-        # Log detallado para depurar "no subió nada"
-        try:
-            from core.appdirs import app_data_dir
-            from pathlib import Path
-            import time as _time
-            _log_path = Path(app_data_dir()) / "upload_debug.log"
-            with open(_log_path, "a", encoding="utf-8") as _f:
-                _f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')} _upload_selected n_sel={len(sel)} n_targets={len(targets)} sel_status={[(e.name[:25], e.status, bool(e.media_info)) for e in sel]}\n")
-        except Exception:
-            pass
         if not targets:
             # Fallback al ancla si la selección no tiene listos pero el ancla sí
             entry = self._selected_entry
